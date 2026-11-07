@@ -354,7 +354,33 @@ impl Session {
             Some((id, through)) => (self.checkpoint_messages(id)?, *through),
             None => (Vec::new(), 0),
         };
-        for chunk in &tail {
+        messages.extend(self.model_messages(&tail, after)?);
+        Ok(messages)
+    }
+
+    /// Model messages of records numbered above `after`, as the model receives them.
+    pub fn model_messages_after(&self, after: u64) -> Result<Vec<Value>> {
+        let mut tail: Vec<Chunk> = Vec::new();
+        for &number in self.chunk_numbers()?.iter().rev() {
+            let chunk = self.load_chunk(number)?;
+            let first = chunk
+                .records
+                .first()
+                .and_then(|r| r.get("n"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            tail.push(chunk);
+            if first <= after {
+                break;
+            }
+        }
+        tail.reverse();
+        self.model_messages(&tail, after)
+    }
+
+    fn model_messages(&self, chunks: &[Chunk], after: u64) -> Result<Vec<Value>> {
+        let mut messages = Vec::new();
+        for chunk in chunks {
             let mut sides = SideFiles::new(&self.dir, chunk.number);
             for record in &chunk.records {
                 let n = record.get("n").and_then(Value::as_u64).unwrap_or(0);
@@ -369,6 +395,37 @@ impl Session {
             }
         }
         Ok(messages)
+    }
+
+    /// The highest record number so far.
+    pub fn last_seq(&self) -> Result<u64> {
+        Ok(self.tail()?.1)
+    }
+
+    pub fn read_state(&self) -> Result<Value> {
+        match self.read_file("state.json")? {
+            Some(text) if !text.trim().is_empty() => Ok(serde_json::from_str(&text)?),
+            _ => Ok(serde_json::json!({})),
+        }
+    }
+
+    pub fn write_state(&self, state: &Value) -> Result<()> {
+        self.write_file("state.json", &serde_json::to_string(state)?)
+    }
+
+    /// A file in the session folder, or None if it does not exist.
+    pub fn read_file(&self, name: &str) -> Result<Option<String>> {
+        let path = self.dir.join(name);
+        match fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(path, e)),
+        }
+    }
+
+    /// Replace a file in the session folder completely, or not at all.
+    pub fn write_file(&self, name: &str, text: &str) -> Result<()> {
+        self.write_durably(&self.dir.join(name), text)
     }
 
     fn chunk_numbers(&self) -> Result<Vec<u32>> {

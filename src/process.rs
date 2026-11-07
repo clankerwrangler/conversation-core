@@ -3,6 +3,7 @@
 //! Harness -> core: {"op":"send","input":{...}}, {"op":"prepared",...}, {"op":"credentials",...}, {"op":"context"}
 //! Core -> harness: prepare_request, need_credentials, text_delta, reasoning_delta, message_end, turn_end, error
 
+use crate::context_file;
 use crate::provider::{self, Delta, Request};
 use crate::responses::Target;
 use crate::store::{Error, Session};
@@ -111,7 +112,18 @@ fn turn<I: Iterator<Item = std::io::Result<String>>>(
         .get("input")
         .ok_or_else(|| Error::Format("send needs input".into()))?;
     let user = json!({"role": "user", "content": input.get("content").cloned().unwrap_or_else(|| json!([{"type": "text", "text": input.get("text").cloned().unwrap_or(Value::Null)}])), "timestamp": now_ms()});
+    // Request boundary: an edited context file becomes the context first.
+    match context_file::accept(session)? {
+        context_file::Outcome::Unchanged => {}
+        context_file::Outcome::Accepted { messages } => {
+            emit(json!({"ev": "context_file", "accepted": true, "messages": messages}))
+        }
+        context_file::Outcome::Rejected(reason) => {
+            emit(json!({"ev": "context_file", "accepted": false, "error": reason}))
+        }
+    }
     session.append("user", &user)?;
+    context_file::publish(session)?;
 
     let context = session.context()?;
     let id = format!("r{request}");
