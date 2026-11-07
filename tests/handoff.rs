@@ -613,8 +613,8 @@ fn injected_messages_and_entries_like_pi_custom_messages() {
     ]);
     let d = dir();
     let mut core = Core::start(&d, &base);
-    // Idle: added at once, starts no turn.
-    core.op(json!({"op": "add_context", "id": "a1", "message": {"customType": "family", "content": "hello from a child", "display": true}}));
+    // Idle, not waking (an internal note): added at once, starts no turn.
+    core.op(json!({"op": "add_context", "id": "a1", "wake": false, "message": {"customType": "family", "content": "hello from a child", "display": true}}));
     assert_eq!(core.until("added")["id"], "a1");
     core.op(json!({"op": "record", "id": "e1", "ns": "harness.usage", "data": {"x": 1}}));
     assert_eq!(core.until("recorded")["id"], "e1");
@@ -655,6 +655,68 @@ fn injected_messages_and_entries_like_pi_custom_messages() {
     assert_eq!(kinds, ["chunk", "user", "app", "user"]);
     assert_eq!(h["records"][1]["source"], "family");
     assert_eq!(h["records"][2]["data"], json!({"x": 1}));
+    core.stop();
+}
+
+#[test]
+fn an_incoming_message_wakes_an_idle_session() {
+    let (base, server) = server(vec![vec![text("hi child"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "add_context", "message": {"customType": "family", "content": "message from a child"}}));
+    core.until("turn_end");
+    assert_eq!(roles(&core.context()), ["user", "assistant"]);
+    assert_eq!(server.join().unwrap().len(), 1);
+    core.stop();
+}
+
+#[test]
+fn a_message_during_a_turn_gets_a_reply_in_that_turn() {
+    let (base, server) = server(vec![
+        vec![text("first"), Step::Pause(500), done()],
+        vec![text("about the note"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    core.op(json!({"op": "add_context", "message": {"customType": "family", "content": "note"}}));
+    core.until("turn_end");
+    let ctx = core.context();
+    assert_eq!(roles(&ctx), ["user", "assistant", "user", "assistant"]);
+    assert_eq!(ctx[2]["content"][0]["text"], "note");
+    assert_eq!(server.join().unwrap().len(), 2);
+    core.stop();
+}
+
+#[test]
+fn a_follow_up_waits_for_the_turn_to_end_then_starts_one() {
+    let (base, server) = server(vec![
+        vec![call("c1", json!({})), done()],
+        vec![text("done"), done()],
+        vec![text("about the follow-up"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    core.until("tool_call");
+    core.op(json!({"op": "add_context", "deliver": "follow_up", "message": {"customType": "family", "content": "later"}}));
+    core.result("c1|fc_c1", "3");
+    core.until("turn_end");
+    core.until("turn_end");
+    let ctx = core.context();
+    assert_eq!(
+        roles(&ctx),
+        [
+            "user",
+            "assistant",
+            "toolResult",
+            "assistant",
+            "user",
+            "assistant"
+        ]
+    );
+    assert_eq!(ctx[4]["content"][0]["text"], "later");
+    assert_eq!(server.join().unwrap().len(), 3);
     core.stop();
 }
 

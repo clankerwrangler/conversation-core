@@ -37,7 +37,7 @@ a file being deleted. Modeled in `specification/ReaperReferences.tla`.
 
 The same things pi offered, as ops on `core run` (each may carry an `id`, echoed in its event):
 
-- `add_context` (pi's custom message): a message the model sees, `{customType, content, display, details}`. Added at once when idle, at the next safe point during a turn; it starts no turn. Event `added`.
+- `add_context` (pi's custom message): a message the model sees, `{customType, content, display, details}`. Like pi's `triggerTurn` it wakes the model: when idle it starts a turn; during a turn it is added at the next safe point and answered in that turn, or with `"deliver": "follow_up"` added after the turn, which then starts another. `"wake": false` (internal notes) only adds it. After an abort nothing is woken. Event `added`.
 - `record` (pi's custom entry): `{ns, data}` bookkeeping the model never sees. Event `recorded`.
 - `set_model`: `{provider, model}` and/or `{reasoning}`, saved as pi-style `settings` records and in meta.json; `prepare_request` offers it as `selected`. Event `model_set`.
 - `history`: records `from`..`to`, optionally with stored data read back (`resolve`). Event `history`. For a session that is not running: `core history <dir> <from> <to>`.

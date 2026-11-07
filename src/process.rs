@@ -305,8 +305,10 @@ impl Core {
         Ok(true)
     }
 
-    /// pi's custom message: a message the model sees, added by the runner (family
-    /// message, reminder, background notice). It starts no turn.
+    /// pi's custom message: a message the model sees, added by the runner (family message,
+    /// background notice, reminder). Like pi's `triggerTurn`, it wakes the model unless
+    /// `"wake": false` (internal notes). During a turn it is added at the next safe point and
+    /// gets a reply in that turn (pi's steer), or with `"deliver": "follow_up"` after the turn.
     fn inject(&mut self, op: &Value) -> Result<()> {
         let m = op.get("message").cloned().unwrap_or(Value::Null);
         let content = match m.get("content") {
@@ -327,12 +329,31 @@ impl Core {
         Ok(())
     }
 
-    /// Add injected messages that arrived during the turn.
-    fn flush_injected(&mut self) -> Result<()> {
-        while let Some(op) = self.injected.pop_front() {
-            self.inject(&op)?;
+    /// Add the injected messages that arrived during the turn; follow-ups wait for the
+    /// turn's end unless `all`.
+    fn flush_injected(&mut self, all: bool) -> Result<()> {
+        let pending: Vec<Value> = self.injected.drain(..).collect();
+        for op in pending {
+            if all || !follow_up(&op) {
+                self.inject(&op)?;
+            } else {
+                self.injected.push_back(op);
+            }
         }
         Ok(())
+    }
+
+    /// Run a turn, then another for as long as waking messages arrived during it.
+    /// After an abort, messages are still added but wake nothing.
+    fn run_turns(&mut self, mut start: Option<Value>) -> Result<()> {
+        loop {
+            let finished = self.turn(start.take())?;
+            let wake = finished && self.injected.iter().any(wakes);
+            self.flush_injected(true)?;
+            if !wake {
+                return Ok(());
+            }
+        }
     }
 
     fn idle(&mut self, op: &Value) -> Result<()> {
@@ -344,11 +365,15 @@ impl Core {
                 let input = op
                     .get("input")
                     .ok_or_else(|| Error::Format("send needs input".into()))?;
-                let result = self.turn(user_message(input));
-                let flushed = self.flush_injected();
-                result.and(flushed)
+                self.run_turns(Some(user_message(input)))
             }
-            Some("add_context") => self.inject(op),
+            Some("add_context") => {
+                self.inject(op)?;
+                if wakes(op) {
+                    self.run_turns(None)?;
+                }
+                Ok(())
+            }
             Some("tool_result") => self.save_result(op),
             Some("abort") => Ok(()),
             Some("context") => self
@@ -476,28 +501,32 @@ impl Core {
         });
     }
 
-    fn turn(&mut self, user: Value) -> Result<()> {
+    /// One turn, starting with `user` if given (else with what was just added). False if aborted.
+    fn turn(&mut self, user: Option<Value>) -> Result<bool> {
         self.boundary()?;
-        self.session.append("user", &user)?;
+        if let Some(user) = user {
+            self.session.append("user", &user)?;
+        }
         loop {
             match self.request()? {
-                End::Aborted => return Ok(()),
+                End::Aborted => return Ok(false),
                 End::Failed => {
                     emit(json!({"ev": "turn_end", "stopReason": "error"}));
-                    return Ok(());
+                    return Ok(true);
                 }
                 End::Reply { calls } => {
-                    if !calls && self.steer.is_empty() {
+                    let waiting = self.injected.iter().any(|op| wakes(op) && !follow_up(op));
+                    if !calls && self.steer.is_empty() && !waiting {
                         emit(json!({"ev": "turn_end", "stopReason": "stop"}));
-                        return Ok(());
+                        return Ok(true);
                     }
                 }
             }
             if !self.wait_for_normal_calls()? {
-                return Ok(());
+                return Ok(false);
             }
             self.boundary()?;
-            self.flush_injected()?;
+            self.flush_injected(false)?;
             while let Some(steer) = self.steer.pop_front() {
                 self.session.append("user", &steer)?;
             }
@@ -860,6 +889,16 @@ impl Core {
 enum Streamed {
     Ended(End),
     Retry(String),
+}
+
+/// An injected message wakes the model unless it says `"wake": false`.
+fn wakes(op: &Value) -> bool {
+    op.get("wake") != Some(&Value::Bool(false))
+}
+
+/// Delivered after the current turn rather than at its next safe point.
+fn follow_up(op: &Value) -> bool {
+    op.get("deliver").and_then(Value::as_str) == Some("follow_up")
 }
 
 /// pi's `completeSimple`: one request outside the conversation (titles), never saved. Runs on
