@@ -123,6 +123,108 @@ impl Session {
         Ok(n)
     }
 
+    /// A record the model never sees (`app` bookkeeping, `settings`): `{n, t, k, ...fields}`.
+    pub fn append_entry(&self, kind: &str, fields: Value) -> Result<u64> {
+        let (chunk, last) = self.tail()?;
+        let n = last + 1;
+        let mut record = serde_json::json!({"n": n, "t": now_iso(), "k": kind});
+        if let (Value::Object(r), Value::Object(f)) = (&mut record, fields) {
+            for (key, value) in f {
+                if !["n", "t", "k"].contains(&key.as_str()) {
+                    r.insert(key, value);
+                }
+            }
+        }
+        self.append_line(&self.log_path(chunk, None), &record)?;
+        Ok(n)
+    }
+
+    /// A message injected by the runner (pi's custom message): a `user` record whose
+    /// `source` says who added it, with pi's `display` flag and `details`.
+    pub fn append_injected(
+        &self,
+        message: &Value,
+        source: &str,
+        display: bool,
+        details: Option<&Value>,
+    ) -> Result<u64> {
+        let mut extra = serde_json::json!({"source": source, "display": display});
+        if let Some(d) = details {
+            extra["details"] = d.clone();
+        }
+        self.append_record("user", message, extra)
+    }
+
+    pub fn meta(&self) -> Result<Value> {
+        Ok(serde_json::from_str(&read(&self.dir.join("meta.json"))?)?)
+    }
+
+    /// Record a model or reasoning change (pi's `model_change` / `thinking_level_change`)
+    /// and keep the current choice in meta.json.
+    pub fn select(
+        &self,
+        provider_model: Option<(&str, &str)>,
+        reasoning: Option<&str>,
+    ) -> Result<()> {
+        let mut meta = self.meta()?;
+        if let Some((provider, model)) = provider_model {
+            self.append_entry(
+                "settings",
+                serde_json::json!({"type": "model_change", "provider": provider, "modelId": model}),
+            )?;
+            meta["model"] = serde_json::json!({"provider": provider, "id": model});
+        }
+        if let Some(level) = reasoning {
+            self.append_entry(
+                "settings",
+                serde_json::json!({"type": "thinking_level_change", "thinkingLevel": level}),
+            )?;
+            meta["reasoning"] = Value::String(level.to_string());
+        }
+        self.write_durably(&self.dir.join("meta.json"), &serde_json::to_string(&meta)?)
+    }
+
+    /// Records numbered `from..=to` across chunks, references named by file. With `resolve`,
+    /// bulky parts are read back; one whose stored data is gone stays a reference and the
+    /// record gets `"expired": true`.
+    pub fn history(&self, from: u64, to: u64, resolve: bool) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        let mut resolver = Resolver {
+            dir: self.dir.clone(),
+            files: HashMap::new(),
+        };
+        for number in self.chunk_numbers()? {
+            let chunk = self.load_chunk(number)?;
+            let last = chunk
+                .records
+                .last()
+                .and_then(|r| r.get("n"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if last < from {
+                continue;
+            }
+            for record in &chunk.records {
+                let n = record.get("n").and_then(Value::as_u64).unwrap_or(0);
+                if n < from || n > to {
+                    continue;
+                }
+                let mut r = qualify(number, record);
+                if resolve && let Some(m) = r.get("m").cloned() {
+                    match resolver.resolve(&m) {
+                        Ok(full) => r["m"] = full,
+                        Err(_) => r["expired"] = Value::Bool(true),
+                    }
+                }
+                out.push(r);
+            }
+            if last >= to {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Replies opened but never closed (a crash mid-reply), oldest first.
     pub fn unfinished_replies(&self) -> Result<Vec<u64>> {
         let mut open: Vec<u64> = Vec::new();
@@ -618,7 +720,15 @@ impl Session {
 
     fn load_chunk(&self, number: u32) -> Result<Chunk> {
         let path = self.dir.join("log").join(format!("{number:06}.jsonl"));
-        let records = read(&path)?
+        let mut text = read(&path)?;
+        // Another process (a history reader) may see a line still being written: every
+        // complete record ends with a newline, so an unterminated tail is not read yet.
+        if !text.ends_with('\n')
+            && let Some(end) = text.rfind('\n')
+        {
+            text.truncate(end + 1);
+        }
+        let records = text
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(serde_json::from_str)

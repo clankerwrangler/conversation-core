@@ -33,6 +33,16 @@ finished deleting, and must only delete files not listed. The core takes the
 same lock only while accepting a new context, so a new reference never names
 a file being deleted. Modeled in `specification/ReaperReferences.tla`.
 
+## What a runner can do besides turns
+
+The same things pi offered, as ops on `core run` (each may carry an `id`, echoed in its event):
+
+- `add_context` (pi's custom message): a message the model sees, `{customType, content, display, details}`. Added at once when idle, at the next safe point during a turn; it starts no turn. Event `added`.
+- `record` (pi's custom entry): `{ns, data}` bookkeeping the model never sees. Event `recorded`.
+- `set_model`: `{provider, model}` and/or `{reasoning}`, saved as pi-style `settings` records and in meta.json; `prepare_request` offers it as `selected`. Event `model_set`.
+- `history`: records `from`..`to`, optionally with stored data read back (`resolve`). Event `history`. For a session that is not running: `core history <dir> <from> <to>`.
+- `complete` (pi's `completeSimple`): `{model, instructions, messages, reasoning}`, one request outside the conversation, never saved. It asks for credentials like a turn; event `completed` with `message` or `error`.
+
 ## Built-in tools
 
 The core has pi 1.5's seven basic tools built in: `read`, `bash`, `edit`,

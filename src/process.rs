@@ -93,6 +93,10 @@ struct Core {
     models: Models,
     /// Models already reported as having no known window.
     warned: HashSet<String>,
+    /// Injected messages that arrived mid-turn, added at the next safe point.
+    injected: VecDeque<Value>,
+    /// One-off completions waiting for their credentials, by id.
+    completions: HashMap<String, Value>,
 }
 
 pub fn run(dir: &Path, disabled: Vec<String>, models: Models) -> Result<()> {
@@ -150,6 +154,8 @@ pub fn run(dir: &Path, disabled: Vec<String>, models: Models) -> Result<()> {
         tool_env: Vec::new(),
         models,
         warned: HashSet::new(),
+        injected: VecDeque::new(),
+        completions: HashMap::new(),
     };
     while let Some(op) = core.next_idle_op() {
         if let Err(err) = core.idle(&op) {
@@ -236,20 +242,113 @@ impl Core {
         }
     }
 
+    /// Ops answered the same way whether or not a turn is running. True if `op` was one.
+    fn anytime(&mut self, op: &Value) -> Result<bool> {
+        let id = op.get("id").cloned().unwrap_or(Value::Null);
+        let text = |key: &str| op.get(key).and_then(Value::as_str);
+        match text("op") {
+            // pi's custom entry: harness bookkeeping the model never sees.
+            Some("record") => {
+                let ns = text("ns").ok_or_else(|| Error::Format("record needs ns".into()))?;
+                let data = op.get("data").cloned().unwrap_or(Value::Null);
+                let n = self
+                    .session
+                    .append_entry("app", json!({"ns": ns, "data": data}))?;
+                emit(json!({"ev": "recorded", "id": id, "n": n}));
+            }
+            Some("set_model") => {
+                let model = match (text("provider"), text("model")) {
+                    (Some(p), Some(m)) => Some((p, m)),
+                    (None, None) => None,
+                    _ => {
+                        return Err(Error::Format(
+                            "set_model needs provider and model together".into(),
+                        ));
+                    }
+                };
+                self.session.select(model, text("reasoning"))?;
+                let meta = self.session.meta()?;
+                emit(
+                    json!({"ev": "model_set", "id": id, "model": meta.get("model"), "reasoning": meta.get("reasoning")}),
+                );
+            }
+            Some("history") => {
+                let num = |key: &str| op.get(key).and_then(Value::as_u64);
+                let from = num("from").unwrap_or(1);
+                let to = num("to").unwrap_or(u64::MAX);
+                let resolve = op.get("resolve") == Some(&Value::Bool(true));
+                let records = self.session.history(from, to, resolve)?;
+                emit(
+                    json!({"ev": "history", "id": id, "records": records, "last": self.session.last_seq()?}),
+                );
+            }
+            Some("complete") => {
+                let key = text("id")
+                    .ok_or_else(|| Error::Format("complete needs id".into()))?
+                    .to_string();
+                let provider = op
+                    .pointer("/model/provider")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                self.completions.insert(key.clone(), op.clone());
+                emit(json!({"ev": "need_credentials", "id": key, "provider": provider}));
+            }
+            Some("credentials") if text("id").is_some_and(|i| self.completions.contains_key(i)) => {
+                let request = self
+                    .completions
+                    .remove(text("id").unwrap_or(""))
+                    .unwrap_or(Value::Null);
+                start_completion(request, op.clone(), self.session_id.clone());
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// pi's custom message: a message the model sees, added by the runner (family
+    /// message, reminder, background notice). It starts no turn.
+    fn inject(&mut self, op: &Value) -> Result<()> {
+        let m = op.get("message").cloned().unwrap_or(Value::Null);
+        let content = match m.get("content") {
+            Some(Value::String(s)) => json!([{"type": "text", "text": s}]),
+            Some(blocks @ Value::Array(_)) => blocks.clone(),
+            _ => return Err(Error::Format("add_context needs message.content".into())),
+        };
+        let source = m
+            .get("customType")
+            .and_then(Value::as_str)
+            .unwrap_or("runner");
+        let display = m.get("display").and_then(Value::as_bool).unwrap_or(true);
+        let message = json!({"role": "user", "content": content, "timestamp": provider::now_ms()});
+        let n = self
+            .session
+            .append_injected(&message, source, display, m.get("details"))?;
+        emit(json!({"ev": "added", "id": op.get("id"), "n": n}));
+        Ok(())
+    }
+
+    /// Add injected messages that arrived during the turn.
+    fn flush_injected(&mut self) -> Result<()> {
+        while let Some(op) = self.injected.pop_front() {
+            self.inject(&op)?;
+        }
+        Ok(())
+    }
+
     fn idle(&mut self, op: &Value) -> Result<()> {
+        if self.anytime(op)? {
+            return Ok(());
+        }
         match op.get("op").and_then(Value::as_str) {
-            Some("send") => {
+            Some("send") | Some("steer") => {
                 let input = op
                     .get("input")
                     .ok_or_else(|| Error::Format("send needs input".into()))?;
-                self.turn(user_message(input))
+                let result = self.turn(user_message(input));
+                let flushed = self.flush_injected();
+                result.and(flushed)
             }
-            Some("steer") => {
-                let input = op
-                    .get("input")
-                    .ok_or_else(|| Error::Format("steer needs input".into()))?;
-                self.turn(user_message(input))
-            }
+            Some("add_context") => self.inject(op),
             Some("tool_result") => self.save_result(op),
             Some("abort") => Ok(()),
             Some("context") => self
@@ -271,7 +370,14 @@ impl Core {
 
     /// Handle an op that arrives mid-turn. Returns true on abort.
     fn during_turn(&mut self, op: Value) -> Result<bool> {
+        if self.anytime(&op)? {
+            return Ok(false);
+        }
         match op.get("op").and_then(Value::as_str) {
+            Some("add_context") => {
+                self.injected.push_back(op);
+                Ok(false)
+            }
             Some("tool_result") => self.save_result(&op).map(|_| false),
             Some("steer") => {
                 if let Some(input) = op.get("input") {
@@ -391,6 +497,7 @@ impl Core {
                 return Ok(());
             }
             self.boundary()?;
+            self.flush_injected()?;
             while let Some(steer) = self.steer.pop_front() {
                 self.session.append("user", &steer)?;
             }
@@ -504,7 +611,10 @@ impl Core {
         let context = self.session.resolve(&refs)?;
         self.requests += 1;
         let id = format!("r{}", self.requests);
-        emit(json!({"ev": "prepare_request", "id": id, "context": context}));
+        // The model and reasoning last chosen with set_model, for the runner to use.
+        let meta = self.session.meta()?;
+        let selected = json!({"model": meta.get("model"), "reasoning": meta.get("reasoning")});
+        emit(json!({"ev": "prepare_request", "id": id, "context": context, "selected": selected}));
         let Some(prepared) = self.answer("prepared", &id)? else {
             self.abort(None)?;
             return Ok(End::Aborted);
@@ -750,6 +860,89 @@ impl Core {
 enum Streamed {
     Ended(End),
     Retry(String),
+}
+
+/// pi's `completeSimple`: one request outside the conversation (titles), never saved. Runs on
+/// its own thread and ends with one `completed` event carrying the reply or an error.
+fn start_completion(request: Value, credentials: Value, session_id: String) {
+    std::thread::spawn(move || {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let field = |key: &str| {
+            request
+                .pointer(&format!("/model/{key}"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let (api, provider_name, model_id, base_url) = (
+            field("api"),
+            field("provider"),
+            field("id"),
+            field("baseUrl"),
+        );
+        let target = Target {
+            api: &api,
+            provider: &provider_name,
+            model: &model_id,
+        };
+        let Some(token) = credentials.get("token").and_then(Value::as_str) else {
+            emit(json!({"ev": "completed", "id": id, "error": "credentials need token"}));
+            return;
+        };
+        let messages = request
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let req = Request {
+            target: Target {
+                api: &api,
+                provider: &provider_name,
+                model: &model_id,
+            },
+            base_url: &base_url,
+            instructions: request
+                .get("instructions")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            reasoning: request.get("reasoning").and_then(Value::as_str),
+            tools: &[],
+            session_id: &session_id,
+            token,
+            account_id: credentials.get("accountId").and_then(Value::as_str),
+        };
+        let ready = match provider::prepare(&req, &messages) {
+            Ok(r) => r,
+            Err(e) => {
+                emit(json!({"ev": "completed", "id": id, "error": e.to_string()}));
+                return;
+            }
+        };
+        let (tx, rx) = channel();
+        provider::spawn(ready, move |piece| {
+            let _ = tx.send(piece);
+        });
+        let mut message = provider::empty_reply(&target);
+        let mut blocks = Vec::new();
+        for piece in rx {
+            match piece {
+                Piece::Block(b) => blocks.push(b),
+                Piece::Done { usage, incomplete } => {
+                    message["content"] = Value::Array(blocks);
+                    message["usage"] = usage;
+                    message["stopReason"] = json!(if incomplete { "length" } else { "stop" });
+                    emit(json!({"ev": "completed", "id": id, "message": message}));
+                    return;
+                }
+                Piece::Failed(Failure::Retryable(e) | Failure::Fatal(e)) => {
+                    emit(json!({"ev": "completed", "id": id, "error": e}));
+                    return;
+                }
+                Piece::Text(_) | Piece::Reasoning(_) => {}
+            }
+        }
+        emit(json!({"ev": "completed", "id": id, "error": "the stream ended without a reply"}));
+    });
 }
 
 fn user_message(input: &Value) -> Value {

@@ -10,7 +10,7 @@ mod tools;
 use std::path::Path;
 use std::process::ExitCode;
 
-const USAGE: &str = "core run <session-dir> [--no-tool <name>]... [--models <file>] | core context <session-dir> | core input <session-dir> <api> <provider> <model> | core referenced <session-dir> | core tool <name> <arguments-json>";
+const USAGE: &str = "core run <session-dir> [--no-tool <name>]... [--models <file>] | core context <session-dir> | core input <session-dir> <api> <provider> <model> | core referenced <session-dir> | core history <session-dir> <from> <to> | core tool <name> <arguments-json>";
 
 /// `--no-tool <name>` and `--models <file>` after `run <dir>`; None if anything else is there.
 fn run_flags(rest: &[String]) -> Option<(Vec<String>, Option<std::path::PathBuf>)> {
@@ -65,6 +65,17 @@ fn main() -> ExitCode {
                 serde_json::to_string(&tools::run(name, &arguments, &ctx))
                     .map_err(store::Error::from)
             }),
+        // Records numbered from..=to (with stored data read back), for a session not running.
+        [_, cmd, dir, from, to] if cmd == "history" => {
+            match (from.parse::<u64>(), to.parse::<u64>()) {
+                (Ok(from), Ok(to)) => store::Session::open(Path::new(dir))
+                    .and_then(|session| session.history(from, to, true))
+                    .and_then(|records| {
+                        serde_json::to_string(&records).map_err(store::Error::from)
+                    }),
+                _ => Err(store::Error::Usage(USAGE)),
+            }
+        }
         [_, cmd, dir] if cmd == "referenced" => store::Session::open(Path::new(dir))
             .and_then(|session| session.referenced())
             .and_then(|files| serde_json::to_string(&files).map_err(store::Error::from)),

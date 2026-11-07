@@ -606,6 +606,109 @@ fn a_new_context_waits_while_a_cleanup_holds_the_references_lock() {
 }
 
 #[test]
+fn injected_messages_and_entries_like_pi_custom_messages() {
+    let (base, server) = server(vec![
+        vec![call("c1", json!({})), done()],
+        vec![text("ok"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    // Idle: added at once, starts no turn.
+    core.op(json!({"op": "add_context", "id": "a1", "message": {"customType": "family", "content": "hello from a child", "display": true}}));
+    assert_eq!(core.until("added")["id"], "a1");
+    core.op(json!({"op": "record", "id": "e1", "ns": "harness.usage", "data": {"x": 1}}));
+    assert_eq!(core.until("recorded")["id"], "e1");
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    core.until("tool_call");
+    // Mid-turn: held until the next safe point (after the call's result).
+    core.op(json!({"op": "add_context", "id": "a2", "message": {"customType": "reminder", "content": "late note"}}));
+    core.result("c1|fc_c1", "3");
+    core.until("turn_end");
+    let ctx = core.context();
+    assert_eq!(
+        roles(&ctx),
+        [
+            "user",
+            "user",
+            "assistant",
+            "toolResult",
+            "user",
+            "assistant"
+        ]
+    );
+    assert_eq!(ctx[0]["content"][0]["text"], "hello from a child");
+    assert_eq!(ctx[4]["content"][0]["text"], "late note");
+    let bodies = server.join().unwrap();
+    assert!(
+        bodies[1].to_string().contains("late note"),
+        "the note reached the next request"
+    );
+    // History shows the bookkeeping entry and the injected message's source.
+    core.op(json!({"op": "history", "id": "h1", "from": 1, "to": 4, "resolve": true}));
+    let h = core.until("history");
+    let kinds: Vec<&str> = h["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["k"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["chunk", "user", "app", "user"]);
+    assert_eq!(h["records"][1]["source"], "family");
+    assert_eq!(h["records"][2]["data"], json!({"x": 1}));
+    core.stop();
+}
+
+#[test]
+fn set_model_is_recorded_and_offered_to_the_runner() {
+    let (base, server) = server(vec![vec![text("hi"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "set_model", "id": "s1", "provider": "openai-codex", "model": "gpt-6.1-sol", "reasoning": "high"}));
+    let set = core.until("model_set");
+    assert_eq!(
+        (&set["model"]["id"], &set["reasoning"]),
+        (&json!("gpt-6.1-sol"), &json!("high"))
+    );
+    core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    let ev = core.events.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert_eq!(ev["ev"], "prepare_request");
+    assert_eq!(ev["selected"]["model"]["id"], "gpt-6.1-sol");
+    let model =
+        json!({"api": "openai-responses", "provider": "test", "id": "m", "baseUrl": core.base});
+    core.op(json!({"op": "prepared", "id": ev["id"], "model": model}));
+    core.until("turn_end");
+    server.join().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_core"))
+        .args(["history", d.to_str().unwrap(), "1", "3"])
+        .output()
+        .unwrap();
+    let records: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(records[1]["type"], "model_change");
+    assert_eq!(records[2]["thinkingLevel"], "high");
+    core.stop();
+}
+
+#[test]
+fn a_one_off_completion_is_answered_and_never_saved() {
+    let (base, server) = server(vec![vec![text("A short title"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    let model = json!({"api": "openai-responses", "provider": "test", "id": "m", "baseUrl": base});
+    core.op(
+        json!({"op": "complete", "id": "t1", "model": model, "instructions": "Title this.",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "a long chat"}]}]}),
+    );
+    // `until` answers the completion's need_credentials (id "t1") like any other.
+    let done = core.until("completed");
+    assert_eq!(done["id"], "t1");
+    assert_eq!(done["message"]["content"][0]["text"], "A short title");
+    assert!(core.context().is_empty(), "nothing was saved");
+    let body = &server.join().unwrap()[0];
+    assert_eq!(body["tools"], json!([]));
+    core.stop();
+}
+
+#[test]
 fn after_a_crash_a_saved_call_gets_an_interrupted_result_and_is_not_rerun() {
     let (base, _server) = server(vec![vec![call("c1", json!({})), Step::Pause(5000)]]);
     let d = dir();
