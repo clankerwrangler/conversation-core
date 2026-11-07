@@ -157,7 +157,7 @@ fn recover_calls(session: &Session) -> Result<()> {
             let id = block.get("id").and_then(Value::as_str).unwrap_or("");
             if !id.is_empty() && !results.iter().any(|r| r == id) {
                 let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                session.append("tool", &tool_result_message(id, name, "Interrupted: the process stopped while this call was running. Its outcome is unknown; it was not re-run.", true))?;
+                session.append("tool", &tool_result_message(id, name, "Interrupted: the process stopped after this call was saved. It may or may not have run; its outcome is unknown, and it was not re-run.", true))?;
             }
         }
     }

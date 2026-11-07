@@ -337,7 +337,7 @@ fn after_a_crash_a_saved_call_gets_an_interrupted_result_and_is_not_rerun() {
         ctx[2]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("Interrupted")
+            .contains("may or may not have run")
     );
     assert_eq!(ctx[1]["stopReason"], "error", "the open reply was closed");
     again.stop();
