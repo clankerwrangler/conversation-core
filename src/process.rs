@@ -12,15 +12,22 @@
 //! part stays, a cut-off note is added and the conversation continues. Abort cancels
 //! every unfinished call. On open, a saved call without a result gets an interrupted
 //! result; nothing is re-run.
+//!
+//! Built-in tools (pi's read, bash, edit, write, grep, find, ls) run inside the core: their
+//! `tool_call` event says `"builtin": true`, so the runner only shows it, and a `tool_result`
+//! event follows once the result is saved. A runner tool with the same name replaces a
+//! built-in; `--no-tool <name>` turns one off.
 
 use crate::context_file;
 use crate::provider::{self, Failure, Piece, Request};
 use crate::responses::Target;
 use crate::store::{Error, Session};
+use crate::tools;
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
@@ -38,6 +45,8 @@ fn emit(event: Value) {
 enum Msg {
     Op(Value),
     Piece(u64, Piece),
+    /// A built-in tool finished: call id and result.
+    Builtin(String, Value),
     Closed,
 }
 
@@ -68,9 +77,19 @@ struct Core {
     requests: u64,
     attempts: u64,
     closed: bool,
+    /// The folder the core was started in: built-in tools work there.
+    cwd: PathBuf,
+    /// Built-ins turned off with `--no-tool`.
+    disabled: Vec<String>,
+    /// Built-ins offered in the current request (not disabled, not replaced by a runner tool).
+    active: HashSet<String>,
+    /// Running built-in calls.
+    running: HashMap<String, Arc<tools::Cancel>>,
+    /// PI_* variables for bash, from the current request.
+    tool_env: Vec<(String, String)>,
 }
 
-pub fn run(dir: &Path) -> Result<()> {
+pub fn run(dir: &Path, disabled: Vec<String>) -> Result<()> {
     let session = if dir.join("meta.json").exists() {
         Session::open(dir)?
     } else {
@@ -118,6 +137,11 @@ pub fn run(dir: &Path) -> Result<()> {
         requests: 0,
         attempts: 0,
         closed: false,
+        cwd: std::env::current_dir().map_err(|e| Error::Io(PathBuf::from("."), e))?,
+        disabled,
+        active: HashSet::new(),
+        running: HashMap::new(),
+        tool_env: Vec::new(),
     };
     while let Some(op) = core.next_idle_op() {
         if let Err(err) = core.idle(&op) {
@@ -170,16 +194,23 @@ fn tool_result_message(call: &str, name: &str, text: &str, is_error: bool) -> Va
 }
 
 impl Core {
-    fn recv(&mut self) -> Msg {
-        if self.closed {
-            return Msg::Closed;
-        }
-        match self.rx.recv() {
-            Ok(Msg::Closed) | Err(_) => {
-                self.closed = true;
-                Msg::Closed
+    /// The next message. Built-in results are saved here, whatever the caller is waiting for,
+    /// and returned (as saved) so the caller re-checks what it waits for; after stdin closes,
+    /// running built-ins are still waited for.
+    fn recv(&mut self) -> Result<Msg> {
+        loop {
+            if self.closed && self.running.is_empty() {
+                return Ok(Msg::Closed);
             }
-            Ok(msg) => msg,
+            match self.rx.recv() {
+                Ok(Msg::Builtin(id, result)) => {
+                    self.running.remove(&id);
+                    self.record(&id, &result, true)?;
+                    return Ok(Msg::Builtin(id, Value::Null));
+                }
+                Ok(Msg::Closed) | Err(_) => self.closed = true,
+                Ok(msg) => return Ok(msg),
+            }
         }
     }
 
@@ -189,9 +220,10 @@ impl Core {
         }
         loop {
             match self.recv() {
-                Msg::Op(op) => return Some(op),
-                Msg::Piece(..) => continue, // a stale reply after an abort
-                Msg::Closed => return None,
+                Ok(Msg::Op(op)) => return Some(op),
+                Ok(Msg::Closed) => return None,
+                Ok(_) => continue, // a stale reply after an abort
+                Err(err) => emit(json!({"ev": "error", "error": err.to_string()})),
             }
         }
     }
@@ -248,7 +280,7 @@ impl Core {
     /// Wait for the harness's answer to a request this core made.
     fn answer(&mut self, op: &str, id: &str) -> Result<Option<Value>> {
         loop {
-            match self.recv() {
+            match self.recv()? {
                 Msg::Op(value) => {
                     if value.get("op").and_then(Value::as_str) == Some(op)
                         && value.get("id").and_then(Value::as_str) == Some(id)
@@ -259,7 +291,7 @@ impl Core {
                         return Ok(None);
                     }
                 }
-                Msg::Piece(..) => {}
+                Msg::Piece(..) | Msg::Builtin(..) => {}
                 Msg::Closed => {
                     return Err(Error::Format(format!(
                         "stdin closed while waiting for {op}"
@@ -270,18 +302,35 @@ impl Core {
     }
 
     fn save_result(&mut self, op: &Value) -> Result<()> {
-        let id = op.get("call").and_then(Value::as_str).unwrap_or("");
-        let Some(call) = self.calls.get_mut(id) else {
+        let id = op
+            .get("call")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if self.running.contains_key(&id) {
             emit(
-                json!({"ev": "error", "error": format!("tool_result for unknown or finished call {id}")}),
+                json!({"ev": "error", "error": format!("tool_result for built-in call {id} ignored")}),
             );
+            return Ok(());
+        }
+        let result = op.get("result").cloned().unwrap_or(Value::Null);
+        self.record(&id, &result, false)
+    }
+
+    /// Save a call's result, unless it already has one (cancelled or answered).
+    fn record(&mut self, id: &str, result: &Value, builtin: bool) -> Result<()> {
+        let Some(call) = self.calls.get_mut(id) else {
+            if !builtin {
+                emit(
+                    json!({"ev": "error", "error": format!("tool_result for unknown or finished call {id}")}),
+                );
+            }
             return Ok(());
         };
         if call.done {
-            return Ok(()); // already cancelled or answered: never record a second outcome
+            return Ok(()); // never record a second outcome
         }
         call.done = true;
-        let result = op.get("result").cloned().unwrap_or(Value::Null);
         let mut message = json!({"role": "toolResult", "toolCallId": id, "toolName": call.name,
             "content": result.get("content").cloned().unwrap_or_else(|| json!([])),
             "isError": result.get("isError").cloned().unwrap_or(json!(false)), "timestamp": provider::now_ms()});
@@ -289,7 +338,26 @@ impl Core {
             message["details"] = details.clone();
         }
         self.session.append("tool", &message)?;
+        if builtin {
+            emit(json!({"ev": "tool_result", "call": id, "result": result}));
+        }
         Ok(())
+    }
+
+    /// Run a built-in call on its own thread; its result comes back as `Msg::Builtin`.
+    fn start_builtin(&mut self, id: &str, name: &str, arguments: Value) {
+        let cancel = Arc::new(tools::Cancel::default());
+        self.running.insert(id.to_string(), cancel.clone());
+        let ctx = tools::Context {
+            cwd: self.cwd.clone(),
+            env: self.tool_env.clone(),
+            cancel,
+        };
+        let (tx, id, name) = (self.tx.clone(), id.to_string(), name.to_string());
+        std::thread::spawn(move || {
+            let result = tools::run(&name, &arguments, &ctx);
+            let _ = tx.send(Msg::Builtin(id, result));
+        });
     }
 
     fn turn(&mut self, user: Value) -> Result<()> {
@@ -336,14 +404,14 @@ impl Core {
     /// Every normal call has a result. False if aborted.
     fn wait_for_normal_calls(&mut self) -> Result<bool> {
         while self.calls.values().any(|c| !c.done && !c.is_async) {
-            match self.recv() {
+            match self.recv()? {
                 Msg::Op(op) => {
                     if self.during_turn(op)? {
                         self.abort(None)?;
                         return Ok(false);
                     }
                 }
-                Msg::Piece(..) => {}
+                Msg::Piece(..) | Msg::Builtin(..) => {}
                 Msg::Closed => {
                     return Err(Error::Format(
                         "stdin closed while tools were running".into(),
@@ -366,6 +434,9 @@ impl Core {
             emit(json!({"ev": "cancel", "calls": unfinished}));
         }
         for id in &unfinished {
+            if let Some(cancel) = self.running.remove(id) {
+                cancel.cancel();
+            }
             if let Some(call) = self.calls.get_mut(id) {
                 call.done = true;
                 let message = tool_result_message(id, &call.name, "Cancelled.", true);
@@ -422,7 +493,37 @@ impl Core {
             .get("token")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Format("credentials need token".into()))?;
-        let empty = Vec::new();
+        // Built-ins first, then the runner's tools; a runner tool replaces a built-in of its name.
+        let runner_tools = prepared
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let runner_names: HashSet<&str> = runner_tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        self.active = tools::NAMES
+            .iter()
+            .filter(|n| !runner_names.contains(**n) && !self.disabled.iter().any(|d| d == **n))
+            .map(|n| n.to_string())
+            .collect();
+        let mut request_tools: Vec<Value> = tools::NAMES
+            .iter()
+            .filter(|n| self.active.contains(**n))
+            .filter_map(|n| tools::definition(n).cloned())
+            .collect();
+        request_tools.extend(runner_tools.iter().cloned());
+        let reasoning = prepared.get("reasoning").and_then(Value::as_str);
+        self.tool_env = vec![
+            ("PI_SESSION_ID".into(), self.session_id.clone()),
+            ("PI_PROVIDER".into(), provider_name.clone()),
+            ("PI_MODEL".into(), model_id.clone()),
+        ];
+        if let Some(level) = reasoning {
+            self.tool_env
+                .push(("PI_REASONING_LEVEL".into(), level.to_string()));
+        }
         let session_id = self.session_id.clone();
         let target = Target {
             api: &api,
@@ -440,11 +541,8 @@ impl Core {
                 .get("instructions")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
-            reasoning: prepared.get("reasoning").and_then(Value::as_str),
-            tools: prepared
-                .get("tools")
-                .and_then(Value::as_array)
-                .unwrap_or(&empty),
+            reasoning,
+            tools: &request_tools,
             session_id: &session_id,
             token,
             account_id: credentials.get("accountId").and_then(Value::as_str),
@@ -479,9 +577,9 @@ impl Core {
         let mut open: Option<u64> = None;
         let mut has_calls = false;
         loop {
-            let piece = match self.recv() {
+            let piece = match self.recv()? {
                 Msg::Piece(t, piece) if t == tag => piece,
-                Msg::Piece(..) => continue,
+                Msg::Piece(..) | Msg::Builtin(..) => continue,
                 Msg::Op(op) => {
                     if self.during_turn(op)? {
                         self.abort(open.map(|r| (r, unsaved.as_slice())))?;
@@ -533,9 +631,15 @@ impl Core {
                                 done: false,
                             },
                         );
+                        let builtin = self.active.contains(&name);
                         emit(
-                            json!({"ev": "tool_call", "call": id, "name": name, "arguments": block.get("arguments"), "async": is_async}),
+                            json!({"ev": "tool_call", "call": id, "name": name, "arguments": block.get("arguments"), "async": is_async, "builtin": builtin}),
                         );
+                        if builtin {
+                            let arguments =
+                                block.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                            self.start_builtin(&id, &name, arguments);
+                        }
                     }
                 }
                 Piece::Done { usage, incomplete } => {

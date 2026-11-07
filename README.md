@@ -6,10 +6,23 @@ runs it, and keeps the context within budget. It knows nothing about the
 program that drives it.
 
 ```
-core run <session-dir>        one session as a process: JSON lines on stdin/stdout
+core run <session-dir> [--no-tool <name>]...   one session as a process: JSON lines on stdin/stdout
 core context <session-dir>    print the context the next request would send
 core input <session-dir> <api> <provider> <model>   print the Responses request input
+core tool <name> <arguments-json>   run one built-in tool in the current folder, print its result
 ```
+
+## Built-in tools
+
+The core has pi 1.5's seven basic tools built in: `read`, `bash`, `edit`,
+`write`, `grep`, `find`, `ls`. Names, parameters, output text, limits and
+edit rules are pi's; `grep` and `find` use ripgrep's and fd's libraries
+instead of the programs. They work in the folder the core was started in.
+
+All seven are offered by default. `--no-tool <name>` turns one off; a tool
+the runner sends in `prepared.tools` with the same name replaces it. A
+built-in call's `tool_call` event has `"builtin": true` (the runner only
+shows it), and a `tool_result` event follows once its result is saved.
 
 The session folder format, the context rule and the message protocol are
 described in the design document. `specification/` holds the TLA+ models;

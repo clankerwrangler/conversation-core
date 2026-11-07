@@ -88,18 +88,31 @@ fn done() -> Step {
     )
 }
 
+fn named_call(id: &str, name: &str, args: Value) -> Step {
+    item_done(
+        json!({"type": "function_call", "id": format!("fc_{id}"), "call_id": id, "name": name, "arguments": args.to_string()}),
+    )
+}
+
 struct Core {
     child: Child,
     stdin: ChildStdin,
     events: Receiver<Value>,
     base: String,
     dir: PathBuf,
+    /// Runner tools sent with `prepared`.
+    tools: Value,
 }
 
 impl Core {
     fn start(dir: &Path, base: &str) -> Core {
+        Core::start_with(dir, base, &[], json!([]))
+    }
+
+    fn start_with(dir: &Path, base: &str, flags: &[&str], tools: Value) -> Core {
         let mut child = Command::new(env!("CARGO_BIN_EXE_core"))
             .args(["run", dir.to_str().unwrap()])
+            .args(flags)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -118,6 +131,7 @@ impl Core {
             events,
             base: base.to_string(),
             dir: dir.to_path_buf(),
+            tools,
         }
     }
 
@@ -132,10 +146,13 @@ impl Core {
                 .events
                 .recv_timeout(Duration::from_secs(20))
                 .expect("core went quiet");
+            if std::env::var_os("CORE_TEST_TRACE").is_some() {
+                eprintln!("event: {ev}");
+            }
             match ev["ev"].as_str() {
                 Some("prepare_request") => {
                     let model = json!({"api": "openai-responses", "provider": "test", "id": "m", "baseUrl": self.base});
-                    self.op(json!({"op": "prepared", "id": ev["id"], "model": model}));
+                    self.op(json!({"op": "prepared", "id": ev["id"], "model": model, "tools": self.tools}));
                 }
                 Some("need_credentials") => {
                     self.op(json!({"op": "credentials", "id": ev["id"], "token": "t"}))
@@ -316,6 +333,91 @@ fn abort_cancels_unfinished_calls_and_ignores_late_results() {
     core.result("c1|fc_c1", "too late");
     let ctx = core.context();
     assert_eq!(roles(&ctx), ["user", "assistant", "toolResult"]);
+    assert_eq!(ctx[2]["content"][0]["text"], "Cancelled.");
+    core.stop();
+}
+
+fn tool_names(body: &Value) -> Vec<String> {
+    body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn built_in_calls_run_inside_the_core() {
+    let (base, server) = server(vec![
+        vec![
+            named_call("c1", "bash", json!({"command": "echo hi", "timeout": null})),
+            done(),
+        ],
+        vec![text("ok"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "run it"}}));
+    let call = core.next();
+    assert_eq!(
+        (&call["ev"], &call["builtin"]),
+        (&json!("tool_call"), &json!(true))
+    );
+    let result = core.until("tool_result");
+    assert_eq!(result["result"]["content"][0]["text"], "hi\n");
+    core.until("turn_end");
+    let ctx = core.context();
+    assert_eq!(
+        roles(&ctx),
+        ["user", "assistant", "toolResult", "assistant"]
+    );
+    assert_eq!(ctx[2]["content"][0]["text"], "hi\n");
+    let bodies = server.join().unwrap();
+    assert_eq!(
+        tool_names(&bodies[0]),
+        ["read", "bash", "edit", "write", "grep", "find", "ls"]
+    );
+    assert_eq!(bodies[0]["tools"][1]["strict"], true);
+    core.stop();
+}
+
+#[test]
+fn a_runner_tool_replaces_a_built_in_and_no_tool_turns_one_off() {
+    let (base, server) = server(vec![vec![text("hi"), done()]]);
+    let d = dir();
+    let mine = json!([{"type": "function", "name": "read", "description": "runner read", "parameters": {"type": "object"}}]);
+    let mut core = Core::start_with(&d, &base, &["--no-tool", "bash", "--no-tool", "ls"], mine);
+    core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    core.until("turn_end");
+    let bodies = server.join().unwrap();
+    assert_eq!(
+        tool_names(&bodies[0]),
+        ["edit", "write", "grep", "find", "read"]
+    );
+    assert_eq!(bodies[0]["tools"][4]["description"], "runner read");
+    core.stop();
+}
+
+#[test]
+fn abort_kills_a_running_built_in() {
+    let d = dir();
+    let marker = std::env::temp_dir().join(format!(
+        "core-marker-{}",
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let command = format!("sleep 1.5; touch {}", marker.display());
+    let (base, _server) = server(vec![vec![
+        named_call("c1", "bash", json!({"command": command})),
+        done(),
+    ]]);
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    assert_eq!(core.next()["builtin"], true);
+    core.op(json!({"op": "abort"}));
+    assert_eq!(core.until("turn_end")["stopReason"], "aborted");
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(!marker.exists(), "the shell's process group was killed");
+    let ctx = core.context();
     assert_eq!(ctx[2]["content"][0]["text"], "Cancelled.");
     core.stop();
 }
