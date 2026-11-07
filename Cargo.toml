@@ -1,0 +1,18 @@
+[package]
+name = "conversation-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "core"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+sha2 = "0.10"
+ureq = "3"
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
