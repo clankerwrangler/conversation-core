@@ -83,6 +83,31 @@ impl Session {
     /// Append a model-visible record, moving bulky parts to side files first.
     /// Returns the record's sequence number.
     pub fn append(&self, kind: &str, message: &Value) -> Result<u64> {
+        self.append_record(kind, message, serde_json::json!({}))
+    }
+
+    /// Open a reply that is still streaming: its first tool call is complete, so the
+    /// reply so far is saved before that call runs. Later parts follow with `append_more`.
+    pub fn append_open_reply(&self, message: &Value) -> Result<u64> {
+        self.append_record("assistant", message, serde_json::json!({"open": true}))
+    }
+
+    /// More blocks of an open reply. With `end` (usage, stop reason) it closes the reply.
+    pub fn append_more(
+        &self,
+        reply: u64,
+        blocks: &[Value],
+        end: Option<(&Value, &str)>,
+    ) -> Result<u64> {
+        let message = serde_json::json!({"role": "assistant", "content": blocks});
+        let mut extra = serde_json::json!({"reply": reply});
+        if let Some((usage, stop)) = end {
+            extra["end"] = serde_json::json!({"usage": usage, "stopReason": stop});
+        }
+        self.append_record("assistant-more", &message, extra)
+    }
+
+    fn append_record(&self, kind: &str, message: &Value, extra: Value) -> Result<u64> {
         let (chunk, last) = self.tail()?;
         let n = last + 1;
         let mut sides: Vec<(&'static str, Value)> = Vec::new();
@@ -90,9 +115,33 @@ impl Session {
         for (file, line) in &sides {
             self.append_line(&self.log_path(chunk, Some(file)), line)?;
         }
-        let record = serde_json::json!({"n": n, "t": now_iso(), "k": kind, "m": stored});
+        let mut record = serde_json::json!({"n": n, "t": now_iso(), "k": kind, "m": stored});
+        if let (Value::Object(r), Value::Object(e)) = (&mut record, extra) {
+            r.extend(e);
+        }
         self.append_line(&self.log_path(chunk, None), &record)?;
         Ok(n)
+    }
+
+    /// Replies opened but never closed (a crash mid-reply), oldest first.
+    pub fn unfinished_replies(&self) -> Result<Vec<u64>> {
+        let mut open: Vec<u64> = Vec::new();
+        for number in self.chunk_numbers()? {
+            for record in self.load_chunk(number)?.records {
+                let n = record.get("n").and_then(Value::as_u64).unwrap_or(0);
+                match record.get("k").and_then(Value::as_str) {
+                    Some("assistant") if record.get("open") == Some(&Value::Bool(true)) => {
+                        open.push(n)
+                    }
+                    Some("assistant-more") if record.get("end").is_some() => {
+                        let reply = record.get("reply").and_then(Value::as_u64);
+                        open.retain(|o| Some(*o) != reply);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(open)
     }
 
     /// The current chunk and the highest sequence number in it.
@@ -396,18 +445,51 @@ impl Session {
     }
 
     fn model_messages(&self, chunks: &[Chunk], after: u64) -> Result<Vec<Value>> {
-        let mut messages = Vec::new();
+        let mut messages: Vec<Value> = Vec::new();
+        // A reply saved in parts is one message, at the position of its first part.
+        let mut replies: HashMap<u64, usize> = HashMap::new();
         for chunk in chunks {
             for record in &chunk.records {
                 let n = record.get("n").and_then(Value::as_u64).unwrap_or(0);
                 let kind = record.get("k").and_then(Value::as_str).unwrap_or("");
-                if n <= after || !MODEL_KINDS.contains(&kind) {
+                if n <= after {
                     continue;
                 }
-                let message = record
-                    .get("m")
-                    .ok_or_else(|| Error::Format(format!("record {n} has no message")))?;
-                messages.push(qualify(chunk.number, &without_unadmitted_calls(message)));
+                let message = || {
+                    record
+                        .get("m")
+                        .map(|m| qualify(chunk.number, &without_unadmitted_calls(m)))
+                        .ok_or_else(|| Error::Format(format!("record {n} has no message")))
+                };
+                if kind == "assistant-more" {
+                    let target = record
+                        .get("reply")
+                        .and_then(Value::as_u64)
+                        .and_then(|r| replies.get(&r).copied());
+                    let Some(index) = target else { continue };
+                    let more = message()?;
+                    let blocks = more
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(Value::Array(content)) = messages[index].get_mut("content") {
+                        content.extend(blocks);
+                    }
+                    if let Some(end) = record.get("end") {
+                        messages[index]["usage"] = end.get("usage").cloned().unwrap_or(Value::Null);
+                        messages[index]["stopReason"] =
+                            end.get("stopReason").cloned().unwrap_or(Value::Null);
+                    }
+                    continue;
+                }
+                if !MODEL_KINDS.contains(&kind) {
+                    continue;
+                }
+                if kind == "assistant" && record.get("open") == Some(&Value::Bool(true)) {
+                    replies.insert(n, messages.len());
+                }
+                messages.push(message()?);
             }
         }
         Ok(messages)

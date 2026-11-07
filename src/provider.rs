@@ -1,4 +1,6 @@
 //! One streamed request to an OpenAI Responses endpoint (Codex, Grok), over SSE.
+//! The stream runs on its own thread and reports each piece as it arrives, so the
+//! turn loop can save and start a tool call as soon as it is complete.
 
 use crate::responses::{self, Target};
 use crate::store::Error;
@@ -19,10 +21,32 @@ pub struct Request<'a> {
     pub account_id: Option<&'a str>,
 }
 
-/// Streaming output, reported as it arrives.
-pub enum Delta<'a> {
-    Text(&'a str),
-    Reasoning(&'a str),
+/// What the stream thread reports.
+#[derive(Debug)]
+pub enum Piece {
+    Text(String),
+    Reasoning(String),
+    /// A finished output item (reasoning, text or a tool call) as a content block.
+    Block(Value),
+    Done {
+        usage: Value,
+        incomplete: bool,
+    },
+    Failed(Failure),
+}
+
+#[derive(Debug)]
+pub enum Failure {
+    /// Connection trouble or a temporary server error: the request may be retried.
+    Retryable(String),
+    Fatal(String),
+}
+
+/// A request ready to send from another thread.
+pub struct Prepared {
+    url: String,
+    headers: Vec<(&'static str, String)>,
+    body: String,
 }
 
 fn endpoint(api: &str, base: &str) -> String {
@@ -70,49 +94,66 @@ pub fn body(req: &Request, messages: &[Value]) -> Result<Value> {
     Ok(body)
 }
 
-/// Send one request and assemble the assistant message (pi message shape).
-pub fn stream(req: &Request, messages: &[Value], on_delta: &mut dyn FnMut(Delta)) -> Result<Value> {
-    let body = body(req, messages)?;
+pub fn prepare(req: &Request, messages: &[Value]) -> Result<Prepared> {
+    let mut headers = vec![
+        ("Authorization", format!("Bearer {}", req.token)),
+        ("OpenAI-Beta", "responses=experimental".to_string()),
+        ("accept", "text/event-stream".to_string()),
+        ("content-type", "application/json".to_string()),
+        ("originator", "pi".to_string()),
+        ("session-id", req.session_id.to_string()),
+        ("x-client-request-id", req.session_id.to_string()),
+    ];
+    if let Some(account) = req.account_id {
+        headers.push(("chatgpt-account-id", account.to_string()));
+    }
+    Ok(Prepared {
+        url: endpoint(req.target.api, req.base_url),
+        headers,
+        body: body(req, messages)?.to_string(),
+    })
+}
+
+/// Send the request on a new thread; every piece goes to `report`, ending with
+/// exactly one `Done` or `Failed`.
+pub fn spawn(prepared: Prepared, report: impl Fn(Piece) + Send + 'static) {
+    std::thread::spawn(move || {
+        if let Err(failure) = run(&prepared, &report) {
+            report(Piece::Failed(failure));
+        }
+    });
+}
+
+fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .build()
         .into();
-    let mut call = agent
-        .post(endpoint(req.target.api, req.base_url))
-        .header("Authorization", format!("Bearer {}", req.token))
-        .header("OpenAI-Beta", "responses=experimental")
-        .header("accept", "text/event-stream")
-        .header("content-type", "application/json")
-        .header("originator", "pi")
-        .header("session-id", req.session_id)
-        .header("x-client-request-id", req.session_id);
-    if let Some(account) = req.account_id {
-        call = call.header("chatgpt-account-id", account);
+    let mut call = agent.post(&p.url);
+    for (name, value) in &p.headers {
+        call = call.header(*name, value);
     }
     let mut response = call
-        .send(body.to_string())
-        .map_err(|e| Error::Format(format!("provider_request_failed: {e}")))?;
+        .send(p.body.as_str())
+        .map_err(|e| Failure::Retryable(format!("provider_request_failed: {e}")))?;
     let status = response.status().as_u16();
     let reader = response.body_mut().as_reader();
     if status != 200 {
         let mut text = String::new();
         let _ = reader.take(4096).read_to_string(&mut text);
-        return Err(Error::Format(format!(
+        let detail = format!(
             "provider_http_{status}: {}",
             text.chars().take(300).collect::<String>()
-        )));
+        );
+        return Err(if status == 429 || status >= 500 {
+            Failure::Retryable(detail)
+        } else {
+            Failure::Fatal(detail)
+        });
     }
-
-    let mut message = json!({
-        "role": "assistant", "content": [], "api": req.target.api, "provider": req.target.provider,
-        "model": req.target.model, "stopReason": "stop", "timestamp": now_ms(),
-        "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
-                  "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
-    });
     let mut data = String::new();
-    let mut finished = false;
     for line in BufReader::new(reader).lines() {
-        let line = line.map_err(|e| Error::Format(format!("provider_stream_read: {e}")))?;
+        let line = line.map_err(|e| Failure::Retryable(format!("provider_stream_read: {e}")))?;
         if let Some(rest) = line.strip_prefix("data:") {
             data.push_str(rest.trim_start());
             continue;
@@ -121,60 +162,37 @@ pub fn stream(req: &Request, messages: &[Value], on_delta: &mut dyn FnMut(Delta)
             continue;
         }
         let event: Value = serde_json::from_str(&std::mem::take(&mut data))
-            .map_err(|_| Error::Format("invalid_provider_json".into()))?;
-        if handle(&event, &mut message, on_delta)? {
-            finished = true;
-            break;
+            .map_err(|_| Failure::Fatal("invalid_provider_json".into()))?;
+        if handle(&event, report)? {
+            return Ok(());
         }
     }
-    if !finished {
-        return Err(Error::Format("provider_stream_ended_early".into()));
-    }
-    Ok(message)
+    Err(Failure::Retryable("provider_stream_ended_early".into()))
 }
 
-/// Apply one stream event; true once the response is complete.
-fn handle(event: &Value, message: &mut Value, on_delta: &mut dyn FnMut(Delta)) -> Result<bool> {
+/// Report one stream event; true once the response is complete.
+fn handle(event: &Value, report: &impl Fn(Piece)) -> std::result::Result<bool, Failure> {
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+    let text = |key: &str| {
+        event
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
     match kind {
-        "response.output_text.delta" => on_delta(Delta::Text(
-            event.get("delta").and_then(Value::as_str).unwrap_or(""),
-        )),
-        "response.reasoning_summary_text.delta" => on_delta(Delta::Reasoning(
-            event.get("delta").and_then(Value::as_str).unwrap_or(""),
-        )),
+        "response.output_text.delta" => report(Piece::Text(text("delta"))),
+        "response.reasoning_summary_text.delta" => report(Piece::Reasoning(text("delta"))),
         "response.output_item.done" => {
             if let Some(block) = event.get("item").and_then(block_from_item) {
-                if block.get("type").and_then(Value::as_str) == Some("toolCall") {
-                    message["stopReason"] = json!("toolUse");
-                }
-                if let Some(Value::Array(content)) = message.get_mut("content") {
-                    content.push(block);
-                }
+                report(Piece::Block(block));
             }
         }
         "response.completed" | "response.done" | "response.incomplete" => {
-            if let Some(usage) = event.pointer("/response/usage") {
-                let input = usage
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let output = usage
-                    .get("output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let cached = usage
-                    .pointer("/input_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                message["usage"]["input"] = json!(input.saturating_sub(cached));
-                message["usage"]["output"] = json!(output);
-                message["usage"]["cacheRead"] = json!(cached);
-                message["usage"]["totalTokens"] = json!(input + output);
-            }
-            if kind == "response.incomplete" {
-                message["stopReason"] = json!("length");
-            }
+            report(Piece::Done {
+                usage: usage_from(event.pointer("/response/usage")),
+                incomplete: kind == "response.incomplete",
+            });
             return Ok(true);
         }
         "response.failed" | "error" => {
@@ -183,15 +201,45 @@ fn handle(event: &Value, message: &mut Value, on_delta: &mut dyn FnMut(Delta)) -
                 .or_else(|| event.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            return Err(Error::Format(format!("provider_error: {detail}")));
+            return Err(Failure::Fatal(format!("provider_error: {detail}")));
         }
         _ => {}
     }
     Ok(false)
 }
 
-/// A finished output item as a pi content block.
-fn block_from_item(item: &Value) -> Option<Value> {
+fn usage_from(usage: Option<&Value>) -> Value {
+    let get = |path: &str| {
+        usage
+            .and_then(|u| u.pointer(path))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let (input, output, cached) = (
+        get("/input_tokens"),
+        get("/output_tokens"),
+        get("/input_tokens_details/cached_tokens"),
+    );
+    json!({"input": input.saturating_sub(cached), "output": output, "cacheRead": cached, "cacheWrite": 0,
+           "totalTokens": input + output, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}})
+}
+
+/// Usage for a reply the provider never finished.
+pub fn zero_usage() -> Value {
+    usage_from(None)
+}
+
+/// A new assistant message in pi's shape, before any content arrives.
+pub fn empty_reply(target: &Target) -> Value {
+    json!({
+        "role": "assistant", "content": [], "api": target.api, "provider": target.provider,
+        "model": target.model, "stopReason": "stop", "timestamp": now_ms(),
+        "usage": usage_from(None),
+    })
+}
+
+/// A finished output item as a pi content block. Async calls keep their marker.
+pub fn block_from_item(item: &Value) -> Option<Value> {
     match item.get("type").and_then(Value::as_str)? {
         "reasoning" => {
             let summary: Vec<&str> = item
@@ -234,15 +282,18 @@ fn block_from_item(item: &Value) -> Option<Value> {
                 .and_then(Value::as_str)
                 .and_then(|a| serde_json::from_str(a).ok())
                 .unwrap_or_else(|| json!({}));
-            Some(
-                json!({"type": "toolCall", "id": format!("{call_id}|{item_id}"), "name": item.get("name").cloned().unwrap_or(Value::Null), "arguments": arguments}),
-            )
+            let mut block = json!({"type": "toolCall", "id": format!("{call_id}|{item_id}"),
+                "name": item.get("name").cloned().unwrap_or(Value::Null), "arguments": arguments});
+            if item.get("async") == Some(&Value::Bool(true)) {
+                block["async"] = json!(true);
+            }
+            Some(block)
         }
         _ => None,
     }
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
