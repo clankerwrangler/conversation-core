@@ -58,9 +58,10 @@ fn parse(text: &str) -> std::result::Result<Vec<Value>, String> {
         .collect()
 }
 
-/// Write the current context to the file.
+/// Write the current context to the file: readable text inline, tool data, reasoning
+/// and images as references to their stored data.
 pub fn publish(session: &Session) -> Result<()> {
-    let text = render(&session.context()?)?;
+    let text = render(&session.context_refs()?)?;
     let through = session.last_seq()?;
     let mut state = session.read_state()?;
     let previous = state
@@ -98,6 +99,10 @@ pub fn accept(session: &Session) -> Result<Outcome> {
         Ok(messages) => messages,
         Err(reason) => return Ok(Outcome::Rejected(reason)),
     };
+    // Every reference must name stored data of this session.
+    if let Err(err) = session.resolve(&edited) {
+        return Ok(Outcome::Rejected(err.to_string()));
+    }
     let through = current.get("through").and_then(Value::as_u64).unwrap_or(0);
     let mut context = edited;
     context.extend(session.model_messages_after(through)?);
@@ -127,18 +132,73 @@ mod tests {
     }
 
     #[test]
-    fn the_file_is_the_context_one_message_per_line() {
+    fn the_file_and_its_references_are_the_context() {
         let s = fresh();
         s.append("user", &text("a")).unwrap();
-        s.append("assistant", &json!({"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "thinkingSignature": "enc"}]})).unwrap();
+        s.append(
+            "assistant",
+            &json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "readable summary", "thinkingSignature": "enc"},
+            {"type": "toolCall", "id": "c", "name": "ipython", "arguments": {"code": "1+1"}}]}),
+        )
+        .unwrap();
+        s.append("tool", &json!({"role": "toolResult", "toolCallId": "c", "content": [{"type": "text", "text": "2"}]})).unwrap();
         publish(&s).unwrap();
         let file = s.read_file(FILE).unwrap().unwrap();
+        assert!(
+            file.contains("readable summary") && file.contains("\"text\":\"a\""),
+            "readable text stays inline"
+        );
+        assert!(
+            !file.contains("\"enc\"") && !file.contains("1+1"),
+            "bulky parts are references"
+        );
+        assert!(
+            file.contains("log/000001.reasoning.jsonl")
+                && file.contains("log/000001.payload.jsonl")
+        );
         assert_eq!(
-            parse(&file).unwrap(),
+            s.resolve(&parse(&file).unwrap()).unwrap(),
             s.context().unwrap(),
-            "full messages, encrypted parts included"
+            "file + references = context"
         );
         assert_eq!(accept(&s).unwrap(), Outcome::Unchanged);
+    }
+
+    #[test]
+    fn an_edit_can_replace_a_reference_with_text_and_keep_others() {
+        let s = fresh();
+        s.append("user", &text("a")).unwrap();
+        s.append("tool", &json!({"role": "toolResult", "toolCallId": "c", "content": [{"type": "text", "text": "long output"}]})).unwrap();
+        s.append("tool", &json!({"role": "toolResult", "toolCallId": "d", "content": [{"type": "text", "text": "keep me"}]})).unwrap();
+        publish(&s).unwrap();
+        let mut lines = parse(&s.read_file(FILE).unwrap().unwrap()).unwrap();
+        lines[1]["content"] = json!([{"type": "text", "text": "short"}]);
+        s.write_file(FILE, &render(&lines).unwrap()).unwrap();
+        assert!(matches!(accept(&s).unwrap(), Outcome::Accepted { .. }));
+        let ctx = s.context().unwrap();
+        assert_eq!(ctx[1]["content"][0]["text"], json!("short"));
+        assert_eq!(
+            ctx[2]["content"][0]["text"],
+            json!("keep me"),
+            "a kept reference still resolves"
+        );
+    }
+
+    #[test]
+    fn references_outside_the_session_log_are_rejected() {
+        let s = fresh();
+        s.append("user", &text("a")).unwrap();
+        publish(&s).unwrap();
+        for bad in [
+            json!({"role": "user", "content": {"$ref": {"file": "../../etc/passwd", "key": "x"}}}),
+            json!({"role": "user", "content": {"$ref": {"file": "log/000001.payload.jsonl", "key": "missing"}}}),
+            json!({"role": "user", "content": [{"type": "image", "$img": "/etc/hostname"}]}),
+        ] {
+            s.write_file(FILE, &render(&[bad]).unwrap()).unwrap();
+            assert!(matches!(accept(&s).unwrap(), Outcome::Rejected(_)));
+        }
+        assert_eq!(s.context().unwrap(), vec![text("a")]);
     }
 
     #[test]

@@ -336,8 +336,25 @@ impl Session {
         }
     }
 
-    /// The context rule: the latest checkpoint's messages, then every model record after it.
+    /// The context exactly as the model receives it: `context_refs` with every
+    /// reference replaced by the stored data it names.
     pub fn context(&self) -> Result<Vec<Value>> {
+        self.resolve(&self.context_refs()?)
+    }
+
+    /// Replace references (`{"$ref":{"file","key"}}`, image `"$img": path`) with stored data.
+    /// References may only name side files and images inside this session's log.
+    pub fn resolve(&self, messages: &[Value]) -> Result<Vec<Value>> {
+        let mut resolver = Resolver {
+            dir: self.dir.clone(),
+            files: HashMap::new(),
+        };
+        messages.iter().map(|m| resolver.resolve(m)).collect()
+    }
+
+    /// The context rule: the latest checkpoint's messages, then every model record
+    /// after it. Bulky parts stay references to their stored data.
+    pub fn context_refs(&self) -> Result<Vec<Value>> {
         let numbers = self.chunk_numbers()?;
         let mut tail: Vec<Chunk> = Vec::new();
         let mut marker: Option<(String, u64)> = None;
@@ -358,7 +375,7 @@ impl Session {
         Ok(messages)
     }
 
-    /// Model messages of records numbered above `after`, as the model receives them.
+    /// Model messages of records numbered above `after`, with references.
     pub fn model_messages_after(&self, after: u64) -> Result<Vec<Value>> {
         let mut tail: Vec<Chunk> = Vec::new();
         for &number in self.chunk_numbers()?.iter().rev() {
@@ -381,7 +398,6 @@ impl Session {
     fn model_messages(&self, chunks: &[Chunk], after: u64) -> Result<Vec<Value>> {
         let mut messages = Vec::new();
         for chunk in chunks {
-            let mut sides = SideFiles::new(&self.dir, chunk.number);
             for record in &chunk.records {
                 let n = record.get("n").and_then(Value::as_u64).unwrap_or(0);
                 let kind = record.get("k").and_then(Value::as_str).unwrap_or("");
@@ -391,7 +407,7 @@ impl Session {
                 let message = record
                     .get("m")
                     .ok_or_else(|| Error::Format(format!("record {n} has no message")))?;
-                messages.push(sides.hydrate(&without_unadmitted_calls(message))?);
+                messages.push(qualify(chunk.number, &without_unadmitted_calls(message)));
             }
         }
         Ok(messages)
@@ -521,28 +537,79 @@ fn read(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|e| Error::Io(path.to_path_buf(), e))
 }
 
-/// Lazily loaded side files of one chunk.
-struct SideFiles {
+/// A record's short references (`{"f","k"}`, image sha) as references that name the
+/// actual file in the session folder, so they can be read and resolved anywhere.
+fn qualify(chunk: u32, value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            if let Some(reference) = map.get("$ref") {
+                let file = reference.get("f").and_then(Value::as_str).unwrap_or("");
+                let key = reference.get("k").cloned().unwrap_or(Value::Null);
+                return serde_json::json!({"$ref": {"file": format!("log/{chunk:06}.{file}.jsonl"), "key": key}});
+            }
+            let mut out = Map::new();
+            for (key, inner) in map {
+                match (key.as_str(), inner) {
+                    ("$img", Value::String(sha)) if !sha.contains('/') => {
+                        out.insert(
+                            key.clone(),
+                            Value::String(format!("log/{chunk:06}.images/{sha}")),
+                        );
+                    }
+                    _ => {
+                        out.insert(key.clone(), qualify(chunk, inner));
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(|v| qualify(chunk, v)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// `log/NNNNNN.payload.jsonl`, `log/NNNNNN.reasoning.jsonl`: the only side files a reference may name.
+fn side_file_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("log/") else {
+        return false;
+    };
+    let Some((number, file)) = rest.split_once('.') else {
+        return false;
+    };
+    number.len() == 6
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && (file == "payload.jsonl" || file == "reasoning.jsonl")
+}
+
+/// `log/NNNNNN.images/<sha256>`: the only image paths a reference may name.
+fn image_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("log/") else {
+        return false;
+    };
+    let Some((number, sha)) = rest.split_once(".images/") else {
+        return false;
+    };
+    number.len() == 6
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && sha.len() == 64
+        && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Resolves references against side files, loading each file once.
+struct Resolver {
     dir: PathBuf,
-    number: u32,
     files: HashMap<String, HashMap<String, Value>>,
 }
 
-impl SideFiles {
-    fn new(dir: &Path, number: u32) -> SideFiles {
-        SideFiles {
-            dir: dir.to_path_buf(),
-            number,
-            files: HashMap::new(),
-        }
-    }
-
+impl Resolver {
     fn lookup(&mut self, file: &str, key: &str) -> Result<Value> {
+        if !side_file_path(file) {
+            return Err(Error::Format(format!(
+                "reference to {file}: not a side file of this session"
+            )));
+        }
         if !self.files.contains_key(file) {
-            let path = self
-                .dir
-                .join("log")
-                .join(format!("{:06}.{file}.jsonl", self.number));
+            let path = self.dir.join(file);
             let mut map = HashMap::new();
             if path.exists() {
                 for line in read(&path)?.lines().filter(|l| !l.trim().is_empty()) {
@@ -559,26 +626,26 @@ impl SideFiles {
         self.files[file]
             .get(key)
             .cloned()
-            .ok_or_else(|| Error::Format(format!("chunk {} {file} has no {key}", self.number)))
+            .ok_or_else(|| Error::Format(format!("{file} has no {key}")))
     }
 
-    fn image(&self, sha: &str) -> Result<String> {
-        let path = self
-            .dir
-            .join("log")
-            .join(format!("{:06}.images", self.number))
-            .join(sha);
-        let bytes = fs::read(&path).map_err(|e| Error::Io(path.clone(), e))?;
+    fn image(&self, path: &str) -> Result<String> {
+        if !image_path(path) {
+            return Err(Error::Format(format!(
+                "image reference {path}: not an image of this session"
+            )));
+        }
+        let full = self.dir.join(path);
+        let bytes = fs::read(&full).map_err(|e| Error::Io(full.clone(), e))?;
         Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
     }
 
-    /// Replace side-file references with their stored values.
-    fn hydrate(&mut self, value: &Value) -> Result<Value> {
+    fn resolve(&mut self, value: &Value) -> Result<Value> {
         match value {
             Value::Object(map) => {
                 if let Some(reference) = map.get("$ref") {
-                    let file = reference.get("f").and_then(Value::as_str);
-                    let key = reference.get("k").and_then(Value::as_str);
+                    let file = reference.get("file").and_then(Value::as_str);
+                    let key = reference.get("key").and_then(Value::as_str);
                     return match (file, key) {
                         (Some(file), Some(key)) => self.lookup(file, key),
                         _ => Err(Error::Format("malformed $ref".into())),
@@ -587,12 +654,12 @@ impl SideFiles {
                 let mut out = Map::new();
                 for (key, inner) in map {
                     if key == "$img" {
-                        let sha = inner
+                        let path = inner
                             .as_str()
                             .ok_or_else(|| Error::Format("malformed $img".into()))?;
-                        out.insert("data".into(), Value::String(self.image(sha)?));
+                        out.insert("data".into(), Value::String(self.image(path)?));
                     } else {
-                        out.insert(key.clone(), self.hydrate(inner)?);
+                        out.insert(key.clone(), self.resolve(inner)?);
                     }
                 }
                 Ok(Value::Object(out))
@@ -600,7 +667,7 @@ impl SideFiles {
             Value::Array(items) => Ok(Value::Array(
                 items
                     .iter()
-                    .map(|v| self.hydrate(v))
+                    .map(|v| self.resolve(v))
                     .collect::<Result<_>>()?,
             )),
             other => Ok(other.clone()),
@@ -615,6 +682,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static NEXT: AtomicU32 = AtomicU32::new(0);
+    const SHA: &str = "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4";
 
     /// A throwaway session folder built from (file, lines) pairs.
     fn session(files: &[(&str, Vec<Value>)]) -> PathBuf {
@@ -703,7 +771,7 @@ mod tests {
                         {"type": "thinking", "thinking": "s", "thinkingSignature": {"$ref": {"f": "reasoning", "k": "1.0"}}},
                         {"type": "toolCall", "id": "t", "arguments": {"$ref": {"f": "payload", "k": "1.1"}}}]}}),
                     json!({"n": 2, "k": "user", "m": {"role": "user", "content": [
-                        {"type": "image", "mimeType": "image/png", "$img": "abc"}]}}),
+                        {"type": "image", "mimeType": "image/png", "$img": SHA}]}}),
                 ],
             ),
             (
@@ -716,7 +784,7 @@ mod tests {
             ),
         ]);
         fs::create_dir_all(dir.join("log/000001.images")).unwrap();
-        fs::write(dir.join("log/000001.images/abc"), b"hi").unwrap();
+        fs::write(dir.join("log/000001.images").join(SHA), b"hi").unwrap();
         let got = context(&dir);
         assert_eq!(got[0]["content"][0]["thinkingSignature"], json!("enc"));
         assert_eq!(got[0]["content"][1]["arguments"], json!({"code": "1+1"}));
