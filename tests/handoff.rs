@@ -582,6 +582,30 @@ fn referenced_lists_the_files_the_context_points_to() {
 }
 
 #[test]
+fn a_new_context_waits_while_a_cleanup_holds_the_references_lock() {
+    use std::os::fd::AsRawFd;
+    let (base, server) = server(vec![vec![text("one"), done()], vec![text("two"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    core.until("turn_end");
+    // A cleanup takes the lock; the next turn's context check must wait for it.
+    let lock = std::fs::File::open(d.join("references.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    core.op(json!({"op": "send", "input": {"text": "again"}}));
+    assert!(
+        core.events
+            .recv_timeout(Duration::from_millis(700))
+            .is_err(),
+        "nothing happens while the lock is held"
+    );
+    drop(lock);
+    core.until("turn_end");
+    assert_eq!(server.join().unwrap().len(), 2);
+    core.stop();
+}
+
+#[test]
 fn after_a_crash_a_saved_call_gets_an_interrupted_result_and_is_not_rerun() {
     let (base, _server) = server(vec![vec![call("c1", json!({})), Step::Pause(5000)]]);
     let d = dir();

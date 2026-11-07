@@ -443,6 +443,31 @@ impl Session {
         Ok(out.into_iter().collect())
     }
 
+    /// Run `f` holding `references.lock` (specification/ReaperReferences.tla). A cleanup holds
+    /// it from asking `core referenced` until it is done deleting; the core holds it while
+    /// accepting a new context, so a new reference never names a file being deleted. The
+    /// operating system releases it when its holder stops.
+    pub fn with_references_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        use std::os::fd::AsRawFd;
+        let path = self.dir.join("references.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| Error::Io(path.clone(), e))?;
+        // SAFETY: flock on a descriptor this function owns; released when `file` is dropped.
+        while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(Error::Io(path, e));
+            }
+        }
+        let result = f();
+        drop(file);
+        result
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }

@@ -25,6 +25,14 @@ images, and if it still does not fit it sends nothing and reports
 `context_too_large`. For a model missing from the file the core reports
 `window_unknown` once, and the guard cannot protect its requests.
 
+## Cleaning up old stored data
+
+Deleting old data is not the core's job. A cleanup must hold the session's
+`references.lock` (an `flock`) from running `core referenced` until it has
+finished deleting, and must only delete files not listed. The core takes the
+same lock only while accepting a new context, so a new reference never names
+a file being deleted. Modeled in `specification/ReaperReferences.tla`.
+
 ## Built-in tools
 
 The core has pi 1.5's seven basic tools built in: `read`, `bash`, `edit`,

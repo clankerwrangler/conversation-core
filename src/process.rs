@@ -257,10 +257,12 @@ impl Core {
                 .context()
                 .map(|m| emit(json!({"ev": "context", "messages": m}))),
             Some("checkpoint") => match op.get("messages") {
-                Some(Value::Array(m)) => self
-                    .session
-                    .checkpoint(m)
-                    .map(|id| emit(json!({"ev": "checkpointed", "id": id}))),
+                Some(Value::Array(m)) => {
+                    let session = &self.session;
+                    session
+                        .with_references_lock(|| session.checkpoint(m))
+                        .map(|id| emit(json!({"ev": "checkpointed", "id": id})))
+                }
                 _ => Err(Error::Format("checkpoint needs messages".into())),
             },
             other => Err(Error::Format(format!("unknown op {other:?}"))),
@@ -397,7 +399,8 @@ impl Core {
 
     /// Request boundary: an edited context file becomes the context.
     fn boundary(&mut self) -> Result<()> {
-        match context_file::accept(&self.session)? {
+        let session = &self.session;
+        match session.with_references_lock(|| context_file::accept(session))? {
             context_file::Outcome::Unchanged => {}
             context_file::Outcome::Accepted { messages } => {
                 emit(json!({"ev": "context_file", "accepted": true, "messages": messages}))
