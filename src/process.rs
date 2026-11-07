@@ -18,7 +18,9 @@
 //! event follows once the result is saved. A runner tool with the same name replaces a
 //! built-in; `--no-tool <name>` turns one off.
 
+use crate::budget;
 use crate::context_file;
+use crate::models::Models;
 use crate::provider::{self, Failure, Piece, Request};
 use crate::responses::Target;
 use crate::store::{Error, Session};
@@ -87,9 +89,13 @@ struct Core {
     running: HashMap<String, Arc<tools::Cancel>>,
     /// PI_* variables for bash, from the current request.
     tool_env: Vec<(String, String)>,
+    /// Context windows from the models file.
+    models: Models,
+    /// Models already reported as having no known window.
+    warned: HashSet<String>,
 }
 
-pub fn run(dir: &Path, disabled: Vec<String>) -> Result<()> {
+pub fn run(dir: &Path, disabled: Vec<String>, models: Models) -> Result<()> {
     let session = if dir.join("meta.json").exists() {
         Session::open(dir)?
     } else {
@@ -142,6 +148,8 @@ pub fn run(dir: &Path, disabled: Vec<String>) -> Result<()> {
         active: HashSet::new(),
         running: HashMap::new(),
         tool_env: Vec::new(),
+        models,
+        warned: HashSet::new(),
     };
     while let Some(op) = core.next_idle_op() {
         if let Err(err) = core.idle(&op) {
@@ -452,10 +460,45 @@ impl Core {
         Ok(())
     }
 
+    /// The messages actually sent: the overflow guard applied, then the context usage line at
+    /// the very end (so the cached prompt stays unchanged). Neither is saved. None when the
+    /// request is too large to send (`context_too_large`).
+    fn budget(
+        &mut self,
+        context: Vec<Value>,
+        refs: Option<&[Value]>,
+        trusted_from: usize,
+        model: &str,
+    ) -> Option<Vec<Value>> {
+        let window = self.models.window(model);
+        let mut estimate = budget::estimate(&context, trusted_from);
+        let line = budget::text_message("user", &budget::usage_line(&estimate, window));
+        estimate.total += budget::estimate_tokens(&line);
+        let Some(window) = window else {
+            if self.warned.insert(model.to_string()) {
+                emit(json!({"ev": "window_unknown", "model": model}));
+            }
+            let mut sent = context;
+            sent.push(line);
+            return Some(sent);
+        };
+        match budget::guard(context, refs, estimate.total, window, self.session.dir()) {
+            budget::Guarded::Fits(mut sent) => {
+                sent.push(line);
+                Some(sent)
+            }
+            budget::Guarded::TooLarge { tokens } => {
+                emit(json!({"ev": "context_too_large", "tokens": tokens, "window": window}));
+                None
+            }
+        }
+    }
+
     /// One request: prepare, stream, save. Retries from scratch only while nothing was saved.
     fn request(&mut self) -> Result<End> {
         context_file::publish(&self.session)?;
-        let context = self.session.context()?;
+        let (refs, from_checkpoint) = self.session.context_parts()?;
+        let context = self.session.resolve(&refs)?;
         self.requests += 1;
         let id = format!("r{}", self.requests);
         emit(json!({"ev": "prepare_request", "id": id, "context": context}));
@@ -463,9 +506,10 @@ impl Core {
             self.abort(None)?;
             return Ok(End::Aborted);
         };
-        let context = match prepared.get("context") {
-            Some(Value::Array(edited)) => edited.clone(),
-            _ => context,
+        // A context the runner replaced has no references and no trusted token count.
+        let (context, refs, trusted_from) = match prepared.get("context") {
+            Some(Value::Array(edited)) => (edited.clone(), None, edited.len()),
+            _ => (context, Some(refs), from_checkpoint),
         };
         let model = prepared
             .get("model")
@@ -546,6 +590,9 @@ impl Core {
             session_id: &session_id,
             token,
             account_id: credentials.get("accountId").and_then(Value::as_str),
+        };
+        let Some(context) = self.budget(context, refs.as_deref(), trusted_from, &model_id) else {
+            return Ok(End::Failed);
         };
         for attempt in 1..=MAX_ATTEMPTS {
             let ready = provider::prepare(&req, &context)?;

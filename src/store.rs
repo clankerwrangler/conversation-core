@@ -404,6 +404,51 @@ impl Session {
     /// The context rule: the latest checkpoint's messages, then every model record
     /// after it. Bulky parts stay references to their stored data.
     pub fn context_refs(&self) -> Result<Vec<Value>> {
+        Ok(self.context_parts()?.0)
+    }
+
+    /// The stored files (session-relative) that the current context and the latest two
+    /// checkpoints refer to: what a cleanup outside the core must not delete.
+    pub fn referenced(&self) -> Result<Vec<String>> {
+        fn collect(value: &Value, out: &mut std::collections::BTreeSet<String>) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(file) = map
+                        .get("$ref")
+                        .and_then(|r| r.get("file"))
+                        .and_then(Value::as_str)
+                    {
+                        out.insert(file.to_string());
+                    }
+                    if let Some(Value::String(path)) = map.get("$img")
+                        && path.contains('/')
+                    {
+                        out.insert(path.clone());
+                    }
+                    map.values().for_each(|v| collect(v, out));
+                }
+                Value::Array(items) => items.iter().for_each(|v| collect(v, out)),
+                _ => {}
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        for message in self.context_refs()? {
+            collect(&message, &mut out);
+        }
+        for (_, id) in self.newest_markers(2)? {
+            for message in self.checkpoint_messages(&id)? {
+                collect(&message, &mut out);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// `context_refs`, and how many of its messages come from the latest checkpoint.
+    pub fn context_parts(&self) -> Result<(Vec<Value>, usize)> {
         let numbers = self.chunk_numbers()?;
         let mut tail: Vec<Chunk> = Vec::new();
         let mut marker: Option<(String, u64)> = None;
@@ -420,8 +465,9 @@ impl Session {
             Some((id, through)) => (self.checkpoint_messages(id)?, *through),
             None => (Vec::new(), 0),
         };
+        let from_checkpoint = messages.len();
         messages.extend(self.model_messages(&tail, after)?);
-        Ok(messages)
+        Ok((messages, from_checkpoint))
     }
 
     /// Model messages of records numbered above `after`, with references.

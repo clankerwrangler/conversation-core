@@ -82,6 +82,10 @@ fn text(t: &str) -> Step {
         json!({"type": "message", "id": "msg_1", "content": [{"type": "output_text", "text": t}]}),
     )
 }
+/// A reply end with no usage: nothing measured, so the core estimates everything.
+fn done_unmeasured() -> Step {
+    Step::Event(json!({"type": "response.completed", "response": {}}))
+}
 fn done() -> Step {
     Step::Event(
         json!({"type": "response.completed", "response": {"usage": {"input_tokens": 10, "output_tokens": 2}}}),
@@ -157,7 +161,7 @@ impl Core {
                 Some("need_credentials") => {
                     self.op(json!({"op": "credentials", "id": ev["id"], "token": "t"}))
                 }
-                Some("text_delta") | Some("reasoning_delta") => {}
+                Some("text_delta") | Some("reasoning_delta") | Some("window_unknown") => {}
                 _ => return ev,
             }
         }
@@ -250,6 +254,10 @@ fn a_call_is_saved_and_handed_off_before_the_reply_ends() {
         .filter_map(|i| i["type"].as_str())
         .collect();
     assert_eq!(second, ["function_call", "message", "function_call_output"]);
+    assert!(
+        last_input_text(&bodies[1]).starts_with("Context: about"),
+        "the usage line comes last"
+    );
     core.stop();
 }
 
@@ -419,6 +427,157 @@ fn abort_kills_a_running_built_in() {
     assert!(!marker.exists(), "the shell's process group was killed");
     let ctx = core.context();
     assert_eq!(ctx[2]["content"][0]["text"], "Cancelled.");
+    core.stop();
+}
+
+/// A models file giving model "m" this window.
+fn models_file(window: u64) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "core-models-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::write(
+        &path,
+        json!({"models": {"m": {"contextWindow": window}}}).to_string(),
+    )
+    .unwrap();
+    path
+}
+
+fn last_input_text(body: &Value) -> String {
+    let input = body["input"].as_array().unwrap();
+    input.last().unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+#[test]
+fn every_request_ends_with_the_context_usage_line_which_is_never_saved() {
+    let (base, server) = server(vec![vec![text("one"), done()], vec![text("two"), done()]]);
+    let d = dir();
+    let models = models_file(272_000);
+    let mut core = Core::start_with(
+        &d,
+        &base,
+        &["--models", models.to_str().unwrap()],
+        json!([]),
+    );
+    core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    core.until("turn_end");
+    core.op(json!({"op": "send", "input": {"text": "again"}}));
+    core.until("turn_end");
+    let bodies = server.join().unwrap();
+    assert_eq!(
+        last_input_text(&bodies[0]),
+        "Context: about 0k of 272k tokens (estimated)"
+    );
+    // The fake server reports 12 tokens for the first reply.
+    assert_eq!(
+        last_input_text(&bodies[1]),
+        "Context: about 0k of 272k tokens (0k measured + ~0k new)"
+    );
+    let ctx = core.context();
+    assert!(
+        ctx.iter()
+            .all(|m| !m.to_string().contains("Context: about")),
+        "the line is not saved"
+    );
+    let _ = std::fs::remove_file(models);
+    core.stop();
+}
+
+#[test]
+fn the_overflow_guard_sets_aside_old_tool_results() {
+    let (base, server) = server(vec![
+        vec![call("c1", json!({})), done_unmeasured()],
+        vec![call("c2", json!({})), done_unmeasured()],
+        vec![text("ok"), done()],
+    ]);
+    let d = dir();
+    let models = models_file(1_500);
+    let mut core = Core::start_with(
+        &d,
+        &base,
+        &["--models", models.to_str().unwrap()],
+        json!([]),
+    );
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    core.until("tool_call");
+    core.result("c1|fc_c1", &"a".repeat(4000));
+    core.until("tool_call");
+    core.result("c2|fc_c2", &"b".repeat(4000));
+    core.until("turn_end");
+    let bodies = server.join().unwrap();
+    let outputs: Vec<String> = bodies[2]["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["type"] == "function_call_output")
+        .map(|i| i["output"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        outputs[0]
+            .starts_with("[Tool result set aside to fit the context window: add call c1|fc_c1"),
+        "{}",
+        outputs[0]
+    );
+    assert!(
+        outputs[0].contains("log/000001.payload.jsonl, key "),
+        "{}",
+        outputs[0]
+    );
+    assert_eq!(outputs[1].len(), 4000, "the newest result is still sent");
+    let ctx = core.context();
+    assert_eq!(
+        ctx[2]["content"][0]["text"].as_str().map(str::len),
+        Some(4000),
+        "history is unchanged"
+    );
+    let _ = std::fs::remove_file(models);
+    core.stop();
+}
+
+#[test]
+fn a_request_that_cannot_fit_is_not_sent() {
+    let (base, server) = server(vec![]);
+    let d = dir();
+    let models = models_file(100);
+    let mut core = Core::start_with(
+        &d,
+        &base,
+        &["--models", models.to_str().unwrap()],
+        json!([]),
+    );
+    core.op(json!({"op": "send", "input": {"text": "x".repeat(4000)}}));
+    let ev = core.until("context_too_large");
+    assert_eq!(ev["window"], 100);
+    assert_eq!(core.until("turn_end")["stopReason"], "error");
+    assert!(server.join().unwrap().is_empty(), "nothing was sent");
+    let _ = std::fs::remove_file(models);
+    core.stop();
+}
+
+#[test]
+fn referenced_lists_the_files_the_context_points_to() {
+    let (base, server) = server(vec![
+        vec![call("c1", json!({"a": 1})), done()],
+        vec![text("ok"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    core.until("tool_call");
+    core.result("c1|fc_c1", "3");
+    core.until("turn_end");
+    server.join().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_core"))
+        .args(["referenced", d.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let files: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(files, json!(["log/000001.payload.jsonl"]));
     core.stop();
 }
 

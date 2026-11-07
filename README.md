@@ -6,11 +6,24 @@ runs it, and keeps the context within budget. It knows nothing about the
 program that drives it.
 
 ```
-core run <session-dir> [--no-tool <name>]...   one session as a process: JSON lines on stdin/stdout
+core run <session-dir> [--no-tool <name>]... [--models <file>]   one session as a process: JSON lines on stdin/stdout
 core context <session-dir>    print the context the next request would send
 core input <session-dir> <api> <provider> <model>   print the Responses request input
+core referenced <session-dir>   print the stored files the context and the latest two checkpoints refer to
 core tool <name> <arguments-json>   run one built-in tool in the current folder, print its result
 ```
+
+## Models file
+
+Context windows come from a models file, not the code:
+`~/.config/conversation-core/models.json`, or `--models <file>`. `models.json`
+in this repository lists the model definitions. Every request ends with a context
+usage line ("Context: about 91k of 500k tokens (84k measured + ~7k new)"),
+which is never saved. If the next request is over the window, the overflow
+guard sets tool results aside (oldest first), then tool-call arguments and
+images, and if it still does not fit it sends nothing and reports
+`context_too_large`. For a model missing from the file the core reports
+`window_unknown` once, and the guard cannot protect its requests.
 
 ## Built-in tools
 
