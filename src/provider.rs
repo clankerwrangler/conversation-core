@@ -21,6 +21,15 @@ pub struct Request<'a> {
     pub session_id: &'a str,
     pub token: &'a str,
     pub account_id: Option<&'a str>,
+    /// Outside Codex the instructions are the first input message, as "developer" for a
+    /// reasoning model that accepts that role and as "system" otherwise (as pi sends them).
+    pub developer_role: bool,
+}
+
+/// pi's instruction role rule: "developer" when the model reasons and its
+/// `compat.supportsDeveloperRole` is not false.
+pub fn developer_role(model: &Value, reasoning: &crate::models::Reasoning) -> bool {
+    reasoning.include && model.pointer("/compat/supportsDeveloperRole") != Some(&Value::Bool(false))
 }
 
 /// What the stream thread reports.
@@ -110,7 +119,15 @@ fn endpoint(api: &str, base: &str) -> String {
 }
 
 pub fn body(req: &Request, messages: &[Value]) -> Result<Value> {
-    let input = responses::input(&req.target, messages)?;
+    let mut input = responses::input(&req.target, messages)?;
+    if req.target.api != "openai-codex-responses" && !req.instructions.is_empty() {
+        let role = if req.developer_role {
+            "developer"
+        } else {
+            "system"
+        };
+        input.insert(0, json!({"role": role, "content": req.instructions}));
+    }
     let mut body = json!({
         "model": req.target.model, "stream": true, "store": false, "input": input, "tools": req.tools,
     });

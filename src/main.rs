@@ -2,30 +2,45 @@ mod budget;
 mod context_file;
 mod models;
 mod process;
+mod prompt;
 mod provider;
 mod responses;
 mod store;
 mod tools;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "core run <session-dir> [--no-tool <name>]... [--models <file>] | core context <session-dir> | core input <session-dir> <api> <provider> <model> | core referenced <session-dir> | core history <session-dir> <from> <to> | core tool <name> <arguments-json>";
+const USAGE: &str = "core run <session-dir> [--no-tool <name>]... [--models <file>] [--agent-dir <dir>] [--skills <path>]... | core context <session-dir> | core input <session-dir> <api> <provider> <model> | core referenced <session-dir> | core history <session-dir> <from> <to> | core tool <name> <arguments-json> | core prompt [--agent-dir <dir>] [--skills <path>]... [--tool <name>]...";
 
-/// `--no-tool <name>` and `--models <file>` after `run <dir>`; None if anything else is there.
-fn run_flags(rest: &[String]) -> Option<(Vec<String>, Option<std::path::PathBuf>)> {
-    let mut names = Vec::new();
-    let mut models = None;
+#[derive(Default)]
+struct Flags {
+    no_tool: Vec<String>,
+    tools: Vec<String>,
+    models: Option<PathBuf>,
+    agent_dir: Option<PathBuf>,
+    skills: Vec<PathBuf>,
+}
+
+/// Flags after `run <dir>` (or `prompt`, which takes `--tool` instead of `--no-tool`).
+/// None if anything else is there.
+fn flags(rest: &[String], prompt: bool) -> Option<Flags> {
+    let mut f = Flags::default();
     let mut it = rest.iter();
     while let Some(flag) = it.next() {
         let value = it.next()?;
         match flag.as_str() {
-            "--no-tool" if tools::NAMES.contains(&value.as_str()) => names.push(value.clone()),
-            "--models" if models.is_none() => models = Some(value.into()),
+            "--no-tool" if !prompt && tools::NAMES.contains(&value.as_str()) => {
+                f.no_tool.push(value.clone())
+            }
+            "--tool" if prompt => f.tools.push(value.clone()),
+            "--models" if !prompt && f.models.is_none() => f.models = Some(value.into()),
+            "--agent-dir" if f.agent_dir.is_none() => f.agent_dir = Some(value.into()),
+            "--skills" => f.skills.push(value.into()),
             _ => return None,
         }
     }
-    Some((names, models))
+    Some(f)
 }
 
 fn main() -> ExitCode {
@@ -33,24 +48,47 @@ fn main() -> ExitCode {
     if let [_, cmd, dir, rest @ ..] = args.as_slice()
         && cmd == "run"
     {
-        let Some((disabled, models)) = run_flags(rest) else {
+        let Some(f) = flags(rest, false) else {
             eprintln!("error: usage: {USAGE} (tools: {})", tools::NAMES.join(", "));
             return ExitCode::FAILURE;
         };
-        let models = match models::Models::load(models.as_deref()) {
+        let models = match models::Models::load(f.models.as_deref()) {
             Ok(m) => m,
             Err(err) => {
                 eprintln!("error: models file: {err}");
                 return ExitCode::FAILURE;
             }
         };
-        return match process::run(Path::new(dir), disabled, models) {
+        let sources = prompt::Sources::new(f.agent_dir, f.skills);
+        return match process::run(Path::new(dir), f.no_tool, models, sources) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err}");
                 ExitCode::FAILURE
             }
         };
+    }
+    // The core's part of the system prompt for the current folder, with the named tools.
+    if let [_, cmd, rest @ ..] = args.as_slice()
+        && cmd == "prompt"
+    {
+        let Some(f) = flags(rest, true) else {
+            eprintln!("error: usage: {USAGE}");
+            return ExitCode::FAILURE;
+        };
+        let cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let sources = prompt::Sources::new(f.agent_dir, f.skills);
+        let files = prompt::context_files(&cwd, &sources.agent_dir);
+        let skills = prompt::skills(&cwd, &sources);
+        let tools: Vec<prompt::ToolPrompt> = f.tools.iter().map(|n| prompt::builtin(n)).collect();
+        print!("{}", prompt::build("", &tools, &files, &skills, &cwd, &[]));
+        return ExitCode::SUCCESS;
     }
     let result = match args.as_slice() {
         // One built-in call in the current folder, printed as the result the core would save.

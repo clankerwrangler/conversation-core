@@ -6,7 +6,9 @@ runs it, and keeps the context within budget. It knows nothing about the
 program that drives it.
 
 ```
-core run <session-dir> [--no-tool <name>]... [--models <file>]   one session as a process: JSON lines on stdin/stdout
+core run <session-dir> [--no-tool <name>]... [--models <file>] [--agent-dir <dir>] [--skills <path>]...
+                              one session as a process: JSON lines on stdin/stdout
+core prompt [--agent-dir <dir>] [--skills <path>]... [--tool <name>]...   print the core's part of the system prompt here
 core context <session-dir>    print the context the next request would send
 core input <session-dir> <api> <provider> <model>   print the Responses request input
 core referenced <session-dir>   print the stored files the context and the latest two checkpoints refer to
@@ -24,6 +26,29 @@ guard sets tool results aside (oldest first), then tool-call arguments and
 images, and if it still does not fit it sends nothing and reports
 `context_too_large`. For a model missing from the file the core reports
 `window_unknown` once, and the guard cannot protect its requests.
+
+## System prompt
+
+The core builds the parts of the system prompt that change, the way pi 1.5 does, as
+named sections (`<tools>`, `<rules>`, `<project_context>`, `<skills>`, `<cwd>`):
+
+- the tools on offer, each with its one-line `promptSnippet`, and their `promptGuidelines`
+  (a runner tool may carry both; they are taken off before the tool is sent);
+- the AGENTS files: the one in the agent folder (`--agent-dir`, default
+  `~/.config/conversation-core`), then one per folder from the filesystem root down to the
+  working folder (`AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`; a nested git worktree's
+  file replaces its main checkout's). They are read for every request, and `prepare_request`
+  lists them as `contextFiles`;
+- the skills in `<agent-dir>/skills` and each `--skills` path (SKILL.md frontmatter), listed
+  only when `read` or `bash` is on offer;
+- the working folder.
+
+There is no fixed wording: no opening line, no standing rules. Those belong in an AGENTS file.
+`prepared.instructions` comes first (pi's preamble), and `prepared.sections`
+(`{name: text}`) follow the core's, a same-named one replacing it. `"basePrompt": false`
+sends `instructions` alone. Outside Codex the prompt is the first input message, with
+role `developer` for a reasoning model (unless `compat.supportsDeveloperRole` is false),
+otherwise `system`.
 
 ## Cleaning up old stored data
 

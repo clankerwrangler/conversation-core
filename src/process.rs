@@ -21,6 +21,7 @@
 use crate::budget;
 use crate::context_file;
 use crate::models::Models;
+use crate::prompt;
 use crate::provider::{self, Failure, Piece, Request};
 use crate::responses::Target;
 use crate::store::{Error, Session};
@@ -103,9 +104,16 @@ struct Core {
     completions: HashMap<String, Value>,
     /// How long a reply may be silent before the attempt fails.
     stall: Duration,
+    /// Where the system prompt's AGENTS files and skills come from.
+    sources: prompt::Sources,
 }
 
-pub fn run(dir: &Path, disabled: Vec<String>, models: Models) -> Result<()> {
+pub fn run(
+    dir: &Path,
+    disabled: Vec<String>,
+    models: Models,
+    sources: prompt::Sources,
+) -> Result<()> {
     let session = if dir.join("meta.json").exists() {
         Session::open(dir)?
     } else {
@@ -163,6 +171,7 @@ pub fn run(dir: &Path, disabled: Vec<String>, models: Models) -> Result<()> {
         injected: VecDeque::new(),
         completions: HashMap::new(),
         stall: Duration::from_millis(STREAM_STALL_MS),
+        sources,
     };
     while let Some(op) = core.next_idle_op() {
         if let Err(err) = core.idle(&op) {
@@ -670,7 +679,12 @@ impl Core {
         // The model and reasoning last chosen with set_model, for the runner to use.
         let meta = self.session.meta()?;
         let selected = json!({"model": meta.get("model"), "reasoning": meta.get("reasoning")});
-        emit(json!({"ev": "prepare_request", "id": id, "context": context, "selected": selected}));
+        // The AGENTS files the prompt will carry, read fresh for every request.
+        let files = prompt::context_files(&self.cwd, &self.sources.agent_dir);
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        emit(
+            json!({"ev": "prepare_request", "id": id, "context": context, "selected": selected, "contextFiles": paths}),
+        );
         let Some(prepared) = self.answer("prepared", &id)? else {
             self.abort(None)?;
             return Ok(End::Aborted);
@@ -707,11 +721,16 @@ impl Core {
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Format("credentials need token".into()))?;
         // Built-ins first, then the runner's tools; a runner tool replaces a built-in of its name.
-        let runner_tools = prepared
+        let mut runner_tools = prepared
             .get("tools")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        // pi's promptSnippet / promptGuidelines go into the prompt, not to the provider.
+        let runner_prompts: Vec<prompt::ToolPrompt> = runner_tools
+            .iter_mut()
+            .map(prompt::take_tool_prompt)
+            .collect();
         let runner_names: HashSet<&str> = runner_tools
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -727,6 +746,41 @@ impl Core {
             .filter_map(|n| tools::definition(n).cloned())
             .collect();
         request_tools.extend(runner_tools.iter().cloned());
+        let preamble = prepared
+            .get("instructions")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        // pi's forceSystemPrompt: `"basePrompt": false` sends the runner's instructions alone.
+        let instructions = if prepared.get("basePrompt") == Some(&Value::Bool(false)) {
+            preamble.to_string()
+        } else {
+            let mut sections = Vec::new();
+            if let Some(Value::Object(extra)) = prepared.get("sections") {
+                for (name, content) in extra {
+                    if !prompt::valid_section_name(name) {
+                        return Err(Error::Format(format!(
+                            "invalid system prompt section name: {name}"
+                        )));
+                    }
+                    sections.push((name.clone(), content.as_str().unwrap_or("").to_string()));
+                }
+            }
+            let mut tool_prompts: Vec<prompt::ToolPrompt> = tools::NAMES
+                .iter()
+                .filter(|n| self.active.contains(**n))
+                .map(|n| prompt::builtin(n))
+                .collect();
+            tool_prompts.extend(runner_prompts);
+            let skills = prompt::skills(&self.cwd, &self.sources);
+            prompt::build(
+                preamble,
+                &tool_prompts,
+                &files,
+                &skills,
+                &self.cwd,
+                &sections,
+            )
+        };
         let reasoning = prepared.get("reasoning").and_then(Value::as_str);
         self.tool_env = vec![
             ("PI_SESSION_ID".into(), self.session_id.clone()),
@@ -753,16 +807,14 @@ impl Core {
                 model: &model_id,
             },
             base_url: &base_url,
-            instructions: prepared
-                .get("instructions")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
+            instructions: &instructions,
             reasoning: &reasoning_setting,
             service_tier: prepared.get("serviceTier").and_then(Value::as_str),
             tools: &request_tools,
             session_id: &session_id,
             token,
             account_id: credentials.get("accountId").and_then(Value::as_str),
+            developer_role: provider::developer_role(&model, &reasoning_setting),
         };
         self.stall = Duration::from_millis(
             prepared
@@ -1018,6 +1070,10 @@ fn start_completion(
             session_id: &session_id,
             token,
             account_id: credentials.get("accountId").and_then(Value::as_str),
+            developer_role: provider::developer_role(
+                request.get("model").unwrap_or(&Value::Null),
+                &reasoning,
+            ),
         };
         let ready = match provider::prepare(&req, &messages) {
             Ok(r) => r,

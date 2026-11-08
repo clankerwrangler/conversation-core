@@ -117,6 +117,8 @@ struct Core {
     extra: Value,
     /// Return `provider_response` events instead of skipping them.
     show_responses: bool,
+    /// The prepare_request events answered so far.
+    prepares: Vec<Value>,
 }
 
 impl Core {
@@ -125,9 +127,15 @@ impl Core {
     }
 
     fn start_with(dir: &Path, base: &str, flags: &[&str], tools: Value) -> Core {
+        Core::start_in(dir, base, flags, tools, &std::env::current_dir().unwrap())
+    }
+
+    /// Started in folder `cwd` (where its tools work and its AGENTS files are found).
+    fn start_in(dir: &Path, base: &str, flags: &[&str], tools: Value, cwd: &Path) -> Core {
         let mut child = Command::new(env!("CARGO_BIN_EXE_core"))
             .args(["run", dir.to_str().unwrap()])
             .args(flags)
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -149,6 +157,7 @@ impl Core {
             tools,
             extra: json!({}),
             show_responses: false,
+            prepares: Vec::new(),
         }
     }
 
@@ -182,6 +191,7 @@ impl Core {
                     }
                     prepared["model"] = model;
                     self.op(prepared);
+                    self.prepares.push(ev);
                 }
                 Some("need_credentials") => {
                     self.op(json!({"op": "credentials", "id": ev["id"], "token": "t"}))
@@ -872,6 +882,81 @@ fn reasoning_levels_and_fast_mode_reach_the_request_as_pi_sends_them() {
     assert_eq!(
         bodies[1]["reasoning"]["effort"], "low",
         "minimal maps to low"
+    );
+    core.stop();
+}
+
+#[test]
+fn the_core_builds_the_changing_part_of_the_system_prompt() {
+    let (base, server) = server(vec![vec![text("a"), done()], vec![text("b"), done()]]);
+    let d = dir();
+    let work = dir();
+    let agent = work.join("agent");
+    let cwd = work.join("project");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(agent.join("AGENTS.md"), "Global rules.").unwrap();
+    std::fs::write(cwd.join("AGENTS.md"), "Project rules.").unwrap();
+    let ipython = json!([{"type": "function", "name": "ipython", "description": "Run Python", "parameters": {"type": "object"},
+        "promptSnippet": "Run calculations", "promptGuidelines": ["Use the tool as needed."]}]);
+    let flags = [
+        "--agent-dir",
+        agent.to_str().unwrap(),
+        "--no-tool",
+        "read",
+        "--no-tool",
+        "bash",
+        "--no-tool",
+        "edit",
+        "--no-tool",
+        "write",
+        "--no-tool",
+        "grep",
+        "--no-tool",
+        "find",
+        "--no-tool",
+        "ls",
+    ];
+    let mut core = Core::start_in(&d, &base, &flags, ipython, &cwd);
+    core.extra = json!({"instructions": "You are an assistant.", "sections": {"scratch": "Use /tmp."},
+        "model": {"api": "openai-codex-responses"}});
+    core.op(json!({"op": "send", "input": {"text": "one"}}));
+    core.until("turn_end");
+    // A runner that wants only its own text turns the core's part off; outside Codex
+    // the text is the first input message.
+    core.extra =
+        json!({"instructions": "Only this.", "basePrompt": false, "model": {"reasoning": true}});
+    core.op(json!({"op": "send", "input": {"text": "two"}}));
+    core.until("turn_end");
+    let paths: Vec<String> = core.prepares[0]["contextFiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            agent.join("AGENTS.md").to_string_lossy(),
+            cwd.join("AGENTS.md").to_string_lossy()
+        ]
+    );
+    let bodies = server.join().unwrap();
+    let expected = format!(
+        "You are an assistant.\n\n<tools>\n- ipython: Run calculations\n</tools>\n\n<rules>\n- Use the tool as needed.\n</rules>\n\n<project_context>\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"{}\">\nGlobal rules.\n</project_instructions>\n\n<project_instructions path=\"{}\">\nProject rules.\n</project_instructions>\n</project_context>\n\n<cwd>\n{}\n</cwd>\n\n<scratch>\nUse /tmp.\n</scratch>",
+        agent.join("AGENTS.md").display(),
+        cwd.join("AGENTS.md").display(),
+        cwd.display()
+    );
+    assert_eq!(bodies[0]["instructions"], expected);
+    assert_eq!(
+        bodies[0]["tools"],
+        json!([{"type": "function", "name": "ipython", "description": "Run Python", "parameters": {"type": "object"}}])
+    );
+    assert!(bodies[1].get("instructions").is_none());
+    assert_eq!(
+        bodies[1]["input"][0],
+        json!({"role": "developer", "content": "Only this."})
     );
     core.stop();
 }
