@@ -89,6 +89,15 @@ impl Pricing {
 
     /// Fill `usage.cost`. `response_tier` is the tier the provider says it used.
     pub fn apply(&self, usage: &mut Value, response_tier: Option<&str>) {
+        // OpenRouter's billed cost, which replaces the total worked out from the rates.
+        let reported = usage.as_object_mut().and_then(|u| u.remove("_openrouter"));
+        self.apply_rates(usage, response_tier);
+        if let Some(reported) = reported {
+            apply_openrouter_cost(usage, &reported);
+        }
+    }
+
+    fn apply_rates(&self, usage: &mut Value, response_tier: Option<&str>) {
         let Some(rates) = &self.rates else { return };
         let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0) as f64;
         let (input, output, read, write) =
@@ -140,6 +149,47 @@ impl Pricing {
     }
 }
 
+/// pi's applyOpenRouterReportedCost.
+fn apply_openrouter_cost(usage: &mut Value, reported: &Value) {
+    let valid = |v: Option<&Value>| {
+        v.and_then(Value::as_f64)
+            .filter(|c| c.is_finite() && *c >= 0.0)
+    };
+    let Some(cost) = valid(reported.get("cost")) else {
+        return;
+    };
+    let total = match reported.get("is_byok").and_then(Value::as_bool) {
+        Some(false) => cost,
+        Some(true) => {
+            let Some(details) = reported.get("cost_details").filter(|d| d.is_object()) else {
+                return;
+            };
+            let upstream = match details.get("upstream_inference_cost") {
+                Some(Value::Null) => {
+                    match (
+                        valid(details.get("upstream_inference_prompt_cost")),
+                        valid(details.get("upstream_inference_completions_cost")),
+                    ) {
+                        (Some(p), Some(c)) => p + c,
+                        _ => return,
+                    }
+                }
+                other => match valid(other) {
+                    Some(u) => u,
+                    None => return,
+                },
+            };
+            cost + upstream
+        }
+        None => return,
+    };
+    if !usage["cost"].is_object() {
+        usage["cost"] = serde_json::json!({"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0});
+    }
+    usage["cost"]["total"] = serde_json::json!(total);
+    usage["cost"]["totalFromProvider"] = serde_json::json!(true);
+}
+
 const LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// pi's `getSupportedThinkingLevels`.
@@ -182,6 +232,8 @@ pub struct Reasoning {
     pub include: bool,
     /// `reasoning.effort`, when the request carries a reasoning setting at all.
     pub effort: Option<String>,
+    /// The level after fitting it to the model ("off" when none was asked for).
+    pub level: String,
 }
 
 /// `requested` is the session's level (None = off). `model` is the runner's model object
@@ -193,12 +245,14 @@ pub fn reasoning(model: &Value, file: Option<&Value>, requested: Option<&str>) -
         return Reasoning {
             include: requested.is_some(),
             effort: requested.map(str::to_string),
+            level: requested.unwrap_or("off").to_string(),
         };
     };
     if !supports {
         return Reasoning {
             include: false,
             effort: None,
+            level: "off".into(),
         };
     }
     let map = field("thinkingLevelMap").filter(|m| m.is_object());
@@ -216,6 +270,7 @@ pub fn reasoning(model: &Value, file: Option<&Value>, requested: Option<&str>) -
     Reasoning {
         include: true,
         effort,
+        level: level.to_string(),
     }
 }
 
@@ -250,7 +305,8 @@ mod tests {
             reasoning(&json!({"reasoning": false}), None, Some("high")),
             Reasoning {
                 include: false,
-                effort: None
+                effort: None,
+                level: "off".into()
             }
         );
         assert_eq!(

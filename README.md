@@ -27,6 +27,17 @@ images, and if it still does not fit it sends nothing and reports
 `context_too_large`. For a model missing from the file the core reports
 `window_unknown` once, and the guard cannot protect its requests.
 
+## Chat Completions (OpenRouter)
+
+A model with `"api": "openai-completions"` (OpenRouter and other OpenAI-compatible
+endpoints) is sent to `<baseUrl>/chat/completions` as pi 1.5 sends it: pi's compatibility
+rules from the provider and endpoint, overridden by the model's `compat`; another model's
+history replayed without its thinking and with shortened tool call ids; OpenRouter's
+`reasoning` setting, session header and billed cost; cache markers for anthropic/ models.
+`core chat-body <session-dir> <model-json> <level>` prints the body for a session.
+A model's `contextWindow` and `cost` on the model object are used when the models file has
+none.
+
 ## Usage and cost
 
 Each reply's `message_end` carries its `usage` in pi's shape (`input`, `output`,

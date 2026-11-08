@@ -181,6 +181,6 @@ pub fn input(target: &Target, messages: &[Value]) -> Result<Vec<Value>> {
 }
 
 /// JSON.stringify-compatible serialization (serde_json escapes the same way for valid text).
-fn js_stringify(value: &Value) -> String {
+pub(crate) fn js_stringify(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".into())
 }

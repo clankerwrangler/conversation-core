@@ -1,4 +1,5 @@
 mod budget;
+mod completions;
 mod context_file;
 mod models;
 mod process;
@@ -114,6 +115,20 @@ fn main() -> ExitCode {
                 _ => Err(store::Error::Usage(USAGE)),
             }
         }
+        // The Chat Completions request body for the session's context and a model object
+        // (pi's shape), with no instructions or tools: for comparing with pi.
+        [_, cmd, dir, model, level] if cmd == "chat-body" => std::fs::read_to_string(model)
+            .map_err(|e| store::Error::Io(model.into(), e))
+            .and_then(|text| {
+                serde_json::from_str::<serde_json::Value>(&text).map_err(store::Error::from)
+            })
+            .and_then(|model| {
+                let messages = store::Session::open(Path::new(dir))?.context()?;
+                let level = (level != "off").then_some(level.as_str());
+                let reasoning = models::reasoning(&model, None, level);
+                let body = completions::body(&model, "", &messages, &[], "s", &reasoning);
+                serde_json::to_string(&body).map_err(store::Error::from)
+            }),
         [_, cmd, dir] if cmd == "referenced" => store::Session::open(Path::new(dir))
             .and_then(|session| session.referenced())
             .and_then(|files| serde_json::to_string(&files).map_err(store::Error::from)),

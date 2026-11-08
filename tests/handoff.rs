@@ -1162,6 +1162,70 @@ fn model_headers_are_merged_over_the_defaults_as_the_harness_does() {
     core.stop();
 }
 
+#[test]
+fn an_openrouter_turn_runs_a_tool_call_over_chat_completions() {
+    let chunk = |c: Value| Step::Event(json!({"id": "gen-1", "choices": [c]}));
+    let (base, server) = server(vec![
+        vec![
+            chunk(json!({"delta": {"reasoning": "let me add"}})),
+            chunk(
+                json!({"delta": {"tool_calls": [{"index": 0, "id": "t1", "function": {"name": "add", "arguments": "{\"a\":"}}]}}),
+            ),
+            chunk(
+                json!({"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "2}"}}]}, "finish_reason": "tool_calls"}),
+            ),
+            Step::Event(
+                json!({"id": "gen-1", "choices": [], "usage": {"prompt_tokens": 20, "completion_tokens": 5, "cost": 0.25, "is_byok": false}}),
+            ),
+        ],
+        vec![chunk(
+            json!({"delta": {"content": "It is 2."}, "finish_reason": "stop"}),
+        )],
+    ]);
+    let d = dir();
+    let tools = json!([{"type": "function", "name": "add", "description": "Add", "parameters": {"type": "object"}}]);
+    let mut core = Core::start_in(&d, &base, &[], tools, &std::env::current_dir().unwrap());
+    core.extra = json!({"instructions": "Be brief.", "model": {"api": "openai-completions", "provider": "openrouter", "id": "z-ai/glm-5.3",
+        "reasoning": true, "input": ["text"], "contextWindow": 200000, "maxTokens": 1000, "compat": {"supportsDeveloperRole": false}}});
+    core.op(json!({"op": "send", "input": {"text": "add 2"}}));
+    let call = core.until("tool_call");
+    assert_eq!(
+        (call["name"].clone(), call["arguments"].clone()),
+        (json!("add"), json!({"a": 2}))
+    );
+    let end = core.next();
+    assert_eq!(end["ev"], "message_end");
+    assert_eq!(
+        end["usage"]["cost"]["total"], 0.25,
+        "OpenRouter's billed cost"
+    );
+    core.result(call["call"].as_str().unwrap(), "2");
+    let last = core.until("turn_end");
+    assert_eq!(last["stopReason"], "stop");
+    let bodies = server.join().unwrap();
+    assert_eq!(bodies[0]["messages"][0]["role"], "system");
+    assert!(
+        bodies[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Be brief.\n\n<tools>")
+    );
+    assert_eq!(bodies[0]["reasoning"], json!({"effort": "none"}));
+    assert_eq!(
+        bodies[0]["tools"][7]["function"]["name"], "add",
+        "after the seven built-ins"
+    );
+    let second = &bodies[1]["messages"];
+    assert_eq!(second[2]["tool_calls"][0]["id"], "t1");
+    assert_eq!(
+        second[3],
+        json!({"role": "tool", "content": "2", "tool_call_id": "t1"})
+    );
+    let ctx = core.context();
+    assert_eq!(ctx[1]["content"][0]["type"], "thinking");
+    core.stop();
+}
+
 fn codex(core: &mut Core) {
     core.extra = json!({"model": {"api": "openai-codex-responses"}});
 }

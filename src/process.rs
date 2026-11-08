@@ -651,8 +651,8 @@ impl Core {
         refs: Option<&[Value]>,
         trusted_from: usize,
         model: &str,
+        window: Option<u64>,
     ) -> Option<Vec<Value>> {
-        let window = self.models.window(model);
         let mut estimate = budget::estimate(&context, trusted_from);
         let line = budget::text_message("user", &budget::usage_line(&estimate, window));
         estimate.total += budget::estimate_tokens(&line);
@@ -830,6 +830,7 @@ impl Core {
                 .into_iter()
                 .flatten()
                 .collect(),
+            model: &model,
         };
         self.stall = Duration::from_millis(
             prepared
@@ -837,7 +838,15 @@ impl Core {
                 .and_then(Value::as_u64)
                 .unwrap_or(STREAM_STALL_MS),
         );
-        let Some(context) = self.budget(context, refs.as_deref(), trusted_from, &model_id) else {
+        // The window from the models file, else from the runner's model object (pi's contextWindow).
+        let window = self.models.window(&model_id).or_else(|| {
+            model
+                .get("contextWindow")
+                .and_then(Value::as_u64)
+                .filter(|w| *w > 0)
+        });
+        let Some(context) = self.budget(context, refs.as_deref(), trusted_from, &model_id, window)
+        else {
             return Ok(End::Failed);
         };
         let mut ready = provider::prepare(&req, &context)?;
@@ -860,7 +869,6 @@ impl Core {
             self.models.get(&model_id),
             prepared.get("serviceTier").and_then(Value::as_str),
         );
-        let window = self.models.window(&model_id);
         for attempt in 1..=MAX_ATTEMPTS {
             self.attempts += 1;
             let tag = self.attempts;
@@ -1164,6 +1172,7 @@ fn start_completion(
             .into_iter()
             .flatten()
             .collect(),
+            model: request.get("model").unwrap_or(&Value::Null),
         };
         let ready = match provider::prepare(&req, &messages) {
             Ok(r) => r,

@@ -2,6 +2,7 @@
 //! The stream runs on its own thread and reports each piece as it arrives, so the
 //! turn loop can save and start a tool call as soon as it is complete.
 
+use crate::completions;
 use crate::responses::{self, Target};
 use crate::store::Error;
 use serde_json::{Value, json};
@@ -27,6 +28,9 @@ pub struct Request<'a> {
     /// Headers from the credentials, then from the model object (pi's `model.headers`, e.g.
     /// grok-cli's client identification), merged over the defaults; a null value removes one.
     pub extra_headers: Vec<&'a Value>,
+    /// The runner's model object (pi's shape): compat, input kinds and limits for Chat
+    /// Completions.
+    pub model: &'a Value,
 }
 
 /// The ChatGPT account id inside a Codex access token (its JWT claims), as the harness reads it.
@@ -196,6 +200,8 @@ pub struct Prepared {
     headers: Vec<(String, String)>,
     body: String,
     pub transport: Transport,
+    /// A Chat Completions request: Some(whether the reply must end with a finish_reason).
+    chat: Option<bool>,
 }
 
 impl Prepared {
@@ -295,6 +301,25 @@ pub fn body(req: &Request, messages: &[Value]) -> Result<Value> {
 }
 
 pub fn prepare(req: &Request, messages: &[Value]) -> Result<Prepared> {
+    if req.target.api == completions::API {
+        let mut headers = completions::headers(req.model, req.token, req.session_id);
+        merge_headers(&mut headers, &req.extra_headers);
+        let body = completions::body(
+            req.model,
+            req.instructions,
+            messages,
+            req.tools,
+            req.session_id,
+            req.reasoning,
+        );
+        return Ok(Prepared {
+            url: completions::endpoint(req.base_url),
+            headers,
+            body: body.to_string(),
+            transport: Transport::Sse,
+            chat: Some(completions::compat(req.model).supports_finish_reason),
+        });
+    }
     // The harness's headers (native-provider.mjs), lower-case, later groups winning.
     let codex = req.target.api == "openai-codex-responses";
     let mut headers: Vec<(String, String)> = vec![
@@ -319,7 +344,23 @@ pub fn prepare(req: &Request, messages: &[Value]) -> Result<Prepared> {
         if codex { "session-id" } else { "session_id" }.into(),
         req.session_id.to_string(),
     ));
-    for group in &req.extra_headers {
+    merge_headers(&mut headers, &req.extra_headers);
+    Ok(Prepared {
+        url: endpoint(req.target.api, req.base_url),
+        headers,
+        body: body(req, messages)?.to_string(),
+        transport: if req.target.api == "openai-codex-responses" {
+            Transport::Auto
+        } else {
+            Transport::Sse
+        },
+        chat: None,
+    })
+}
+
+/// Header groups over the defaults, lower-case, later winning; a null removes one.
+fn merge_headers(headers: &mut Vec<(String, String)>, groups: &[&Value]) {
+    for group in groups {
         let Value::Object(group) = group else {
             continue;
         };
@@ -331,16 +372,6 @@ pub fn prepare(req: &Request, messages: &[Value]) -> Result<Prepared> {
             }
         }
     }
-    Ok(Prepared {
-        url: endpoint(req.target.api, req.base_url),
-        headers,
-        body: body(req, messages)?.to_string(),
-        transport: if req.target.api == "openai-codex-responses" {
-            Transport::Auto
-        } else {
-            Transport::Sse
-        },
-    })
 }
 
 /// Send the request on a new thread; every piece goes to `report`, ending with
@@ -637,6 +668,7 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
     }
     let mut data = String::new();
     let mut seen = std::collections::HashSet::new();
+    let mut chat = p.chat.map(|finish| (completions::Reply::default(), finish));
     for line in BufReader::new(reader).lines() {
         let line = line.map_err(|_| Failure::Retryable("provider_request_failed".into()))?;
         if let Some(rest) = line.strip_prefix("data:") {
@@ -646,11 +678,25 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
         if !line.is_empty() || data.is_empty() {
             continue;
         }
-        let event: Value = serde_json::from_str(&std::mem::take(&mut data))
+        let text = std::mem::take(&mut data);
+        if let Some((reply, _)) = &mut chat {
+            // Chat Completions: chunks until "[DONE]" (or the end of the stream).
+            if text == "[DONE]" {
+                break;
+            }
+            let chunk: Value = serde_json::from_str(&text)
+                .map_err(|_| Failure::Fatal("invalid_provider_json".into()))?;
+            reply.chunk(&chunk, report)?;
+            continue;
+        }
+        let event: Value = serde_json::from_str(&text)
             .map_err(|_| Failure::Fatal("invalid_provider_json".into()))?;
         if handle(&event, report, &mut seen)? {
             return Ok(());
         }
+    }
+    if let Some((reply, finish)) = chat {
+        return reply.finish(report, finish);
     }
     Err(Failure::Retryable("provider_stream_incomplete".into()))
 }
