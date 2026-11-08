@@ -27,6 +27,16 @@ images, and if it still does not fit it sends nothing and reports
 `context_too_large`. For a model missing from the file the core reports
 `window_unknown` once, and the guard cannot protect its requests.
 
+## Usage and cost
+
+Each reply's `message_end` carries its `usage` in pi's shape (`input`, `output`,
+`cacheRead`, `cacheWrite`, `reasoning`, `totalTokens`, and `cost` in dollars) and
+`contextUsage` (`tokens`, `contextWindow`, `percent`); the saved reply has the same usage.
+Cost is pi's `calculateCost` with the model's `cost` rates (from the model object, else the
+models file; per million tokens, with `tiers` above an input size), then service-tier
+pricing: flex half, priority double (Codex reports "default" for a priority request, which
+still counts as priority). Without rates the cost stays zero.
+
 ## System prompt
 
 The core builds the parts of the system prompt that change, the way pi 1.5 does, as

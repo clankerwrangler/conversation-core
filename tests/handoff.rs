@@ -962,6 +962,62 @@ fn the_core_builds_the_changing_part_of_the_system_prompt() {
 }
 
 #[test]
+fn a_reply_reports_its_usage_cost_and_how_full_the_context_is() {
+    let usage = json!({"input_tokens": 3000, "output_tokens": 400, "total_tokens": 3400,
+        "input_tokens_details": {"cached_tokens": 2000, "cache_write_tokens": 500},
+        "output_tokens_details": {"reasoning_tokens": 300}});
+    let (base, server) = server(vec![vec![
+        text("hi"),
+        Step::Event(
+            json!({"type": "response.completed", "response": {"output": [], "usage": usage, "service_tier": "default"}}),
+        ),
+    ]]);
+    let d = dir();
+    let models = d.with_extension("models.json");
+    std::fs::write(&models, r#"{"models": {"m": {"contextWindow": 10000, "cost": {"input": 2, "output": 10, "cacheRead": 0.1, "cacheWrite": 2.5}}}}"#).unwrap();
+    let mut core = Core::start_with(
+        &d,
+        &base,
+        &["--models", models.to_str().unwrap()],
+        json!([]),
+    );
+    core.extra = json!({"serviceTier": "priority", "model": {"api": "openai-codex-responses"}});
+    core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    let end = core.until("message_end");
+    let u = &end["usage"];
+    assert_eq!(
+        (
+            u["input"].clone(),
+            u["cacheRead"].clone(),
+            u["cacheWrite"].clone(),
+            u["reasoning"].clone(),
+            u["totalTokens"].clone()
+        ),
+        (json!(500), json!(2000), json!(500), json!(300), json!(3400))
+    );
+    // Codex said "default" for a priority request: priced double, as the harness does.
+    let expected = ((2.0 / 1_000_000.0) * 500.0
+        + (10.0 / 1_000_000.0) * 400.0
+        + (0.1 / 1_000_000.0) * 2000.0
+        + (2.5 * 500.0 + 2.0 * 2.0 * 0.0) / 1_000_000.0)
+        * 2.0;
+    assert_eq!(u["cost"]["total"], json!(expected));
+    assert_eq!(
+        end["contextUsage"],
+        json!({"tokens": 3400, "contextWindow": 10000, "percent": 34.0})
+    );
+    core.until("turn_end");
+    let ctx = core.context();
+    assert_eq!(
+        ctx[1]["usage"], end["usage"],
+        "the saved reply carries the same usage"
+    );
+    drop(server);
+    let _ = std::fs::remove_file(models);
+    core.stop();
+}
+
+#[test]
 fn an_item_listed_only_in_the_final_message_is_not_lost() {
     let late = json!({"type": "function_call", "id": "fc_c1", "call_id": "c1", "name": "add", "arguments": "{\"a\":1}", "status": "completed"});
     let (base, server) = server(vec![

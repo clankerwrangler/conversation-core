@@ -74,7 +74,11 @@ fn usage_tokens(message: &Value) -> Option<u64> {
     if matches!(stop, Some("aborted" | "error")) {
         return None;
     }
-    let usage = message.get("usage")?;
+    context_tokens(message.get("usage")?)
+}
+
+/// pi's `calculateContextTokens`: the provider's total, or the sum of its parts; None if zero.
+pub fn context_tokens(usage: &Value) -> Option<u64> {
     let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
     let tokens = match n("totalTokens") {
         0 => n("input") + n("output") + n("cacheRead") + n("cacheWrite"),

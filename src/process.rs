@@ -20,7 +20,7 @@
 
 use crate::budget;
 use crate::context_file;
-use crate::models::Models;
+use crate::models::{Models, Pricing};
 use crate::prompt;
 use crate::provider::{self, Failure, Piece, Request};
 use crate::responses::Target;
@@ -334,7 +334,14 @@ impl Core {
                 let model_id = model.get("id").and_then(Value::as_str).unwrap_or("");
                 let level = request.get("reasoning").and_then(Value::as_str);
                 let reasoning = crate::models::reasoning(&model, self.models.get(model_id), level);
-                start_completion(request, op.clone(), self.session_id.clone(), reasoning);
+                let pricing = Pricing::new(&model, self.models.get(model_id), None);
+                start_completion(
+                    request,
+                    op.clone(),
+                    self.session_id.clone(),
+                    reasoning,
+                    pricing,
+                );
             }
             _ => return Ok(false),
         }
@@ -836,6 +843,12 @@ impl Core {
             };
             ready.replace(reviewed.get("body"), reviewed.get("headers"))?;
         }
+        let pricing = Pricing::new(
+            &model,
+            self.models.get(&model_id),
+            prepared.get("serviceTier").and_then(Value::as_str),
+        );
+        let window = self.models.window(&model_id);
         for attempt in 1..=MAX_ATTEMPTS {
             self.attempts += 1;
             let tag = self.attempts;
@@ -843,7 +856,7 @@ impl Core {
             provider::spawn(ready.clone(), move |piece| {
                 let _ = tx.send(Msg::Piece(tag, piece));
             });
-            match self.stream(tag, &target)? {
+            match self.stream(tag, &target, &pricing, window)? {
                 Streamed::Ended(end) => return Ok(end),
                 Streamed::Retry(reason) if attempt < MAX_ATTEMPTS => {
                     emit(json!({"ev": "retry", "attempt": attempt + 1, "error": reason}));
@@ -859,7 +872,13 @@ impl Core {
     }
 
     /// Stream one attempt, saving and handing off each tool call as soon as it is complete.
-    fn stream(&mut self, tag: u64, target: &Target) -> Result<Streamed> {
+    fn stream(
+        &mut self,
+        tag: u64,
+        target: &Target,
+        pricing: &Pricing,
+        window: Option<u64>,
+    ) -> Result<Streamed> {
         let mut message = provider::empty_reply(target);
         let mut unsaved: Vec<Value> = Vec::new();
         let mut open: Option<u64> = None;
@@ -946,7 +965,12 @@ impl Core {
                         }
                     }
                 }
-                Piece::Done { usage, incomplete } => {
+                Piece::Done {
+                    mut usage,
+                    incomplete,
+                    service_tier,
+                } => {
+                    pricing.apply(&mut usage, service_tier.as_deref());
                     let stop = if has_calls {
                         "toolUse"
                     } else if incomplete {
@@ -961,12 +985,18 @@ impl Core {
                         }
                         None => {
                             message["content"] = Value::Array(unsaved);
-                            message["usage"] = usage;
+                            message["usage"] = usage.clone();
                             message["stopReason"] = json!(stop);
                             self.session.append("assistant", &message)?
                         }
                     };
-                    emit(json!({"ev": "message_end", "n": n, "stopReason": stop}));
+                    // Right after a reply the context is exactly what the provider counted.
+                    let tokens = budget::context_tokens(&usage);
+                    let context = json!({"tokens": tokens, "contextWindow": window,
+                        "percent": window.zip(tokens).map(|(w, t)| t as f64 / w as f64 * 100.0)});
+                    emit(
+                        json!({"ev": "message_end", "n": n, "stopReason": stop, "usage": usage, "contextUsage": context}),
+                    );
                     return Ok(Streamed::Ended(End::Reply { calls: has_calls }));
                 }
                 Piece::Failed(Failure::Retryable(reason)) if open.is_none() => {
@@ -1023,6 +1053,7 @@ fn start_completion(
     credentials: Value,
     session_id: String,
     reasoning: crate::models::Reasoning,
+    pricing: Pricing,
 ) {
     std::thread::spawn(move || {
         let id = request.get("id").cloned().unwrap_or(Value::Null);
@@ -1091,7 +1122,12 @@ fn start_completion(
         for piece in rx {
             match piece {
                 Piece::Block(b) => blocks.push(b),
-                Piece::Done { usage, incomplete } => {
+                Piece::Done {
+                    mut usage,
+                    incomplete,
+                    service_tier,
+                } => {
+                    pricing.apply(&mut usage, service_tier.as_deref());
                     message["content"] = Value::Array(blocks);
                     message["usage"] = usage;
                     message["stopReason"] = json!(if incomplete { "length" } else { "stop" });

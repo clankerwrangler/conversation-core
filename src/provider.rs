@@ -42,6 +42,8 @@ pub enum Piece {
     Done {
         usage: Value,
         incomplete: bool,
+        /// The service tier the provider reports it used, for pricing.
+        service_tier: Option<String>,
     },
     Failed(Failure),
     /// The response's status and headers, as soon as they arrive (pi's after_provider_response).
@@ -307,6 +309,10 @@ fn handle(
             report(Piece::Done {
                 usage: usage_from(event.pointer("/response/usage")),
                 incomplete: kind == "response.incomplete",
+                service_tier: event
+                    .pointer("/response/service_tier")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             });
             return Ok(true);
         }
@@ -330,13 +336,15 @@ fn usage_from(usage: Option<&Value>) -> Value {
             .and_then(Value::as_u64)
             .unwrap_or(0)
     };
-    let (input, output, cached) = (
+    // As pi reads it: input_tokens includes cached and cache-write tokens.
+    let (input, cached, written) = (
         get("/input_tokens"),
-        get("/output_tokens"),
         get("/input_tokens_details/cached_tokens"),
+        get("/input_tokens_details/cache_write_tokens"),
     );
-    json!({"input": input.saturating_sub(cached), "output": output, "cacheRead": cached, "cacheWrite": 0,
-           "totalTokens": input + output, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}})
+    json!({"input": input.saturating_sub(cached).saturating_sub(written), "output": get("/output_tokens"),
+           "cacheRead": cached, "cacheWrite": written, "reasoning": get("/output_tokens_details/reasoning_tokens"),
+           "totalTokens": get("/total_tokens"), "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}})
 }
 
 /// Usage for a reply the provider never finished.
