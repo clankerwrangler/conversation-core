@@ -182,6 +182,10 @@ pub enum Failure {
     Fatal(String),
 }
 
+/// The provider refused to switch reasoning off for this model (OpenRouter's "Reasoning is
+/// mandatory"): the core leaves the setting out, remembers it, and sends again.
+pub const REASONING_MANDATORY: &str = "reasoning_mandatory";
+
 /// How a request travels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Transport {
@@ -215,6 +219,14 @@ impl Prepared {
             .collect();
         let body: Value = serde_json::from_str(&self.body).unwrap_or(Value::Null);
         json!({"url": self.url, "headers": headers, "body": body})
+    }
+
+    /// Leave one top-level field out of the body.
+    pub fn without(&mut self, field: &str) {
+        if let Ok(Value::Object(mut body)) = serde_json::from_str::<Value>(&self.body) {
+            body.remove(field);
+            self.body = Value::Object(body).to_string();
+        }
     }
 
     /// Replace the body and/or headers with the runner's reviewed versions.
@@ -657,8 +669,13 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
     ));
     let reader = response.body_mut().as_reader();
     if status != 200 {
-        // Only the status: an error body can echo the request.
-        let _ = std::io::copy(&mut reader.take(64 * 1024), &mut std::io::sink());
+        // Only the status is reported: an error body can echo the request. It is read only
+        // to recognise a refusal the core can correct by itself.
+        let mut body = String::new();
+        let _ = reader.take(64 * 1024).read_to_string(&mut body);
+        if status == 400 && p.chat.is_some() && body.contains("Reasoning is mandatory") {
+            return Err(Failure::Retryable(REASONING_MANDATORY.into()));
+        }
         let detail = format!("provider_http_{status}");
         return Err(if status == 429 || status >= 500 {
             Failure::Retryable(detail)

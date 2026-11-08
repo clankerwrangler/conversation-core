@@ -47,6 +47,17 @@ impl Models {
         self.models.get(model)
     }
 
+    /// Every model in the file, each with its `id`.
+    pub fn all(&self) -> impl Iterator<Item = Value> + '_ {
+        self.models.iter().map(|(id, m)| {
+            let mut m = m.clone();
+            if m.get("id").is_none() && m.is_object() {
+                m["id"] = Value::String(id.clone());
+            }
+            m
+        })
+    }
+
     /// The model's context window in tokens, if the file knows it.
     pub fn window(&self, model: &str) -> Option<u64> {
         self.models

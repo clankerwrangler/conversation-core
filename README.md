@@ -15,11 +15,20 @@ core referenced <session-dir>   print the stored files the context and the lates
 core tool <name> <arguments-json>   run one built-in tool in the current folder, print its result
 ```
 
-## Models file
+## Models file and model lists
 
-Context windows come from a models file, not the code:
-`~/.config/conversation-core/models.json`, or `--models <file>`. `models.json`
-in this repository lists the model definitions. Every request ends with a context
+The runner only has to name a model (`provider` and `id`); the core fills in its details
+(API, endpoint, limits, prices, reasoning levels, compatibility), under any the runner sets:
+
+- OpenRouter: OpenRouter's own list, fetched from OpenRouter (`/models/user` with the
+  account's key, as pi does) and cached in `--catalog <dir>` (default
+  `~/.config/conversation-core/catalog`), refreshed every 4 hours. OpenRouter does not say
+  which models cannot switch reasoning off: when it refuses "off", the core sends again
+  without the setting and remembers that for the model (`learned.json`).
+- Codex and xAI: the models file, `~/.config/conversation-core/models.json` or
+  `--models <file>`. `models.json` in this repository has the model definitions, in pi's shape.
+
+The `models` op (`{"op": "models", "provider"?}`) lists them. Every request ends with a context
 usage line ("Context: about 91k of 500k tokens (84k measured + ~7k new)"),
 which is never saved. If the next request is over the window, the overflow
 guard sets tool results aside (oldest first), then tool-call arguments and

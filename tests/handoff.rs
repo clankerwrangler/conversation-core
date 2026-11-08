@@ -16,6 +16,8 @@ enum Step {
     Event(Value),
     Pause(u64),
     Drop,
+    /// As the only step: answer with this HTTP status and body instead of a stream.
+    Status(u16, String),
 }
 
 /// One scripted reply per request, in order.
@@ -30,6 +32,12 @@ fn server(replies: Vec<Vec<Step>>) -> (String, std::thread::JoinHandle<Vec<Value
             bodies.push(read_request(&mut stream));
             // Each reply streams on its own thread, so a stuck reply does not hold the next.
             writers.push(std::thread::spawn(move || {
+                if let Some(Step::Status(code, body)) = reply.first() {
+                    let _ = stream.write_all(
+                        format!("HTTP/1.1 {code} Error\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes(),
+                    );
+                    return;
+                }
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
                 );
@@ -40,7 +48,7 @@ fn server(replies: Vec<Vec<Step>>) -> (String, std::thread::JoinHandle<Vec<Value
                             let _ = stream.flush();
                         }
                         Step::Pause(ms) => std::thread::sleep(Duration::from_millis(ms)),
-                        Step::Drop => break,
+                        Step::Drop | Step::Status(..) => break,
                     }
                 }
             }));
@@ -120,7 +128,7 @@ fn ws_server(replies: Vec<Vec<Step>>) -> (String, WsSeen) {
                             .send(tungstenite::Message::text(e.to_string()))
                             .unwrap(),
                         Step::Pause(ms) => std::thread::sleep(Duration::from_millis(ms)),
-                        Step::Drop => {
+                        Step::Drop | Step::Status(..) => {
                             let _ = socket.close(None);
                             let _ = socket.flush();
                             break 'socket;
@@ -246,7 +254,12 @@ impl Core {
                     for (k, v) in self.extra.as_object().unwrap() {
                         if k == "model" {
                             for (mk, mv) in v.as_object().unwrap() {
-                                model[mk] = mv.clone();
+                                // null: leave the field out, for the core to fill in.
+                                if mv.is_null() {
+                                    model.as_object_mut().unwrap().remove(mk);
+                                } else {
+                                    model[mk] = mv.clone();
+                                }
                             }
                         } else {
                             prepared[k] = v.clone();
@@ -1183,10 +1196,20 @@ fn an_openrouter_turn_runs_a_tool_call_over_chat_completions() {
         )],
     ]);
     let d = dir();
+    // OpenRouter's list as the core caches it: the runner names only provider and id.
+    let catalog = d.with_extension("catalog");
+    std::fs::create_dir_all(&catalog).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    std::fs::write(catalog.join("openrouter.json"), json!({"checkedAt": now, "models": [{"id": "z-ai/glm-5.3",
+        "api": "openai-completions", "provider": "openrouter", "baseUrl": "https://unused.invalid", "reasoning": true,
+        "input": ["text"], "contextWindow": 200000, "maxTokens": 1000}]}).to_string()).unwrap();
     let tools = json!([{"type": "function", "name": "add", "description": "Add", "parameters": {"type": "object"}}]);
-    let mut core = Core::start_in(&d, &base, &[], tools, &std::env::current_dir().unwrap());
-    core.extra = json!({"instructions": "Be brief.", "model": {"api": "openai-completions", "provider": "openrouter", "id": "z-ai/glm-5.3",
-        "reasoning": true, "input": ["text"], "contextWindow": 200000, "maxTokens": 1000, "compat": {"supportsDeveloperRole": false}}});
+    let flags = ["--catalog", catalog.to_str().unwrap()];
+    let mut core = Core::start_in(&d, &base, &flags, tools, &std::env::current_dir().unwrap());
+    core.extra = json!({"instructions": "Be brief.", "model": {"provider": "openrouter", "id": "z-ai/glm-5.3", "api": null}});
     core.op(json!({"op": "send", "input": {"text": "add 2"}}));
     let call = core.until("tool_call");
     assert_eq!(
@@ -1223,6 +1246,53 @@ fn an_openrouter_turn_runs_a_tool_call_over_chat_completions() {
     );
     let ctx = core.context();
     assert_eq!(ctx[1]["content"][0]["type"], "thinking");
+    core.stop();
+}
+
+#[test]
+fn a_model_that_cannot_switch_reasoning_off_is_learned() {
+    let refused = r#"{"error":{"message":"Reasoning is mandatory for this endpoint and cannot be disabled.","code":400}}"#;
+    let chunk = |t: &str| {
+        Step::Event(json!({"choices": [{"delta": {"content": t}, "finish_reason": "stop"}]}))
+    };
+    let (base, server) = server(vec![
+        vec![Step::Status(400, refused.into())],
+        vec![chunk("a")],
+        vec![chunk("b")],
+    ]);
+    let d = dir();
+    let catalog = d.with_extension("catalog");
+    std::fs::create_dir_all(&catalog).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    std::fs::write(catalog.join("openrouter.json"), json!({"checkedAt": now, "models": [{"id": "z/flash",
+        "api": "openai-completions", "provider": "openrouter", "reasoning": true, "input": ["text"]}]}).to_string()).unwrap();
+    let flags = ["--catalog", catalog.to_str().unwrap()];
+    let mut core = Core::start_in(
+        &d,
+        &base,
+        &flags,
+        json!([]),
+        &std::env::current_dir().unwrap(),
+    );
+    core.extra = json!({"model": {"provider": "openrouter", "id": "z/flash", "api": null}});
+    core.op(json!({"op": "send", "input": {"text": "one"}}));
+    assert_eq!(core.until("retry")["error"], "reasoning_mandatory");
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+    core.op(json!({"op": "send", "input": {"text": "two"}}));
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+    let bodies = server.join().unwrap();
+    assert_eq!(bodies[0]["reasoning"], json!({"effort": "none"}));
+    assert!(
+        bodies[1].get("reasoning").is_none(),
+        "sent again without it"
+    );
+    assert!(
+        bodies[2].get("reasoning").is_none(),
+        "and remembered for the next request"
+    );
     core.stop();
 }
 

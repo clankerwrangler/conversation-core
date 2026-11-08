@@ -1,4 +1,5 @@
 mod budget;
+mod catalog;
 mod completions;
 mod context_file;
 mod models;
@@ -21,6 +22,7 @@ struct Flags {
     models: Option<PathBuf>,
     agent_dir: Option<PathBuf>,
     skills: Vec<PathBuf>,
+    catalog: Option<PathBuf>,
 }
 
 /// Flags after `run <dir>` (or `prompt`, which takes `--tool` instead of `--no-tool`).
@@ -38,6 +40,7 @@ fn flags(rest: &[String], prompt: bool) -> Option<Flags> {
             "--models" if !prompt && f.models.is_none() => f.models = Some(value.into()),
             "--agent-dir" if f.agent_dir.is_none() => f.agent_dir = Some(value.into()),
             "--skills" => f.skills.push(value.into()),
+            "--catalog" if !prompt && f.catalog.is_none() => f.catalog = Some(value.into()),
             _ => return None,
         }
     }
@@ -61,7 +64,8 @@ fn main() -> ExitCode {
             }
         };
         let sources = prompt::Sources::new(f.agent_dir, f.skills);
-        return match process::run(Path::new(dir), f.no_tool, models, sources) {
+        let catalog = f.catalog.unwrap_or_else(catalog::default_dir);
+        return match process::run(Path::new(dir), f.no_tool, models, sources, catalog) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err}");

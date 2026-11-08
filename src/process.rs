@@ -19,6 +19,7 @@
 //! built-in; `--no-tool <name>` turns one off.
 
 use crate::budget;
+use crate::catalog;
 use crate::context_file;
 use crate::models::{Models, Pricing};
 use crate::prompt;
@@ -106,6 +107,8 @@ struct Core {
     stall: Duration,
     /// Where the system prompt's AGENTS files and skills come from.
     sources: prompt::Sources,
+    /// Where fetched model lists (OpenRouter's) are cached.
+    catalog_dir: PathBuf,
 }
 
 pub fn run(
@@ -113,6 +116,7 @@ pub fn run(
     disabled: Vec<String>,
     models: Models,
     sources: prompt::Sources,
+    catalog_dir: PathBuf,
 ) -> Result<()> {
     let session = if dir.join("meta.json").exists() {
         Session::open(dir)?
@@ -172,6 +176,7 @@ pub fn run(
         completions: HashMap::new(),
         stall: Duration::from_millis(STREAM_STALL_MS),
         sources,
+        catalog_dir,
     };
     while let Some(op) = core.next_idle_op() {
         if let Err(err) = core.idle(&op) {
@@ -315,6 +320,16 @@ impl Core {
                     json!({"ev": "history", "id": id, "records": records, "last": self.session.last_seq()?}),
                 );
             }
+            // The models the core knows: the models file's, and OpenRouter's own list.
+            Some("models") => {
+                let list = catalog::list(
+                    &self.models,
+                    &self.catalog_dir,
+                    text("provider"),
+                    text("token"),
+                );
+                emit(json!({"ev": "models", "id": id, "models": list}));
+            }
             Some("complete") => {
                 let key = text("id")
                     .ok_or_else(|| Error::Format("complete needs id".into()))?
@@ -327,11 +342,14 @@ impl Core {
                 emit(json!({"ev": "need_credentials", "id": key, "provider": provider}));
             }
             Some("credentials") if text("id").is_some_and(|i| self.completions.contains_key(i)) => {
-                let request = self
+                let mut request = self
                     .completions
                     .remove(text("id").unwrap_or(""))
                     .unwrap_or(Value::Null);
-                let model = request.get("model").cloned().unwrap_or(Value::Null);
+                let named = request.get("model").cloned().unwrap_or(Value::Null);
+                let model =
+                    catalog::resolve(&self.models, &self.catalog_dir, &named, text("token"));
+                request["model"] = model.clone();
                 let model_id = model.get("id").and_then(Value::as_str).unwrap_or("");
                 let level = request.get("reasoning").and_then(Value::as_str);
                 let reasoning = crate::models::reasoning(&model, self.models.get(model_id), level);
@@ -701,23 +719,15 @@ impl Core {
             Some(Value::Array(edited)) => (edited.clone(), None, edited.len()),
             _ => (context, Some(refs), from_checkpoint),
         };
-        let model = prepared
+        let named = prepared
             .get("model")
             .cloned()
             .ok_or_else(|| Error::Format("prepared needs model".into()))?;
-        let field = |key: &str| {
-            model
-                .get(key)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        };
-        let (api, provider_name, model_id, base_url) = (
-            field("api"),
-            field("provider"),
-            field("id"),
-            field("baseUrl"),
-        );
+        let provider_name = named
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         emit(json!({"ev": "need_credentials", "id": id, "provider": provider_name}));
         let Some(credentials) = self.answer("credentials", &id)? else {
             self.abort(None)?;
@@ -727,6 +737,17 @@ impl Core {
             .get("token")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Format("credentials need token".into()))?;
+        // The runner names the model; its details come from the catalog (OpenRouter's own
+        // list, or the models file), under whatever the runner set itself.
+        let model = catalog::resolve(&self.models, &self.catalog_dir, &named, Some(token));
+        let field = |key: &str| {
+            model
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let (api, model_id, base_url) = (field("api"), field("id"), field("baseUrl"));
         // Built-ins first, then the runner's tools; a runner tool replaces a built-in of its name.
         let mut runner_tools = prepared
             .get("tools")
@@ -878,6 +899,19 @@ impl Core {
             });
             match self.stream(tag, &target, &pricing, window)? {
                 Streamed::Ended(end) => return Ok(end),
+                // The model's reasoning cannot be switched off: send again without the
+                // setting (the model's own default), and remember it for this model.
+                Streamed::Retry(reason)
+                    if reason == provider::REASONING_MANDATORY && attempt < MAX_ATTEMPTS =>
+                {
+                    catalog::learn_reasoning_mandatory(
+                        &self.catalog_dir,
+                        &provider_name,
+                        &model_id,
+                    );
+                    ready.without("reasoning");
+                    emit(json!({"ev": "retry", "attempt": attempt + 1, "error": reason}));
+                }
                 Streamed::Retry(reason) if attempt < MAX_ATTEMPTS => {
                     emit(json!({"ev": "retry", "attempt": attempt + 1, "error": reason}));
                     std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
