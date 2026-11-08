@@ -42,6 +42,33 @@ images, and if it still does not fit it sends nothing and reports
 `context_too_large`. For a model missing from the file the core reports
 `window_unknown` once, and the guard cannot protect its requests.
 
+## Sign-in
+
+The core signs in, stores credentials and renews them itself, with the providers' own flows
+(as pi and the pi-grok-cli add-on run them). Credentials live in `--auth <file>` (default
+`~/.config/conversation-core/auth.json`, pi's `auth.json` shape, owner-only). A request uses
+the stored sign-in for its provider, renewed shortly before it expires; only when there is
+none is the runner asked (`need_credentials`). Renewal holds `<file>.lock` and re-reads the
+file first, so sessions sharing it never send a refresh token twice (providers rotate them).
+Modeled in `specification/CredentialRefresh.tla`.
+
+- `core login openai-codex|grok-cli [device|browser]`, `core login openrouter [key|browser]`,
+  `core logout <provider>`: from a terminal. Device sign-in prints a page and a code to
+  approve; browser sign-in prints a page and waits for the address it ends on to be pasted;
+  an API key is read from standard input.
+- The same as ops: `{"op": "login", "id", "provider", "method", "key"?}` with `login` events
+  (`step`: `device_code`, `open_and_paste`, `done`, `failed`), `{"op": "login_input", "id",
+  "input"}` for the pasted address, `logout`, and `auth_status` (who is signed in, never the
+  secrets). A failed renewal is reported as `sign_in_needed`.
+
+## Grok (grok-cli)
+
+Grok through the Grok CLI proxy works as the pi-grok-cli add-on makes it work: its client
+headers and conversation header, its model list (fetched from the proxy's `/models` with the
+sign-in, the add-on's list shipped in `models.json`, without prices), and its request
+changes (system prompt into `instructions`, reasoning items and images reshaped, tool-result
+images moved to a message, effort fitted per model).
+
 ## Chat Completions (OpenRouter)
 
 A model with `"api": "openai-completions"` (OpenRouter and other OpenAI-compatible

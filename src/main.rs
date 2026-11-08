@@ -1,7 +1,9 @@
+mod auth;
 mod budget;
 mod catalog;
 mod completions;
 mod context_file;
+mod grok;
 mod models;
 mod process;
 mod prompt;
@@ -23,6 +25,7 @@ struct Flags {
     agent_dir: Option<PathBuf>,
     skills: Vec<PathBuf>,
     catalog: Option<PathBuf>,
+    auth: Option<PathBuf>,
 }
 
 /// Flags after `run <dir>` (or `prompt`, which takes `--tool` instead of `--no-tool`).
@@ -41,6 +44,7 @@ fn flags(rest: &[String], prompt: bool) -> Option<Flags> {
             "--agent-dir" if f.agent_dir.is_none() => f.agent_dir = Some(value.into()),
             "--skills" => f.skills.push(value.into()),
             "--catalog" if !prompt && f.catalog.is_none() => f.catalog = Some(value.into()),
+            "--auth" if !prompt && f.auth.is_none() => f.auth = Some(value.into()),
             _ => return None,
         }
     }
@@ -64,11 +68,96 @@ fn main() -> ExitCode {
             }
         };
         let sources = prompt::Sources::new(f.agent_dir, f.skills);
-        let catalog = f.catalog.unwrap_or_else(catalog::default_dir);
-        return match process::run(Path::new(dir), f.no_tool, models, sources, catalog) {
+        let paths = process::Paths {
+            catalog: f.catalog.unwrap_or_else(catalog::default_dir),
+            auth: f.auth.unwrap_or_else(auth::default_path),
+        };
+        return match process::run(Path::new(dir), f.no_tool, models, sources, paths) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // Sign-in from a terminal: `core login <provider> [device|browser|key] [--auth <file>]`.
+    // A pasted address or API key is read from standard input, never taken as an argument.
+    if let [_, cmd, provider, rest @ ..] = args.as_slice()
+        && (cmd == "login" || cmd == "logout")
+    {
+        let (method, rest) = match rest {
+            [m, rest @ ..] if !m.starts_with("--") => (Some(m.as_str()), rest),
+            _ => (None, rest),
+        };
+        let Some(f) = flags(rest, false) else {
+            eprintln!(
+                "error: usage: core login <provider> [device|browser|key] [--auth <file>] | core logout <provider>"
+            );
+            return ExitCode::FAILURE;
+        };
+        let path = f.auth.unwrap_or_else(auth::default_path);
+        if cmd == "logout" {
+            return match auth::remove(&path, provider) {
+                Ok(removed) => {
+                    println!(
+                        "{}",
+                        if removed {
+                            "signed out"
+                        } else {
+                            "was not signed in"
+                        }
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        let method = method.unwrap_or(if provider == auth::OPENROUTER {
+            "key"
+        } else {
+            "device"
+        });
+        let line = || {
+            let mut s = String::new();
+            std::io::stdin()
+                .read_line(&mut s)
+                .ok()
+                .map(|_| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let key = if method == "key" {
+            eprintln!("Paste the API key, then press Enter:");
+            line()
+        } else {
+            None
+        };
+        let show = |step: auth::Step| match step {
+            auth::Step::DeviceCode {
+                url,
+                code,
+                expires_in,
+            } => {
+                eprintln!(
+                    "Open {url} and enter the code {code} (valid for {} minutes).",
+                    expires_in / 60
+                )
+            }
+            auth::Step::OpenAndPaste { url } => {
+                eprintln!(
+                    "Open this page and sign in:\n{url}\nThen paste the address the browser ends on and press Enter:"
+                )
+            }
+        };
+        return match auth::login(&path, provider, method, key.as_deref(), &show, &line) {
+            Ok(done) => {
+                println!("{done}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
                 ExitCode::FAILURE
             }
         };

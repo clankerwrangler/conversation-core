@@ -316,6 +316,10 @@ pub fn body(req: &Request, messages: &[Value]) -> Result<Value> {
     if req.reasoning.include {
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
+    // The Grok CLI proxy takes the request only in the add-on's shape.
+    if req.model.get("provider").and_then(Value::as_str) == Some(crate::grok::PROVIDER) {
+        crate::grok::sanitize(&mut body, req.model, req.session_id);
+    }
     Ok(body)
 }
 
@@ -364,6 +368,11 @@ pub fn prepare(req: &Request, messages: &[Value]) -> Result<Prepared> {
         req.session_id.to_string(),
     ));
     merge_headers(&mut headers, &req.extra_headers);
+    if req.model.get("provider").and_then(Value::as_str) == Some(crate::grok::PROVIDER) {
+        // The add-on's before_provider_headers: the conversation the request belongs to.
+        headers.retain(|(k, _)| k != "x-grok-conv-id");
+        headers.push(("x-grok-conv-id".into(), req.session_id.to_string()));
+    }
     Ok(Prepared {
         url: endpoint(req.target.api, req.base_url),
         headers,

@@ -1166,7 +1166,9 @@ fn model_headers_are_merged_over_the_defaults_as_the_harness_does() {
     assert_eq!(
         headers,
         json!({"content-type": "application/json", "authorization": "Bearer t",
-        "session_id": headers["session_id"], "user-agent": "grok-shell/1", "x-grok-model-override": "m"})
+        "session_id": headers["session_id"], "user-agent": "grok-shell/1", "x-grok-model-override": "m",
+        "x-grok-conv-id": headers["session_id"]}),
+        "and grok-cli's conversation header"
     );
     assert!(headers["session_id"].is_string());
     core.op(json!({"op": "review_request", "id": review["id"]}));
@@ -1293,6 +1295,37 @@ fn a_model_that_cannot_switch_reasoning_off_is_learned() {
         bodies[2].get("reasoning").is_none(),
         "and remembered for the next request"
     );
+    core.stop();
+}
+
+#[test]
+fn a_stored_sign_in_is_used_without_asking_the_runner() {
+    let (base, server) = server(vec![vec![text("a"), done()]]);
+    let d = dir();
+    let auth = d.with_extension("auth.json");
+    std::fs::write(
+        &auth,
+        r#"{"test": {"type": "api_key", "key": "stored-key"}}"#,
+    )
+    .unwrap();
+    let mut core = Core::start_with(&d, &base, &["--auth", auth.to_str().unwrap()], json!([]));
+    core.extra = json!({"reviewRequest": true});
+    core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    let review = core.until("review_request");
+    assert_eq!(
+        review["request"]["headers"]["authorization"],
+        "Bearer stored-key"
+    );
+    core.op(json!({"op": "review_request", "id": review["id"]}));
+    core.until("turn_end");
+    core.op(json!({"op": "auth_status", "id": "s"}));
+    let status = core.until("auth_status");
+    assert_eq!(status["signedIn"][0]["provider"], "test");
+    assert!(
+        !status.to_string().contains("stored-key"),
+        "the secret is never reported"
+    );
+    drop(server);
     core.stop();
 }
 

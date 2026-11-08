@@ -7,6 +7,7 @@
 //! - Every other provider (Codex, xAI): the models file, whose entries are full model
 //!   descriptions in pi's shape.
 
+use crate::grok;
 use crate::models::Models;
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
@@ -442,15 +443,60 @@ pub fn resolve(models: &Models, dir: &Path, requested: &Value, key: Option<&str>
 }
 
 /// The providers whose lists the core discovers, with their default endpoints.
-const DISCOVERED: [(&str, &str); 2] = [(OPENROUTER, OPENROUTER_BASE), (CODEX, CODEX_BASE)];
+const DISCOVERED: [(&str, &str); 3] = [
+    (OPENROUTER, OPENROUTER_BASE),
+    (CODEX, CODEX_BASE),
+    (grok::PROVIDER, grok::BASE),
+];
 
 /// A provider's discovered list (empty for providers the core cannot ask).
 fn discovered(dir: &Path, provider: &str, base_url: Option<&str>, key: Option<&str>) -> Vec<Value> {
     match provider {
         OPENROUTER => openrouter_models(dir, base_url.unwrap_or(OPENROUTER_BASE), key),
         CODEX => codex_models(dir, base_url.unwrap_or(CODEX_BASE), key),
+        grok::PROVIDER => fetched(
+            dir,
+            grok::PROVIDER,
+            base_url.unwrap_or(grok::BASE),
+            key,
+            refresh_grok,
+        ),
         _ => Vec::new(),
     }
+}
+
+/// Fetch the Grok CLI proxy's model list (`<base>/models` with the sign-in and the add-on's
+/// client headers) and cache it.
+pub fn refresh_grok(dir: &Path, base_url: &str, token: Option<&str>) -> Result<Vec<Value>, String> {
+    let token = token
+        .filter(|t| !t.is_empty())
+        .ok_or("grok_models_need_sign_in")?;
+    let mut headers: Vec<(&str, String)> = vec![("authorization", format!("Bearer {token}"))];
+    let client = grok::headers("");
+    for (k, v) in client.as_object().into_iter().flatten() {
+        if k != "x-grok-model-override"
+            && let Some(v) = v.as_str()
+        {
+            headers.push((k.as_str(), v.to_string()));
+        }
+    }
+    let (status, body, _) = get(
+        &format!("{}/models", base_url.trim_end_matches('/')),
+        &headers,
+    )?;
+    if status != 200 {
+        return Err(format!("grok_models_http_{status}"));
+    }
+    let entries = body
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or("grok_models_invalid")?;
+    let models: Vec<Value> = entries
+        .iter()
+        .filter_map(|e| grok::model(e, base_url))
+        .collect();
+    write_cache(dir, grok::PROVIDER, &models, None).map_err(|_| "grok_models_not_saved")?;
+    Ok(models)
 }
 
 /// `over`'s fields over `base`'s.

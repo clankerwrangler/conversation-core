@@ -18,6 +18,7 @@
 //! event follows once the result is saved. A runner tool with the same name replaces a
 //! built-in; `--no-tool <name>` turns one off.
 
+use crate::auth;
 use crate::budget;
 use crate::catalog;
 use crate::context_file;
@@ -109,6 +110,14 @@ struct Core {
     sources: prompt::Sources,
     /// Where fetched model lists (OpenRouter's) are cached.
     catalog_dir: PathBuf,
+    /// The core's own credentials file.
+    auth_path: PathBuf,
+}
+
+/// Where the core keeps what it fetches and what it is signed in with.
+pub struct Paths {
+    pub catalog: PathBuf,
+    pub auth: PathBuf,
 }
 
 pub fn run(
@@ -116,7 +125,7 @@ pub fn run(
     disabled: Vec<String>,
     models: Models,
     sources: prompt::Sources,
-    catalog_dir: PathBuf,
+    paths: Paths,
 ) -> Result<()> {
     let session = if dir.join("meta.json").exists() {
         Session::open(dir)?
@@ -176,7 +185,8 @@ pub fn run(
         completions: HashMap::new(),
         stall: Duration::from_millis(STREAM_STALL_MS),
         sources,
-        catalog_dir,
+        catalog_dir: paths.catalog,
+        auth_path: paths.auth,
     };
     while let Some(op) = core.next_idle_op() {
         if let Err(err) = core.idle(&op) {
@@ -336,35 +346,102 @@ impl Core {
                     .to_string();
                 let provider = op
                     .pointer("/model/provider")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                self.completions.insert(key.clone(), op.clone());
-                emit(json!({"ev": "need_credentials", "id": key, "provider": provider}));
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                match self.stored_credentials(&provider) {
+                    Some(credentials) => self.complete_with(op.clone(), credentials),
+                    None => {
+                        self.completions.insert(key.clone(), op.clone());
+                        emit(json!({"ev": "need_credentials", "id": key, "provider": provider}));
+                    }
+                }
             }
             Some("credentials") if text("id").is_some_and(|i| self.completions.contains_key(i)) => {
-                let mut request = self
+                let request = self
                     .completions
                     .remove(text("id").unwrap_or(""))
                     .unwrap_or(Value::Null);
-                let named = request.get("model").cloned().unwrap_or(Value::Null);
-                let model =
-                    catalog::resolve(&self.models, &self.catalog_dir, &named, text("token"));
-                request["model"] = model.clone();
-                let model_id = model.get("id").and_then(Value::as_str).unwrap_or("");
-                let level = request.get("reasoning").and_then(Value::as_str);
-                let reasoning = crate::models::reasoning(&model, self.models.get(model_id), level);
-                let pricing = Pricing::new(&model, self.models.get(model_id), None);
-                start_completion(
-                    request,
-                    op.clone(),
-                    self.session_id.clone(),
-                    reasoning,
-                    pricing,
+                self.complete_with(request, op.clone());
+            }
+            // Sign-in, kept by the core (see auth.rs): device code, or a page to open whose
+            // final address is pasted back with `login_input`, or an OpenRouter API key.
+            Some("login") => {
+                let provider = text("provider")
+                    .ok_or_else(|| Error::Format("login needs provider".into()))?
+                    .to_string();
+                let method = text("method")
+                    .unwrap_or(if provider == auth::OPENROUTER {
+                        "key"
+                    } else {
+                        "device"
+                    })
+                    .to_string();
+                start_login(
+                    self.auth_path.clone(),
+                    id,
+                    provider,
+                    method,
+                    text("key").map(str::to_string),
                 );
             }
+            Some("login_input") => {
+                let key = id
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| id.to_string());
+                if let Some(tx) = LOGIN_INPUTS
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| m.as_mut().and_then(|m| m.remove(&key)))
+                {
+                    let _ = tx.send(text("input").unwrap_or("").to_string());
+                }
+            }
+            Some("logout") => {
+                let provider = text("provider")
+                    .ok_or_else(|| Error::Format("logout needs provider".into()))?;
+                let removed = auth::remove(&self.auth_path, provider).map_err(Error::Format)?;
+                emit(
+                    json!({"ev": "logged_out", "id": id, "provider": provider, "removed": removed}),
+                );
+            }
+            Some("auth_status") => emit(
+                json!({"ev": "auth_status", "id": id, "signedIn": auth::status(&self.auth_path)}),
+            ),
             _ => return Ok(false),
         }
         Ok(true)
+    }
+
+    /// The core's stored sign-in for a provider, renewed if about to expire. None when it
+    /// holds none (or renewal failed, reported as `sign_in_needed`): the runner is asked.
+    fn stored_credentials(&self, provider: &str) -> Option<Value> {
+        match auth::credentials(&self.auth_path, provider) {
+            Ok(found) => found,
+            Err(error) => {
+                emit(json!({"ev": "sign_in_needed", "provider": provider, "error": error}));
+                None
+            }
+        }
+    }
+
+    fn complete_with(&self, mut request: Value, credentials: Value) {
+        let named = request.get("model").cloned().unwrap_or(Value::Null);
+        let token = credentials.get("token").and_then(Value::as_str);
+        let model = catalog::resolve(&self.models, &self.catalog_dir, &named, token);
+        request["model"] = model.clone();
+        let model_id = model.get("id").and_then(Value::as_str).unwrap_or("");
+        let level = request.get("reasoning").and_then(Value::as_str);
+        let reasoning = crate::models::reasoning(&model, self.models.get(model_id), level);
+        let pricing = Pricing::new(&model, self.models.get(model_id), None);
+        start_completion(
+            request,
+            credentials,
+            self.session_id.clone(),
+            reasoning,
+            pricing,
+        );
     }
 
     /// pi's custom message: a message the model sees, added by the runner (family message,
@@ -728,10 +805,17 @@ impl Core {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        emit(json!({"ev": "need_credentials", "id": id, "provider": provider_name}));
-        let Some(credentials) = self.answer("credentials", &id)? else {
-            self.abort(None)?;
-            return Ok(End::Aborted);
+        // The core's own sign-in first (renewed when about to expire); the runner otherwise.
+        let credentials = match self.stored_credentials(&provider_name) {
+            Some(c) => c,
+            None => {
+                emit(json!({"ev": "need_credentials", "id": id, "provider": provider_name}));
+                let Some(c) = self.answer("credentials", &id)? else {
+                    self.abort(None)?;
+                    return Ok(End::Aborted);
+                };
+                c
+            }
         };
         let token = credentials
             .get("token")
@@ -1108,6 +1192,49 @@ enum Streamed {
 /// An injected message wakes the model unless it says `"wake": false`.
 fn wakes(op: &Value) -> bool {
     op.get("wake") != Some(&Value::Bool(false))
+}
+
+/// Sign-ins waiting for a pasted address, by the login op's id.
+static LOGIN_INPUTS: std::sync::Mutex<Option<HashMap<String, Sender<String>>>> =
+    std::sync::Mutex::new(None);
+
+/// Run one sign-in on its own thread: `login` events report each step and the end.
+fn start_login(path: PathBuf, id: Value, provider: String, method: String, key: Option<String>) {
+    std::thread::spawn(move || {
+        let tag = id
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| id.to_string());
+        let show = |step: auth::Step| match step {
+            auth::Step::DeviceCode {
+                url,
+                code,
+                expires_in,
+            } => emit(json!({"ev": "login", "id": id, "provider": provider,
+                "step": "device_code", "url": url, "code": code, "expiresIn": expires_in})),
+            auth::Step::OpenAndPaste { url } => {
+                emit(json!({"ev": "login", "id": id, "provider": provider,
+                "step": "open_and_paste", "url": url}))
+            }
+        };
+        let paste = || {
+            let (tx, rx) = channel();
+            if let Ok(mut inputs) = LOGIN_INPUTS.lock() {
+                inputs
+                    .get_or_insert_with(HashMap::new)
+                    .insert(tag.clone(), tx);
+            }
+            rx.recv_timeout(Duration::from_secs(15 * 60)).ok()
+        };
+        match auth::login(&path, &provider, &method, key.as_deref(), &show, &paste) {
+            Ok(done) => emit(
+                json!({"ev": "login", "id": id, "provider": provider, "step": "done", "signedIn": done}),
+            ),
+            Err(error) => emit(
+                json!({"ev": "login", "id": id, "provider": provider, "step": "failed", "error": error}),
+            ),
+        }
+    });
 }
 
 /// The closing fields of a failed reply: pi's stopReason "error" and errorMessage (a fixed
