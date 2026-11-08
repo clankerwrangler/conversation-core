@@ -256,9 +256,9 @@ impl Core {
                     self.op(prepared);
                     self.prepares.push(ev);
                 }
-                Some("need_credentials") => {
-                    self.op(json!({"op": "credentials", "id": ev["id"], "token": "t"}))
-                }
+                Some("need_credentials") => self.op(
+                    json!({"op": "credentials", "id": ev["id"], "token": "t", "accountId": "acct"}),
+                ),
                 Some("provider_response") if self.show_responses => return ev,
                 Some("text_delta")
                 | Some("reasoning_delta")
@@ -909,7 +909,7 @@ fn the_runner_can_review_the_exact_request() {
     let mut body = review["request"]["body"].clone();
     assert_eq!(body["stream"], true);
     assert!(
-        review["request"]["headers"]["Authorization"]
+        review["request"]["headers"]["authorization"]
             .as_str()
             .unwrap()
             .starts_with("Bearer ")
@@ -1136,6 +1136,29 @@ fn a_provider_error_is_reported_and_saved_as_fixed_codes() {
             .iter()
             .all(|i| i["role"] != "assistant")
     );
+    core.stop();
+}
+
+#[test]
+fn model_headers_are_merged_over_the_defaults_as_the_harness_does() {
+    let (base, server) = server(vec![vec![text("a"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    // grok-cli's model headers (pi's model.headers); a null removes a default.
+    core.extra = json!({"reviewRequest": true, "model": {"provider": "grok-cli",
+        "headers": {"User-Agent": "grok-shell/1", "x-grok-model-override": "m", "accept": null}}});
+    core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    let review = core.until("review_request");
+    let headers = review["request"]["headers"].clone();
+    assert_eq!(
+        headers,
+        json!({"content-type": "application/json", "authorization": "Bearer t",
+        "session_id": headers["session_id"], "user-agent": "grok-shell/1", "x-grok-model-override": "m"})
+    );
+    assert!(headers["session_id"].is_string());
+    core.op(json!({"op": "review_request", "id": review["id"]}));
+    core.until("turn_end");
+    drop(server);
     core.stop();
 }
 

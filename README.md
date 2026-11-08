@@ -90,6 +90,12 @@ a file being deleted. Modeled in `specification/ReaperReferences.tla`.
 - `streamStallMs`: give up an attempt after this long without a sign of life
   (default 10 minutes, as in the harness); it is retried like a dropped connection.
 
+- Headers are the harness's: content type, accept, authorization, and `session_id`
+  (Codex: `session-id`, `originator`, `chatgpt-account-id`, taken from `credentials.accountId`
+  or the token's claims). Then `credentials.headers` and the model object's `headers` (pi's
+  `model.headers`, e.g. grok-cli's client identification) are merged over them, a null
+  removing one; `credentials.baseUrl` replaces the model's endpoint. Provider-specific
+  request changes (grok-cli's payload fixes) belong to the runner, via `reviewRequest`.
 - `transport`: Codex requests go over one WebSocket kept open between requests (as the
   harness sends them), with plain HTTP when no socket can be opened; `"sse"` keeps them on
   HTTP. Every request carries the whole context (no `previous_response_id`), so the usage

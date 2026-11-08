@@ -813,7 +813,11 @@ impl Core {
                 provider: &provider_name,
                 model: &model_id,
             },
-            base_url: &base_url,
+            // The credentials may name another endpoint (an account on its own proxy).
+            base_url: credentials
+                .get("baseUrl")
+                .and_then(Value::as_str)
+                .unwrap_or(base_url.as_str()),
             instructions: &instructions,
             reasoning: &reasoning_setting,
             service_tier: prepared.get("serviceTier").and_then(Value::as_str),
@@ -822,6 +826,10 @@ impl Core {
             token,
             account_id: credentials.get("accountId").and_then(Value::as_str),
             developer_role: provider::developer_role(&model, &reasoning_setting),
+            extra_headers: [credentials.get("headers"), model.get("headers")]
+                .into_iter()
+                .flatten()
+                .collect(),
         };
         self.stall = Duration::from_millis(
             prepared
@@ -1131,7 +1139,10 @@ fn start_completion(
                 provider: &provider_name,
                 model: &model_id,
             },
-            base_url: &base_url,
+            base_url: credentials
+                .get("baseUrl")
+                .and_then(Value::as_str)
+                .unwrap_or(base_url.as_str()),
             instructions: request
                 .get("instructions")
                 .and_then(Value::as_str)
@@ -1146,6 +1157,13 @@ fn start_completion(
                 request.get("model").unwrap_or(&Value::Null),
                 &reasoning,
             ),
+            extra_headers: [
+                credentials.get("headers"),
+                request.pointer("/model/headers"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
         };
         let ready = match provider::prepare(&req, &messages) {
             Ok(r) => r,

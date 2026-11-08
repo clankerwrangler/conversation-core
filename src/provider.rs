@@ -24,6 +24,23 @@ pub struct Request<'a> {
     /// Outside Codex the instructions are the first input message, as "developer" for a
     /// reasoning model that accepts that role and as "system" otherwise (as pi sends them).
     pub developer_role: bool,
+    /// Headers from the credentials, then from the model object (pi's `model.headers`, e.g.
+    /// grok-cli's client identification), merged over the defaults; a null value removes one.
+    pub extra_headers: Vec<&'a Value>,
+}
+
+/// The ChatGPT account id inside a Codex access token (its JWT claims), as the harness reads it.
+fn codex_account(token: &str) -> Option<String> {
+    use base64::Engine;
+    let claims = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(claims.trim_end_matches('='))
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    let id = claims
+        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")?
+        .as_str()?;
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 /// pi's instruction role rule: "developer" when the model reasons and its
@@ -278,20 +295,41 @@ pub fn body(req: &Request, messages: &[Value]) -> Result<Value> {
 }
 
 pub fn prepare(req: &Request, messages: &[Value]) -> Result<Prepared> {
-    let mut headers: Vec<(String, String)> = [
-        ("Authorization", format!("Bearer {}", req.token)),
-        ("OpenAI-Beta", "responses=experimental".to_string()),
-        ("accept", "text/event-stream".to_string()),
-        ("content-type", "application/json".to_string()),
-        ("originator", "pi".to_string()),
-        ("session-id", req.session_id.to_string()),
-        ("x-client-request-id", req.session_id.to_string()),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v))
-    .collect();
-    if let Some(account) = req.account_id {
-        headers.push(("chatgpt-account-id".to_string(), account.to_string()));
+    // The harness's headers (native-provider.mjs), lower-case, later groups winning.
+    let codex = req.target.api == "openai-codex-responses";
+    let mut headers: Vec<(String, String)> = vec![
+        ("content-type".into(), "application/json".into()),
+        ("accept".into(), "text/event-stream".into()),
+    ];
+    if !req.token.is_empty() {
+        headers.push(("authorization".into(), format!("Bearer {}", req.token)));
+    }
+    if codex {
+        let account = req
+            .account_id
+            .map(str::to_string)
+            .or_else(|| codex_account(req.token));
+        let Some(account) = account else {
+            return Err(Error::Format("missing_codex_account_id".into()));
+        };
+        headers.push(("chatgpt-account-id".into(), account));
+        headers.push(("originator".into(), "pi".into()));
+    }
+    headers.push((
+        if codex { "session-id" } else { "session_id" }.into(),
+        req.session_id.to_string(),
+    ));
+    for group in &req.extra_headers {
+        let Value::Object(group) = group else {
+            continue;
+        };
+        for (key, value) in group {
+            let key = key.to_ascii_lowercase();
+            headers.retain(|(k, _)| *k != key);
+            if let Some(value) = value.as_str() {
+                headers.push((key, value.to_string()));
+            }
+        }
     }
     Ok(Prepared {
         url: endpoint(req.target.api, req.base_url),
