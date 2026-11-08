@@ -34,7 +34,7 @@ pub struct Request<'a> {
 }
 
 /// The ChatGPT account id inside a Codex access token (its JWT claims), as the harness reads it.
-fn codex_account(token: &str) -> Option<String> {
+pub(crate) fn codex_account(token: &str) -> Option<String> {
     use base64::Engine;
     let claims = token.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -185,6 +185,13 @@ pub enum Failure {
 /// The provider refused to switch reasoning off for this model (OpenRouter's "Reasoning is
 /// mandatory"): the core leaves the setting out, remembers it, and sends again.
 pub const REASONING_MANDATORY: &str = "reasoning_mandatory";
+
+/// The provider's error says reasoning cannot be switched off for this model: OpenRouter's
+/// "Reasoning is mandatory", or OpenAI's unsupported `reasoning.effort` value 'none'.
+fn refuses_reasoning_off(error: &str) -> bool {
+    error.contains("Reasoning is mandatory")
+        || (error.contains("reasoning.effort") && error.contains("'none' is not supported"))
+}
 
 /// How a request travels.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -673,7 +680,7 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
         // to recognise a refusal the core can correct by itself.
         let mut body = String::new();
         let _ = reader.take(64 * 1024).read_to_string(&mut body);
-        if status == 400 && p.chat.is_some() && body.contains("Reasoning is mandatory") {
+        if status == 400 && refuses_reasoning_off(&body) {
             return Err(Failure::Retryable(REASONING_MANDATORY.into()));
         }
         let detail = format!("provider_http_{status}");
@@ -782,6 +789,9 @@ fn handle(
             return Ok(true);
         }
         // Fixed codes as the harness gives them; the provider's text is never passed on.
+        "error" if refuses_reasoning_off(&event.to_string()) => {
+            return Err(Failure::Retryable(REASONING_MANDATORY.into()));
+        }
         "error" => {
             let code = event.get("code").or_else(|| event.pointer("/error/code"));
             report(Piece::ProviderError(provider_error(event, code)));

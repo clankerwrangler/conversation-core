@@ -131,53 +131,211 @@ pub fn openrouter_model(entry: &Value, base_url: &str) -> Option<Value> {
     Some(model)
 }
 
-/// The cached OpenRouter list, if any: (fetched at, models).
-fn read_cache(dir: &Path) -> Option<(u64, Vec<Value>)> {
-    let text = std::fs::read_to_string(dir.join("openrouter.json")).ok()?;
+/// A provider's cached list, if any: (fetched at, models, etag).
+fn read_cache(dir: &Path, provider: &str) -> Option<(u64, Vec<Value>, Option<String>)> {
+    let text = std::fs::read_to_string(dir.join(format!("{provider}.json"))).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
     let models = value.get("models")?.as_array()?.clone();
+    let etag = value
+        .get("etag")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Some((
         value.get("checkedAt").and_then(Value::as_u64).unwrap_or(0),
         models,
+        etag,
     ))
 }
 
-fn write_cache(dir: &Path, models: &[Value]) -> std::io::Result<()> {
+fn write_cache(
+    dir: &Path,
+    provider: &str,
+    models: &[Value],
+    etag: Option<&str>,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".openrouter.json.{}", std::process::id()));
+    let tmp = dir.join(format!(".{provider}.json.{}", std::process::id()));
     std::fs::write(
         &tmp,
-        json!({"checkedAt": now_ms(), "models": models}).to_string(),
+        json!({"checkedAt": now_ms(), "etag": etag, "models": models}).to_string(),
     )?;
-    std::fs::rename(tmp, dir.join("openrouter.json"))
+    std::fs::rename(tmp, dir.join(format!("{provider}.json")))
 }
 
-fn get(url: &str, key: Option<&str>) -> Result<(u16, Value), String> {
+/// GET a JSON list: (status, body, etag). A 304 (unchanged) has no body.
+fn get(url: &str, headers: &[(&str, String)]) -> Result<(u16, Value, Option<String>), String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(TIMEOUT))
         .build()
         .into();
     let mut call = agent.get(url).header("accept", "application/json");
-    if let Some(key) = key {
-        call = call.header("authorization", format!("Bearer {key}"));
+    for (k, v) in headers {
+        call = call.header(*k, v);
     }
     let mut response = call
         .call()
-        .map_err(|_| "openrouter_models_unreachable".to_string())?;
+        .map_err(|_| "models_list_unreachable".to_string())?;
     let status = response.status().as_u16();
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     if status != 200 {
-        return Ok((status, Value::Null));
+        return Ok((status, Value::Null, etag));
     }
     let body = response
         .body_mut()
         .with_config()
         .limit(64 * 1024 * 1024)
         .read_to_string()
-        .map_err(|_| "openrouter_models_unreadable")?;
+        .map_err(|_| "models_list_unreadable")?;
     serde_json::from_str(&body)
-        .map(|v| (status, v))
-        .map_err(|_| "openrouter_models_invalid".to_string())
+        .map(|v| (status, v, etag))
+        .map_err(|_| "models_list_invalid".to_string())
+}
+
+pub const CODEX: &str = "openai-codex";
+const CODEX_BASE: &str = "https://chatgpt.com/backend-api";
+/// OpenAI lists a model only to clients at least as new as its `minimal_client_version`.
+const CODEX_CLIENT_VERSION: &str = "1.5.0";
+
+/// One entry of OpenAI's Codex list as a model description in pi's shape. The reasoning
+/// levels it lists become pi's `thinkingLevelMap` (a level it does not list is null, so
+/// the session's level is fitted to the nearest one it has). OpenAI gives no prices.
+pub fn codex_model(entry: &Value, base_url: &str) -> Option<Value> {
+    let id = entry.get("slug")?.as_str()?;
+    if entry
+        .get("visibility")
+        .and_then(Value::as_str)
+        .is_some_and(|v| v != "list")
+    {
+        return None;
+    }
+    let efforts: Vec<&str> = entry
+        .get("supported_reasoning_levels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.get("effort").and_then(Value::as_str))
+        .collect();
+    let mut map = Map::new();
+    // OpenAI's list never offers "none", but most Codex models accept it. "off" is sent as
+    // "none"; a model that refuses it is learned (see learn_reasoning_mandatory).
+    map.insert("off".into(), json!("none"));
+    for level in ["minimal", "low", "medium", "high", "xhigh", "max"] {
+        map.insert(
+            level.into(),
+            if efforts.contains(&level) {
+                json!(level)
+            } else {
+                Value::Null
+            },
+        );
+    }
+    let inputs: Vec<&str> = entry
+        .get("input_modalities")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|m| matches!(*m, "text" | "image"))
+        .collect();
+    let mut model = json!({"id": id, "name": entry.get("display_name").cloned().unwrap_or(json!(id)),
+        "api": "openai-codex-responses", "provider": CODEX, "baseUrl": base_url,
+        "reasoning": !efforts.is_empty(), "input": if inputs.is_empty() { json!(["text"]) } else { json!(inputs) }});
+    if !efforts.is_empty() {
+        model["thinkingLevelMap"] = Value::Object(map);
+    }
+    if let Some(w) = entry
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .filter(|w| *w > 0)
+    {
+        model["contextWindow"] = json!(w);
+    }
+    Some(model)
+}
+
+/// Fetch OpenAI's Codex list, as the Codex CLI does (`<base>/codex/models` with the
+/// account's sign-in), and cache it. An unchanged list (304) keeps the cached one.
+pub fn refresh_codex(
+    dir: &Path,
+    base_url: &str,
+    token: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    let token = token
+        .filter(|t| !t.is_empty())
+        .ok_or("codex_models_need_sign_in")?;
+    let base = base_url.trim_end_matches('/');
+    let cached = read_cache(dir, CODEX);
+    let mut headers = vec![
+        ("authorization", format!("Bearer {token}")),
+        ("originator", "pi".to_string()),
+    ];
+    if let Some(account) = crate::provider::codex_account(token) {
+        headers.push(("chatgpt-account-id", account));
+    }
+    if let Some((_, models, Some(etag))) = &cached
+        && !models.is_empty()
+    {
+        headers.push(("if-none-match", etag.clone()));
+    }
+    let (status, body, etag) = get(
+        &format!("{base}/codex/models?client_version={CODEX_CLIENT_VERSION}"),
+        &headers,
+    )?;
+    if status == 304
+        && let Some((_, models, old)) = cached
+    {
+        write_cache(dir, CODEX, &models, old.as_deref()).map_err(|_| "codex_models_not_saved")?;
+        return Ok(models);
+    }
+    if status != 200 {
+        return Err(format!("codex_models_http_{status}"));
+    }
+    let entries = body
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or("codex_models_invalid")?;
+    let models: Vec<Value> = entries
+        .iter()
+        .filter_map(|e| codex_model(e, base_url))
+        .collect();
+    write_cache(dir, CODEX, &models, etag.as_deref()).map_err(|_| "codex_models_not_saved")?;
+    Ok(models)
+}
+
+/// A provider's fetched list: the cache, fetched first when there is none, refreshed in the
+/// background when it is older than 4 hours.
+fn fetched(
+    dir: &Path,
+    provider: &'static str,
+    base_url: &str,
+    key: Option<&str>,
+    refresh: fn(&Path, &str, Option<&str>) -> Result<Vec<Value>, String>,
+) -> Vec<Value> {
+    match read_cache(dir, provider) {
+        Some((checked, models, _)) => {
+            if now_ms().saturating_sub(checked) > REFRESH.as_millis() as u64 {
+                let (dir, base, key) = (
+                    dir.to_path_buf(),
+                    base_url.to_string(),
+                    key.map(str::to_string),
+                );
+                std::thread::spawn(move || {
+                    let _ = refresh(&dir, &base, key.as_deref());
+                });
+            }
+            models
+        }
+        None => refresh(dir, base_url, key).unwrap_or_default(),
+    }
+}
+
+pub fn codex_models(dir: &Path, base_url: &str, key: Option<&str>) -> Vec<Value> {
+    fetched(dir, CODEX, base_url, key, refresh_codex)
 }
 
 /// Fetch OpenRouter's list now and cache it. With a key, the models that key may use
@@ -190,7 +348,10 @@ pub fn refresh_openrouter(
     let base = base_url.trim_end_matches('/');
     let mut body = Value::Null;
     if let Some(key) = key.filter(|k| !k.is_empty()) {
-        let (status, value) = get(&format!("{base}/models/user"), Some(key))?;
+        let (status, value, _) = get(
+            &format!("{base}/models/user"),
+            &[("authorization", format!("Bearer {key}"))],
+        )?;
         if status == 200 {
             body = value;
         } else if ![401, 403, 404].contains(&status) {
@@ -198,7 +359,7 @@ pub fn refresh_openrouter(
         }
     }
     if body.is_null() {
-        let (status, value) = get(&format!("{base}/models"), None)?;
+        let (status, value, _) = get(&format!("{base}/models"), &[])?;
         if status != 200 {
             return Err(format!("openrouter_models_http_{status}"));
         }
@@ -212,29 +373,12 @@ pub fn refresh_openrouter(
         .iter()
         .filter_map(|e| openrouter_model(e, base_url))
         .collect();
-    write_cache(dir, &models).map_err(|_| "openrouter_models_not_saved")?;
+    write_cache(dir, OPENROUTER, &models, None).map_err(|_| "openrouter_models_not_saved")?;
     Ok(models)
 }
 
-/// OpenRouter's models: the cache, fetched first when there is none, and refreshed in the
-/// background when it is older than 4 hours.
 pub fn openrouter_models(dir: &Path, base_url: &str, key: Option<&str>) -> Vec<Value> {
-    match read_cache(dir) {
-        Some((checked, models)) => {
-            if now_ms().saturating_sub(checked) > REFRESH.as_millis() as u64 {
-                let (dir, base, key) = (
-                    dir.to_path_buf(),
-                    base_url.to_string(),
-                    key.map(str::to_string),
-                );
-                std::thread::spawn(move || {
-                    let _ = refresh_openrouter(&dir, &base, key.as_deref());
-                });
-            }
-            models
-        }
-        None => refresh_openrouter(dir, base_url, key).unwrap_or_default(),
-    }
+    fetched(dir, OPENROUTER, base_url, key, refresh_openrouter)
 }
 
 /// What the core has learned about models from the providers' answers, by `provider/id`.
@@ -300,15 +444,7 @@ fn resolve_listed(models: &Models, dir: &Path, requested: &Value, key: Option<&s
         .and_then(Value::as_str)
         .unwrap_or("");
     let id = requested.get("id").and_then(Value::as_str).unwrap_or("");
-    let base = if provider == OPENROUTER {
-        let base_url = requested
-            .get("baseUrl")
-            .and_then(Value::as_str)
-            .unwrap_or(OPENROUTER_BASE);
-        openrouter_models(dir, base_url, key)
-            .into_iter()
-            .find(|m| m["id"] == id)
-    } else {
+    let file = || {
         models
             .get(id)
             .filter(|m| {
@@ -317,6 +453,18 @@ fn resolve_listed(models: &Models, dir: &Path, requested: &Value, key: Option<&s
                     .is_none_or(|p| p == provider)
             })
             .cloned()
+    };
+    let base_url = requested.get("baseUrl").and_then(Value::as_str);
+    let base = match provider {
+        OPENROUTER => openrouter_models(dir, base_url.unwrap_or(OPENROUTER_BASE), key)
+            .into_iter()
+            .find(|m| m["id"] == id),
+        // OpenAI's own list first; the models file when it cannot be fetched.
+        CODEX => codex_models(dir, base_url.unwrap_or(CODEX_BASE), key)
+            .into_iter()
+            .find(|m| m["id"] == id)
+            .or_else(file),
+        _ => file(),
     };
     let Some(Value::Object(mut merged)) = base else {
         return requested.clone();
@@ -331,11 +479,22 @@ fn resolve_listed(models: &Models, dir: &Path, requested: &Value, key: Option<&s
 
 /// Every model the core knows for a provider (all providers when None).
 pub fn list(models: &Models, dir: &Path, provider: Option<&str>, key: Option<&str>) -> Vec<Value> {
+    let wanted = |p: &str| provider.is_none_or(|w| w == p);
+    let codex = if wanted(CODEX) {
+        codex_models(dir, CODEX_BASE, key)
+    } else {
+        Vec::new()
+    };
     let mut out: Vec<Value> = models
         .all()
-        .filter(|m| provider.is_none_or(|p| m.get("provider").and_then(Value::as_str) == Some(p)))
+        .filter(|m| {
+            let p = m.get("provider").and_then(Value::as_str).unwrap_or("");
+            // The fetched Codex list replaces the file's, when there is one.
+            wanted(p) && !(p == CODEX && !codex.is_empty())
+        })
         .collect();
-    if provider.is_none_or(|p| p == OPENROUTER) {
+    out.extend(codex);
+    if wanted(OPENROUTER) {
         out.extend(openrouter_models(dir, OPENROUTER_BASE, key));
     }
     out
@@ -363,6 +522,30 @@ mod tests {
         );
         let image_only = json!({"id": "x/img", "architecture": {"output_modalities": ["image"]}});
         assert!(openrouter_model(&image_only, OPENROUTER_BASE).is_none());
+    }
+
+    #[test]
+    fn a_codex_entry_becomes_a_model() {
+        let entry = json!({"slug": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol", "context_window": 500000, "visibility": "list",
+            "input_modalities": ["text", "image"], "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"},
+            {"effort": "high"}, {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"}]});
+        let m = codex_model(&entry, CODEX_BASE).unwrap();
+        assert_eq!(
+            m,
+            json!({"id": "gpt-6.1-sol", "name": "GPT-6.1-Sol", "api": "openai-codex-responses", "provider": "openai-codex",
+            "baseUrl": CODEX_BASE, "reasoning": true, "input": ["text", "image"],
+            "thinkingLevelMap": {"off": "none", "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"},
+            "contextWindow": 500000})
+        );
+        // Fitted as pi fits it: minimal goes up to low.
+        let r = |l: Option<&str>| crate::models::reasoning(&m, None, l).effort;
+        assert_eq!(
+            (r(None), r(Some("minimal"))),
+            (Some("none".into()), Some("low".into()))
+        );
+        assert!(
+            codex_model(&json!({"slug": "hidden", "visibility": "hide"}), CODEX_BASE).is_none()
+        );
     }
 
     #[test]

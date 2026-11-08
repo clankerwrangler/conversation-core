@@ -25,8 +25,14 @@ The runner only has to name a model (`provider` and `id`); the core fills in its
   `~/.config/conversation-core/catalog`), refreshed every 4 hours. OpenRouter does not say
   which models cannot switch reasoning off: when it refuses "off", the core sends again
   without the setting and remembers that for the model (`learned.json`).
-- Codex and xAI: the models file, `~/.config/conversation-core/models.json` or
-  `--models <file>`. `models.json` in this repository has the model definitions, in pi's shape.
+- Codex: OpenAI's own list, as the Codex CLI fetches it (`<base>/codex/models` with the
+  account's sign-in, revalidated with its ETag), cached and refreshed the same way. Its
+  reasoning levels become pi's level map. It has no prices, so Codex replies have no cost.
+  OpenAI's list never offers "none"; "off" is sent as "none" and a model that refuses it
+  is learned the same way.
+- xAI, and Codex when OpenAI's list cannot be fetched: the models file,
+  `~/.config/conversation-core/models.json` or `--models <file>`. `models.json` in this
+  repository has the model definitions, in pi's shape.
 
 The `models` op (`{"op": "models", "provider"?}`) lists them. Every request ends with a context
 usage line ("Context: about 91k of 500k tokens (84k measured + ~7k new)"),

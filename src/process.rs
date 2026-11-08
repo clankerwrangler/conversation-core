@@ -859,13 +859,12 @@ impl Core {
                 .and_then(Value::as_u64)
                 .unwrap_or(STREAM_STALL_MS),
         );
-        // The window from the models file, else from the runner's model object (pi's contextWindow).
-        let window = self.models.window(&model_id).or_else(|| {
-            model
-                .get("contextWindow")
-                .and_then(Value::as_u64)
-                .filter(|w| *w > 0)
-        });
+        // The model's window (from the runner or the fetched list), else the models file's.
+        let window = model
+            .get("contextWindow")
+            .and_then(Value::as_u64)
+            .filter(|w| *w > 0)
+            .or_else(|| self.models.window(&model_id));
         let Some(context) = self.budget(context, refs.as_deref(), trusted_from, &model_id, window)
         else {
             return Ok(End::Failed);
