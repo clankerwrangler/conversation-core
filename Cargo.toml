@@ -12,6 +12,8 @@ path = "src/main.rs"
 base64 = "0.22"
 sha2 = "0.10"
 ureq = "3"
+# Codex's WebSocket transport, as the harness uses it.
+tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 # Skill frontmatter, as pi reads it.
 serde_yaml = "0.9"

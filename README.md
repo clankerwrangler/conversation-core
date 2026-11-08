@@ -90,7 +90,14 @@ a file being deleted. Modeled in `specification/ReaperReferences.tla`.
 - `streamStallMs`: give up an attempt after this long without a sign of life
   (default 10 minutes, as in the harness); it is retried like a dropped connection.
 
-Each attempt reports `provider_response` with the status and headers.
+- `transport`: Codex requests go over one WebSocket kept open between requests (as the
+  harness sends them), with plain HTTP when no socket can be opened; `"sse"` keeps them on
+  HTTP. Every request carries the whole context (no `previous_response_id`), so the usage
+  line stays once per request. A socket closes after 5 idle minutes, after 55 minutes, or
+  on any trouble; a rejected or stale socket is replaced once without a retry.
+
+Each attempt reports `provider_response` with the status and headers (101 and
+`"transport": "websocket"` when a socket is opened; none when a kept one is reused).
 
 ## What a runner can do besides turns
 

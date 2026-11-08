@@ -161,12 +161,24 @@ pub enum Failure {
     Fatal(String),
 }
 
+/// How a request travels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Transport {
+    /// One HTTP request per reply, the reply streamed as server-sent events.
+    Sse,
+    /// The harness's default for Codex: one WebSocket kept open between requests, with
+    /// SSE when it cannot connect. Every request carries the whole context (no
+    /// previous_response_id), so the context usage line stays once per request.
+    Auto,
+}
+
 /// A request ready to send from another thread.
 #[derive(Clone)]
 pub struct Prepared {
     url: String,
     headers: Vec<(String, String)>,
     body: String,
+    pub transport: Transport,
 }
 
 impl Prepared {
@@ -285,6 +297,11 @@ pub fn prepare(req: &Request, messages: &[Value]) -> Result<Prepared> {
         url: endpoint(req.target.api, req.base_url),
         headers,
         body: body(req, messages)?.to_string(),
+        transport: if req.target.api == "openai-codex-responses" {
+            Transport::Auto
+        } else {
+            Transport::Sse
+        },
     })
 }
 
@@ -292,10 +309,256 @@ pub fn prepare(req: &Request, messages: &[Value]) -> Result<Prepared> {
 /// exactly one `Done` or `Failed`.
 pub fn spawn(prepared: Prepared, report: impl Fn(Piece) + Send + 'static) {
     std::thread::spawn(move || {
-        if let Err(failure) = run(&prepared, &report) {
+        let result = match prepared.transport {
+            Transport::Sse => run(&prepared, &report),
+            Transport::Auto => websocket::run(&prepared, &report),
+        };
+        if let Err(failure) = result {
             report(Piece::Failed(failure));
         }
     });
+}
+
+/// The WebSocket transport, as the harness's native-provider.mjs runs it: one socket per
+/// session kept open between requests (closed after 5 idle minutes or 55 minutes of age,
+/// or when anything goes wrong), the same headers as HTTP, each request sent as one
+/// `response.create` text frame, and the reply's events arriving as text frames.
+mod websocket {
+    use super::{Failure, Piece, Prepared, handle};
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    use tungstenite::client::IntoClientRequest;
+    use tungstenite::protocol::WebSocketConfig;
+    use tungstenite::stream::MaybeTlsStream;
+    use tungstenite::{Message, WebSocket};
+
+    const IDLE: Duration = Duration::from_secs(300);
+    const MAX_AGE: Duration = Duration::from_secs(3300);
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+    const MAX_FRAME: usize = 16 * 1024 * 1024;
+    /// Codes that mean "this socket cannot take the request": try once more on a new one.
+    const REJECTED: [&str; 2] = [
+        "previous_response_not_found",
+        "websocket_connection_limit_reached",
+    ];
+
+    type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
+
+    struct Open {
+        socket: Socket,
+        identity: String,
+        created: Instant,
+        last_used: Instant,
+    }
+
+    /// The session's socket between requests. A request takes it and puts it back only
+    /// after a complete reply, so a socket is never shared or reused after trouble.
+    static IDLE_SOCKET: Mutex<Option<Open>> = Mutex::new(None);
+
+    /// Same URL and headers (including the token): the same socket may be reused.
+    fn identity(p: &Prepared) -> String {
+        let mut hash = Sha256::new();
+        hash.update(p.url.as_bytes());
+        for (k, v) in &p.headers {
+            hash.update([0]);
+            hash.update(k.as_bytes());
+            hash.update([1]);
+            hash.update(v.as_bytes());
+        }
+        format!("{:x}", hash.finalize())
+    }
+
+    fn connect(p: &Prepared) -> Result<(Socket, Value), String> {
+        let url = p
+            .url
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|_| "websocket_bad_url")?;
+        for (k, v) in &p.headers {
+            let (Ok(name), Ok(value)) = (
+                tungstenite::http::HeaderName::from_bytes(k.as_bytes()),
+                tungstenite::http::HeaderValue::from_str(v),
+            ) else {
+                continue;
+            };
+            request.headers_mut().insert(name, value);
+        }
+        let uri = request.uri();
+        let host = uri.host().ok_or("websocket_bad_url")?.to_string();
+        let port = uri
+            .port_u16()
+            .unwrap_or(if uri.scheme_str() == Some("wss") {
+                443
+            } else {
+                80
+            });
+        let address = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|_| "websocket_connect_failed")?
+            .next()
+            .ok_or("websocket_connect_failed")?;
+        let stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
+            .map_err(|_| "websocket_connect_failed")?;
+        let _ = stream.set_read_timeout(Some(CONNECT_TIMEOUT));
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_FRAME))
+            .max_frame_size(Some(MAX_FRAME));
+        let (socket, response) =
+            tungstenite::client_tls_with_config(request, stream, Some(config), None)
+                .map_err(|_| "websocket_connect_failed")?;
+        if let MaybeTlsStream::Plain(s) = socket.get_ref() {
+            let _ = s.set_read_timeout(None);
+        }
+        if let MaybeTlsStream::Rustls(s) = socket.get_ref() {
+            let _ = s.get_ref().set_read_timeout(None);
+        }
+        let headers: serde_json::Map<String, Value> = response
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|v| (k.as_str().to_string(), Value::String(v.to_string())))
+            })
+            .collect();
+        Ok((
+            socket,
+            json!({"status": response.status().as_u16(), "headers": headers, "transport": "websocket"}),
+        ))
+    }
+
+    /// A kept socket that may be used for this request, or None.
+    fn take_idle(identity: &str) -> Option<Open> {
+        let open = IDLE_SOCKET.lock().ok()?.take()?;
+        let fresh = open.identity == identity
+            && open.last_used.elapsed() < IDLE
+            && open.created.elapsed() < MAX_AGE;
+        if fresh { Some(open) } else { None }
+    }
+
+    enum Outcome {
+        Done,
+        /// Nothing arrived from this socket before it failed or rejected the request.
+        Unused(Failure),
+        Failed(Failure),
+    }
+
+    fn exchange(socket: &mut Socket, frame: &str, report: &impl Fn(Piece)) -> Outcome {
+        if socket.send(Message::text(frame)).is_err() {
+            return Outcome::Unused(Failure::Retryable("websocket_closed".into()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut any = false;
+        loop {
+            let message = match socket.read() {
+                Ok(m) => m,
+                Err(tungstenite::Error::Capacity(_)) => {
+                    return Outcome::Failed(Failure::Fatal("provider_frame_limit".into()));
+                }
+                Err(_) if !any => {
+                    return Outcome::Unused(Failure::Retryable("websocket_closed".into()));
+                }
+                Err(_) => return Outcome::Failed(Failure::Retryable("websocket_closed".into())),
+            };
+            let text = match message {
+                Message::Text(t) => t,
+                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+                Message::Close(_) if !any => {
+                    return Outcome::Unused(Failure::Retryable("websocket_closed".into()));
+                }
+                Message::Close(_) => {
+                    return Outcome::Failed(Failure::Retryable("websocket_closed".into()));
+                }
+                Message::Binary(_) => {
+                    return Outcome::Failed(Failure::Fatal("unsupported_websocket_frame".into()));
+                }
+            };
+            let Ok(event) = serde_json::from_str::<Value>(text.as_str()) else {
+                return Outcome::Failed(Failure::Fatal("invalid_provider_json".into()));
+            };
+            if !any && event.get("type").and_then(Value::as_str) == Some("error") {
+                let code = event
+                    .get("code")
+                    .or_else(|| event.pointer("/error/code"))
+                    .and_then(Value::as_str);
+                if code.is_some_and(|c| REJECTED.contains(&c)) {
+                    return Outcome::Unused(Failure::Retryable(
+                        code.unwrap_or_default().to_string(),
+                    ));
+                }
+            }
+            any = true;
+            match handle(&event, report, &mut seen) {
+                Ok(true) => return Outcome::Done,
+                Ok(false) => {}
+                Err(failure) => return Outcome::Failed(failure),
+            }
+        }
+    }
+
+    pub(super) fn run(p: &Prepared, report: &impl Fn(Piece)) -> Result<(), Failure> {
+        let identity = identity(p);
+        let frame = match p.body.strip_prefix('{') {
+            Some(rest) if rest.trim_start() != "}" => {
+                format!("{{\"type\":\"response.create\",{rest}")
+            }
+            _ => return Err(Failure::Fatal("invalid_stream_payload".into())),
+        };
+        let mut reused = take_idle(&identity);
+        // A kept socket may have gone stale: one fresh try after it, as the harness does
+        // for a rejected request.
+        for _ in 0..2 {
+            let (mut open, was_kept) = match reused.take() {
+                Some(open) => (open, true),
+                None => match connect(p) {
+                    Ok((socket, response)) => {
+                        report(Piece::Response(response));
+                        (
+                            Open {
+                                socket,
+                                identity: identity.clone(),
+                                created: Instant::now(),
+                                last_used: Instant::now(),
+                            },
+                            false,
+                        )
+                    }
+                    // Cannot open a socket: the request goes over plain HTTP instead.
+                    Err(_) => return super::run(p, report),
+                },
+            };
+            match exchange(&mut open.socket, &frame, report) {
+                Outcome::Done => {
+                    open.last_used = Instant::now();
+                    if let Ok(mut slot) = IDLE_SOCKET.lock() {
+                        *slot = Some(open);
+                    }
+                    return Ok(());
+                }
+                Outcome::Unused(failure) => {
+                    let _ = open.socket.close(None);
+                    if !was_kept
+                        && !REJECTED
+                            .iter()
+                            .any(|c| matches!(&failure, Failure::Retryable(r) if r == c))
+                    {
+                        return Err(failure);
+                    }
+                }
+                Outcome::Failed(failure) => {
+                    let _ = open.socket.close(None);
+                    return Err(failure);
+                }
+            }
+        }
+        Err(Failure::Retryable("websocket_closed".into()))
+    }
 }
 
 fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure> {

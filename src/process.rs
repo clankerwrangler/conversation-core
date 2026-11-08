@@ -833,6 +833,10 @@ impl Core {
             return Ok(End::Failed);
         };
         let mut ready = provider::prepare(&req, &context)?;
+        // `"transport": "sse"` keeps a Codex request on plain HTTP.
+        if prepared.get("transport").and_then(Value::as_str) == Some("sse") {
+            ready.transport = provider::Transport::Sse;
+        }
         // pi's before_provider_request / before_provider_headers: the runner may review and
         // change the exact request (body and headers) before it is sent.
         if prepared.get("reviewRequest") == Some(&Value::Bool(true)) {

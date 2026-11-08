@@ -66,9 +66,72 @@ fn read_request(stream: &mut TcpStream) -> Value {
             length = v.trim().parse().unwrap();
         }
     }
+    if length == 0 {
+        // A request without a body (a WebSocket upgrade the server does not accept).
+        return Value::Null;
+    }
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
     serde_json::from_slice(&body).unwrap()
+}
+
+/// A fake Codex WebSocket server: each request frame is answered with the next reply on
+/// the same socket; `Step::Drop` closes the socket, and the next request needs a new one.
+/// Returns the request frames and the Authorization header of each socket.
+type WsSeen = std::thread::JoinHandle<(Vec<Value>, Vec<String>)>;
+
+// tungstenite's handshake callback returns its large error type; only the test sees it.
+#[allow(clippy::result_large_err)]
+fn ws_server(replies: Vec<Vec<Step>>) -> (String, WsSeen) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let mut frames = Vec::new();
+        let mut sockets = Vec::new();
+        let mut replies = replies.into_iter();
+        let mut pending = replies.next();
+        while pending.is_some() {
+            let (stream, _) = listener.accept().unwrap();
+            let auth = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let seen = auth.clone();
+            let mut socket = tungstenite::accept_hdr(
+                stream,
+                move |req: &tungstenite::handshake::server::Request, res| {
+                    *seen.lock().unwrap() = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    Ok(res)
+                },
+            )
+            .unwrap();
+            sockets.push(auth.lock().unwrap().clone());
+            'socket: while let Some(reply) = pending.take() {
+                let Ok(tungstenite::Message::Text(frame)) = socket.read() else {
+                    break;
+                };
+                frames.push(serde_json::from_str(frame.as_str()).unwrap());
+                pending = replies.next();
+                for step in reply {
+                    match step {
+                        Step::Event(e) => socket
+                            .send(tungstenite::Message::text(e.to_string()))
+                            .unwrap(),
+                        Step::Pause(ms) => std::thread::sleep(Duration::from_millis(ms)),
+                        Step::Drop => {
+                            let _ = socket.close(None);
+                            let _ = socket.flush();
+                            break 'socket;
+                        }
+                    }
+                }
+            }
+        }
+        (frames, sockets)
+    });
+    (base, handle)
 }
 
 fn item_done(item: Value) -> Step {
@@ -919,7 +982,7 @@ fn the_core_builds_the_changing_part_of_the_system_prompt() {
     ];
     let mut core = Core::start_in(&d, &base, &flags, ipython, &cwd);
     core.extra = json!({"instructions": "You are an assistant.", "sections": {"scratch": "Use /tmp."},
-        "model": {"api": "openai-codex-responses"}});
+        "model": {"api": "openai-codex-responses"}, "transport": "sse"});
     core.op(json!({"op": "send", "input": {"text": "one"}}));
     core.until("turn_end");
     // A runner that wants only its own text turns the core's part off; outside Codex
@@ -981,7 +1044,7 @@ fn a_reply_reports_its_usage_cost_and_how_full_the_context_is() {
         &["--models", models.to_str().unwrap()],
         json!([]),
     );
-    core.extra = json!({"serviceTier": "priority", "model": {"api": "openai-codex-responses"}});
+    core.extra = json!({"serviceTier": "priority", "model": {"api": "openai-codex-responses"}, "transport": "sse"});
     core.op(json!({"op": "send", "input": {"text": "hi"}}));
     let end = core.until("message_end");
     let u = &end["usage"];
@@ -1073,6 +1136,82 @@ fn a_provider_error_is_reported_and_saved_as_fixed_codes() {
             .iter()
             .all(|i| i["role"] != "assistant")
     );
+    core.stop();
+}
+
+fn codex(core: &mut Core) {
+    core.extra = json!({"model": {"api": "openai-codex-responses"}});
+}
+
+#[test]
+fn codex_requests_share_one_websocket_and_each_carries_the_whole_context() {
+    let (base, server) = ws_server(vec![vec![text("a"), done()], vec![text("b"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    codex(&mut core);
+    core.op(json!({"op": "send", "input": {"text": "one"}}));
+    let first = core.until("turn_end");
+    assert_eq!(first["stopReason"], "stop", "{first}");
+    core.op(json!({"op": "send", "input": {"text": "two"}}));
+    core.until("turn_end");
+    let (frames, sockets) = server.join().unwrap();
+    assert_eq!(
+        sockets,
+        ["Bearer t"],
+        "one socket for both requests, with the usual headers"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|f| f["type"] == "response.create" && f.get("previous_response_id").is_none())
+    );
+    let second = frames[1]["input"].to_string();
+    assert!(
+        second.contains("one") && second.contains("two"),
+        "the whole context is sent again"
+    );
+    assert_eq!(
+        roles(&core.context()),
+        ["user", "assistant", "user", "assistant"]
+    );
+    core.stop();
+}
+
+#[test]
+fn a_rejected_or_closed_websocket_is_replaced_by_a_new_one() {
+    let rejected = json!({"type": "error", "code": "websocket_connection_limit_reached"});
+    let (base, server) = ws_server(vec![
+        vec![Step::Event(rejected), Step::Drop],
+        vec![text("a"), done(), Step::Drop],
+        vec![text("b"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    codex(&mut core);
+    core.op(json!({"op": "send", "input": {"text": "one"}}));
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+    // The server closed the kept socket after the first reply: the next request finds it
+    // closed and opens a new one, without a retry or an error.
+    core.op(json!({"op": "send", "input": {"text": "two"}}));
+    let end = core.until("turn_end");
+    assert_eq!(end["stopReason"], "stop", "{end}");
+    let (frames, sockets) = server.join().unwrap();
+    assert_eq!((frames.len(), sockets.len()), (3, 3));
+    core.stop();
+}
+
+#[test]
+fn without_a_websocket_a_codex_request_goes_over_http() {
+    // The first connection is the refused upgrade; the request then comes over HTTP.
+    let (base, server) = server(vec![vec![], vec![text("a"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    codex(&mut core);
+    core.op(json!({"op": "send", "input": {"text": "one"}}));
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+    let bodies = server.join().unwrap();
+    assert_eq!(bodies[0], Value::Null);
+    assert_eq!(bodies[1]["stream"], true);
     core.stop();
 }
 
