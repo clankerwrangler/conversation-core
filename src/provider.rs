@@ -14,7 +14,9 @@ pub struct Request<'a> {
     pub target: Target<'a>,
     pub base_url: &'a str,
     pub instructions: &'a str,
-    pub reasoning: Option<&'a str>,
+    pub reasoning: &'a crate::models::Reasoning,
+    /// `service_tier`, e.g. "priority" for Fast mode.
+    pub service_tier: Option<&'a str>,
     pub tools: &'a [Value],
     pub session_id: &'a str,
     pub token: &'a str,
@@ -33,6 +35,8 @@ pub enum Piece {
         incomplete: bool,
     },
     Failed(Failure),
+    /// The response's status and headers, as soon as they arrive (pi's after_provider_response).
+    Response(Value),
 }
 
 #[derive(Debug)]
@@ -43,10 +47,49 @@ pub enum Failure {
 }
 
 /// A request ready to send from another thread.
+#[derive(Clone)]
 pub struct Prepared {
     url: String,
-    headers: Vec<(&'static str, String)>,
+    headers: Vec<(String, String)>,
     body: String,
+}
+
+impl Prepared {
+    /// The request as it will be sent, for the runner to review (pi's before_provider_request
+    /// and before_provider_headers).
+    pub fn view(&self) -> Value {
+        let headers: serde_json::Map<String, Value> = self
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect();
+        let body: Value = serde_json::from_str(&self.body).unwrap_or(Value::Null);
+        json!({"url": self.url, "headers": headers, "body": body})
+    }
+
+    /// Replace the body and/or headers with the runner's reviewed versions.
+    pub fn replace(&mut self, body: Option<&Value>, headers: Option<&Value>) -> Result<()> {
+        if let Some(body) = body {
+            if body.get("stream") != Some(&Value::Bool(true))
+                || !body.get("input").is_some_and(Value::is_array)
+            {
+                return Err(Error::Format(
+                    "a reviewed request must keep stream: true and an input array".into(),
+                ));
+            }
+            self.body = body.to_string();
+        }
+        if let Some(headers) = headers {
+            let Value::Object(map) = headers else {
+                return Err(Error::Format("reviewed headers must be an object".into()));
+            };
+            self.headers = map
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                .collect();
+        }
+        Ok(())
+    }
 }
 
 fn endpoint(api: &str, base: &str) -> String {
@@ -83,19 +126,24 @@ pub fn body(req: &Request, messages: &[Value]) -> Result<Value> {
         body["tool_choice"] = json!("auto");
     }
     body["prompt_cache_key"] = json!(req.session_id);
-    if let Some(effort) = req.reasoning {
+    if let Some(tier) = req.service_tier {
+        body["service_tier"] = json!(tier);
+    }
+    if let Some(effort) = &req.reasoning.effort {
         body["reasoning"] = if effort == "none" {
             json!({"effort": "none"})
         } else {
             json!({"effort": effort, "summary": "auto"})
         };
+    }
+    if req.reasoning.include {
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
     Ok(body)
 }
 
 pub fn prepare(req: &Request, messages: &[Value]) -> Result<Prepared> {
-    let mut headers = vec![
+    let mut headers: Vec<(String, String)> = [
         ("Authorization", format!("Bearer {}", req.token)),
         ("OpenAI-Beta", "responses=experimental".to_string()),
         ("accept", "text/event-stream".to_string()),
@@ -103,9 +151,12 @@ pub fn prepare(req: &Request, messages: &[Value]) -> Result<Prepared> {
         ("originator", "pi".to_string()),
         ("session-id", req.session_id.to_string()),
         ("x-client-request-id", req.session_id.to_string()),
-    ];
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
     if let Some(account) = req.account_id {
-        headers.push(("chatgpt-account-id", account.to_string()));
+        headers.push(("chatgpt-account-id".to_string(), account.to_string()));
     }
     Ok(Prepared {
         url: endpoint(req.target.api, req.base_url),
@@ -131,12 +182,24 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
         .into();
     let mut call = agent.post(&p.url);
     for (name, value) in &p.headers {
-        call = call.header(*name, value);
+        call = call.header(name.as_str(), value);
     }
     let mut response = call
         .send(p.body.as_str())
         .map_err(|e| Failure::Retryable(format!("provider_request_failed: {e}")))?;
     let status = response.status().as_u16();
+    let headers: serde_json::Map<String, Value> = response
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_string(), Value::String(v.to_string())))
+        })
+        .collect();
+    report(Piece::Response(
+        json!({"status": status, "headers": headers}),
+    ));
     let reader = response.body_mut().as_reader();
     if status != 200 {
         let mut text = String::new();
@@ -152,6 +215,7 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
         });
     }
     let mut data = String::new();
+    let mut seen = std::collections::HashSet::new();
     for line in BufReader::new(reader).lines() {
         let line = line.map_err(|e| Failure::Retryable(format!("provider_stream_read: {e}")))?;
         if let Some(rest) = line.strip_prefix("data:") {
@@ -163,15 +227,20 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
         }
         let event: Value = serde_json::from_str(&std::mem::take(&mut data))
             .map_err(|_| Failure::Fatal("invalid_provider_json".into()))?;
-        if handle(&event, report)? {
+        if handle(&event, report, &mut seen)? {
             return Ok(());
         }
     }
     Err(Failure::Retryable("provider_stream_ended_early".into()))
 }
 
-/// Report one stream event; true once the response is complete.
-fn handle(event: &Value, report: &impl Fn(Piece)) -> std::result::Result<bool, Failure> {
+/// Report one stream event; true once the response is complete. `seen` holds the ids of
+/// items already reported, so items listed only in the final message are reported too.
+fn handle(
+    event: &Value,
+    report: &impl Fn(Piece),
+    seen: &mut std::collections::HashSet<String>,
+) -> std::result::Result<bool, Failure> {
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     let text = |key: &str| {
         event
@@ -184,11 +253,40 @@ fn handle(event: &Value, report: &impl Fn(Piece)) -> std::result::Result<bool, F
         "response.output_text.delta" => report(Piece::Text(text("delta"))),
         "response.reasoning_summary_text.delta" => report(Piece::Reasoning(text("delta"))),
         "response.output_item.done" => {
-            if let Some(block) = event.get("item").and_then(block_from_item) {
-                report(Piece::Block(block));
+            if let Some(item) = event.get("item") {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    seen.insert(id.to_string());
+                }
+                if let Some(block) = block_from_item(item) {
+                    report(Piece::Block(block));
+                }
             }
         }
         "response.completed" | "response.done" | "response.incomplete" => {
+            // An item the stream never finished separately is taken from the final list,
+            // in order, as the harness's native provider does.
+            for item in event
+                .pointer("/response/output")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+                if id.is_empty()
+                    || seen.contains(id)
+                    || !["function_call", "reasoning", "message"].contains(&kind)
+                {
+                    continue;
+                }
+                if item.get("status").is_some_and(|s| s != "completed") {
+                    return Err(Failure::Fatal("incomplete_terminal_item".into()));
+                }
+                seen.insert(id.to_string());
+                if let Some(block) = block_from_item(item) {
+                    report(Piece::Block(block));
+                }
+            }
             report(Piece::Done {
                 usage: usage_from(event.pointer("/response/usage")),
                 incomplete: kind == "response.incomplete",

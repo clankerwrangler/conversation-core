@@ -518,10 +518,11 @@ mod tests {
 
     #[test]
     fn output_exit_codes_timeouts() {
-        assert_eq!(
-            run_cmd(json!({"command": "echo hi; echo err >&2"})),
-            ("hi\nerr\n".into(), false)
-        );
+        // stdout and stderr are two pipes: both are kept, in arrival order (as in pi).
+        let (both, failed) = run_cmd(json!({"command": "echo hi; echo err >&2"}));
+        let mut lines: Vec<&str> = both.lines().collect();
+        lines.sort_unstable();
+        assert_eq!((lines, failed), (vec!["err", "hi"], false));
         assert_eq!(
             run_cmd(json!({"command": "true"})),
             ("(no output)".into(), false)

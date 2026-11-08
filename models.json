@@ -1,15 +1,15 @@
 {
   "models": {
-    "gpt-6.1-sol": { "contextWindow": 500000 },
-    "gpt-6.1-terra": { "contextWindow": 500000 },
-    "gpt-6-sol": { "contextWindow": 272000 },
-    "gpt-6-astra": { "contextWindow": 272000 },
-    "gpt-6-luna": { "contextWindow": 272000 },
-    "gpt-5.6-sol": { "contextWindow": 272000 },
-    "gpt-5.6-terra": { "contextWindow": 272000 },
-    "gpt-5.6-luna": { "contextWindow": 272000 },
-    "grok-4.6": { "contextWindow": 500000 },
-    "grok-4.5": { "contextWindow": 500000 },
-    "grok-4.3": { "contextWindow": 1000000 }
+    "gpt-6.1-sol": { "contextWindow": 500000, "reasoning": true, "thinkingLevelMap": { "off": null, "minimal": "low", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max" } },
+    "gpt-6.1-terra": { "contextWindow": 500000, "reasoning": true, "thinkingLevelMap": { "off": "none", "minimal": "low", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max" } },
+    "gpt-6-sol": { "contextWindow": 272000, "reasoning": true, "thinkingLevelMap": { "off": "none", "minimal": "low", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max" } },
+    "gpt-6-astra": { "contextWindow": 272000, "reasoning": true, "thinkingLevelMap": { "off": null, "minimal": "low", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max" } },
+    "gpt-6-luna": { "contextWindow": 272000, "reasoning": true, "thinkingLevelMap": { "off": "none", "minimal": "low", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max" } },
+    "gpt-5.6-sol": { "contextWindow": 272000, "reasoning": true, "thinkingLevelMap": { "xhigh": "xhigh", "max": "max", "minimal": "low" } },
+    "gpt-5.6-terra": { "contextWindow": 272000, "reasoning": true, "thinkingLevelMap": { "xhigh": "xhigh", "max": "max", "minimal": "low" } },
+    "gpt-5.6-luna": { "contextWindow": 272000, "reasoning": true, "thinkingLevelMap": { "xhigh": "xhigh", "max": "max", "minimal": "low" } },
+    "grok-4.6": { "contextWindow": 500000, "reasoning": true, "thinkingLevelMap": { "off": null, "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": null } },
+    "grok-4.5": { "contextWindow": 500000, "reasoning": true, "thinkingLevelMap": { "off": null, "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": null, "max": null } },
+    "grok-4.3": { "contextWindow": 1000000, "reasoning": true, "thinkingLevelMap": { "off": "none", "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": null, "max": null } }
   }
 }

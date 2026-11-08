@@ -33,6 +33,20 @@ finished deleting, and must only delete files not listed. The core takes the
 same lock only while accepting a new context, so a new reference never names
 a file being deleted. Modeled in `specification/ReaperReferences.tla`.
 
+## Request options in `prepared`
+
+- `reasoning`: the session's level (`off` .. `max`). It is fitted to the model as pi does
+  (`clampThinkingLevel`, `thinkingLevelMap`), using `reasoning` and `thinkingLevelMap` from
+  the model object or the models file.
+- `serviceTier`: sent as `service_tier`, e.g. `"priority"` for Fast mode.
+- `reviewRequest: true`: before sending, the core emits `review_request` with the exact
+  `{url, headers, body}`; answer `{"op":"review_request","id",...}` with a changed `body`
+  and/or `headers`, or neither to keep them (pi's before_provider_request/headers).
+- `streamStallMs`: give up an attempt after this long without a sign of life
+  (default 10 minutes, as in the harness); it is retried like a dropped connection.
+
+Each attempt reports `provider_response` with the status and headers.
+
 ## What a runner can do besides turns
 
 The same things pi offered, as ops on `core run` (each may carry an `id`, echoed in its event):

@@ -24,22 +24,29 @@ fn server(replies: Vec<Vec<Step>>) -> (String, std::thread::JoinHandle<Vec<Value
     let base = format!("http://{}", listener.local_addr().unwrap());
     let handle = std::thread::spawn(move || {
         let mut bodies = Vec::new();
+        let mut writers = Vec::new();
         for reply in replies {
             let (mut stream, _) = listener.accept().unwrap();
             bodies.push(read_request(&mut stream));
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n")
-                .unwrap();
-            for step in reply {
-                match step {
-                    Step::Event(e) => {
-                        let _ = stream.write_all(format!("data: {e}\n\n").as_bytes());
-                        let _ = stream.flush();
+            // Each reply streams on its own thread, so a stuck reply does not hold the next.
+            writers.push(std::thread::spawn(move || {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                );
+                for step in reply {
+                    match step {
+                        Step::Event(e) => {
+                            let _ = stream.write_all(format!("data: {e}\n\n").as_bytes());
+                            let _ = stream.flush();
+                        }
+                        Step::Pause(ms) => std::thread::sleep(Duration::from_millis(ms)),
+                        Step::Drop => break,
                     }
-                    Step::Pause(ms) => std::thread::sleep(Duration::from_millis(ms)),
-                    Step::Drop => break,
                 }
-            }
+            }));
+        }
+        for w in writers {
+            let _ = w.join();
         }
         bodies
     });
@@ -106,6 +113,10 @@ struct Core {
     dir: PathBuf,
     /// Runner tools sent with `prepared`.
     tools: Value,
+    /// More fields for `prepared` (and the model object under "model").
+    extra: Value,
+    /// Return `provider_response` events instead of skipping them.
+    show_responses: bool,
 }
 
 impl Core {
@@ -136,6 +147,8 @@ impl Core {
             base: base.to_string(),
             dir: dir.to_path_buf(),
             tools,
+            extra: json!({}),
+            show_responses: false,
         }
     }
 
@@ -155,13 +168,29 @@ impl Core {
             }
             match ev["ev"].as_str() {
                 Some("prepare_request") => {
-                    let model = json!({"api": "openai-responses", "provider": "test", "id": "m", "baseUrl": self.base});
-                    self.op(json!({"op": "prepared", "id": ev["id"], "model": model, "tools": self.tools}));
+                    let mut model = json!({"api": "openai-responses", "provider": "test", "id": "m", "baseUrl": self.base});
+                    let mut prepared =
+                        json!({"op": "prepared", "id": ev["id"], "tools": self.tools});
+                    for (k, v) in self.extra.as_object().unwrap() {
+                        if k == "model" {
+                            for (mk, mv) in v.as_object().unwrap() {
+                                model[mk] = mv.clone();
+                            }
+                        } else {
+                            prepared[k] = v.clone();
+                        }
+                    }
+                    prepared["model"] = model;
+                    self.op(prepared);
                 }
                 Some("need_credentials") => {
                     self.op(json!({"op": "credentials", "id": ev["id"], "token": "t"}))
                 }
-                Some("text_delta") | Some("reasoning_delta") | Some("window_unknown") => {}
+                Some("provider_response") if self.show_responses => return ev,
+                Some("text_delta")
+                | Some("reasoning_delta")
+                | Some("window_unknown")
+                | Some("provider_response") => {}
                 _ => return ev,
             }
         }
@@ -767,6 +796,103 @@ fn a_one_off_completion_is_answered_and_never_saved() {
     assert!(core.context().is_empty(), "nothing was saved");
     let body = &server.join().unwrap()[0];
     assert_eq!(body["tools"], json!([]));
+    core.stop();
+}
+
+#[test]
+fn a_silent_reply_is_given_up_and_retried() {
+    let (base, server) = server(vec![
+        vec![text("partial"), Step::Pause(8000), done()],
+        vec![text("second try"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.extra = json!({"streamStallMs": 2000});
+    core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    let retry = core.until("retry");
+    assert!(
+        retry["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("provider_stream_stalled"),
+        "{retry}"
+    );
+    core.until("turn_end");
+    let ctx = core.context();
+    assert_eq!(ctx[1]["content"][0]["text"], "second try");
+    assert_eq!(server.join().unwrap().len(), 2);
+    core.stop();
+}
+
+#[test]
+fn the_runner_can_review_the_exact_request() {
+    let (base, server) = server(vec![vec![text("ok"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.extra = json!({"reviewRequest": true});
+    core.show_responses = true;
+    core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    let review = core.until("review_request");
+    let mut body = review["request"]["body"].clone();
+    assert_eq!(body["stream"], true);
+    assert!(
+        review["request"]["headers"]["Authorization"]
+            .as_str()
+            .unwrap()
+            .starts_with("Bearer ")
+    );
+    body["metadata"] = json!({"reviewed": "yes"});
+    core.op(json!({"op": "review_request", "id": review["id"], "body": body}));
+    let response = core.until("provider_response");
+    assert_eq!(response["status"], 200);
+    core.until("turn_end");
+    assert_eq!(server.join().unwrap()[0]["metadata"]["reviewed"], "yes");
+    core.stop();
+}
+
+#[test]
+fn reasoning_levels_and_fast_mode_reach_the_request_as_pi_sends_them() {
+    let (base, server) = server(vec![vec![text("a"), done()], vec![text("b"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    let map = json!({"off": null, "minimal": "low", "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"});
+    core.extra =
+        json!({"model": {"reasoning": true, "thinkingLevelMap": map}, "serviceTier": "priority"});
+    core.op(json!({"op": "send", "input": {"text": "one"}}));
+    core.until("turn_end");
+    core.extra["reasoning"] = json!("minimal");
+    core.op(json!({"op": "send", "input": {"text": "two"}}));
+    core.until("turn_end");
+    let bodies = server.join().unwrap();
+    assert!(
+        bodies[0].get("reasoning").is_none(),
+        "off is not offered by this model, so nothing is sent"
+    );
+    assert_eq!(bodies[0]["service_tier"], "priority");
+    assert_eq!(
+        bodies[1]["reasoning"]["effort"], "low",
+        "minimal maps to low"
+    );
+    core.stop();
+}
+
+#[test]
+fn an_item_listed_only_in_the_final_message_is_not_lost() {
+    let late = json!({"type": "function_call", "id": "fc_c1", "call_id": "c1", "name": "add", "arguments": "{\"a\":1}", "status": "completed"});
+    let (base, server) = server(vec![
+        vec![Step::Event(
+            json!({"type": "response.completed", "response": {"output": [late], "usage": {"input_tokens": 5, "output_tokens": 1}}}),
+        )],
+        vec![text("done"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    let call = core.until("tool_call");
+    assert_eq!(call["arguments"], json!({"a": 1}));
+    core.result("c1|fc_c1", "1");
+    core.until("turn_end");
+    assert_eq!(server.join().unwrap().len(), 2);
     core.stop();
 }
 

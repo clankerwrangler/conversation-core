@@ -30,8 +30,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::time::{Duration, Instant};
+
+/// pi's harness gives up on a reply after this long without a sign of life
+/// (`prepared.streamStallMs` changes it).
+const STREAM_STALL_MS: u64 = 10 * 60_000;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -97,6 +101,8 @@ struct Core {
     injected: VecDeque<Value>,
     /// One-off completions waiting for their credentials, by id.
     completions: HashMap<String, Value>,
+    /// How long a reply may be silent before the attempt fails.
+    stall: Duration,
 }
 
 pub fn run(dir: &Path, disabled: Vec<String>, models: Models) -> Result<()> {
@@ -156,6 +162,7 @@ pub fn run(dir: &Path, disabled: Vec<String>, models: Models) -> Result<()> {
         warned: HashSet::new(),
         injected: VecDeque::new(),
         completions: HashMap::new(),
+        stall: Duration::from_millis(STREAM_STALL_MS),
     };
     while let Some(op) = core.next_idle_op() {
         if let Err(err) = core.idle(&op) {
@@ -212,18 +219,34 @@ impl Core {
     /// and returned (as saved) so the caller re-checks what it waits for; after stdin closes,
     /// running built-ins are still waited for.
     fn recv(&mut self) -> Result<Msg> {
+        Ok(self.recv_until(None)?.unwrap_or(Msg::Closed))
+    }
+
+    /// `recv`, giving up (None) at `deadline`.
+    fn recv_until(&mut self, deadline: Option<Instant>) -> Result<Option<Msg>> {
         loop {
             if self.closed && self.running.is_empty() {
-                return Ok(Msg::Closed);
+                return Ok(Some(Msg::Closed));
             }
-            match self.rx.recv() {
-                Ok(Msg::Builtin(id, result)) => {
+            let got = match deadline {
+                None => self.rx.recv().ok(),
+                Some(d) => match self
+                    .rx
+                    .recv_timeout(d.saturating_duration_since(Instant::now()))
+                {
+                    Ok(msg) => Some(msg),
+                    Err(RecvTimeoutError::Timeout) => return Ok(None),
+                    Err(RecvTimeoutError::Disconnected) => None,
+                },
+            };
+            match got {
+                Some(Msg::Builtin(id, result)) => {
                     self.running.remove(&id);
                     self.record(&id, &result, true)?;
-                    return Ok(Msg::Builtin(id, Value::Null));
+                    return Ok(Some(Msg::Builtin(id, Value::Null)));
                 }
-                Ok(Msg::Closed) | Err(_) => self.closed = true,
-                Ok(msg) => return Ok(msg),
+                Some(Msg::Closed) | None => self.closed = true,
+                Some(msg) => return Ok(Some(msg)),
             }
         }
     }
@@ -298,7 +321,11 @@ impl Core {
                     .completions
                     .remove(text("id").unwrap_or(""))
                     .unwrap_or(Value::Null);
-                start_completion(request, op.clone(), self.session_id.clone());
+                let model = request.get("model").cloned().unwrap_or(Value::Null);
+                let model_id = model.get("id").and_then(Value::as_str).unwrap_or("");
+                let level = request.get("reasoning").and_then(Value::as_str);
+                let reasoning = crate::models::reasoning(&model, self.models.get(model_id), level);
+                start_completion(request, op.clone(), self.session_id.clone(), reasoning);
             }
             _ => return Ok(false),
         }
@@ -716,6 +743,9 @@ impl Core {
             provider: &provider_name,
             model: &model_id,
         };
+        // The level as the model accepts it (pi's clampThinkingLevel and thinkingLevelMap).
+        let reasoning_setting =
+            crate::models::reasoning(&model, self.models.get(&model_id), reasoning);
         let req = Request {
             target: Target {
                 api: &api,
@@ -727,21 +757,38 @@ impl Core {
                 .get("instructions")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
-            reasoning,
+            reasoning: &reasoning_setting,
+            service_tier: prepared.get("serviceTier").and_then(Value::as_str),
             tools: &request_tools,
             session_id: &session_id,
             token,
             account_id: credentials.get("accountId").and_then(Value::as_str),
         };
+        self.stall = Duration::from_millis(
+            prepared
+                .get("streamStallMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(STREAM_STALL_MS),
+        );
         let Some(context) = self.budget(context, refs.as_deref(), trusted_from, &model_id) else {
             return Ok(End::Failed);
         };
+        let mut ready = provider::prepare(&req, &context)?;
+        // pi's before_provider_request / before_provider_headers: the runner may review and
+        // change the exact request (body and headers) before it is sent.
+        if prepared.get("reviewRequest") == Some(&Value::Bool(true)) {
+            emit(json!({"ev": "review_request", "id": id, "request": ready.view()}));
+            let Some(reviewed) = self.answer("review_request", &id)? else {
+                self.abort(None)?;
+                return Ok(End::Aborted);
+            };
+            ready.replace(reviewed.get("body"), reviewed.get("headers"))?;
+        }
         for attempt in 1..=MAX_ATTEMPTS {
-            let ready = provider::prepare(&req, &context)?;
             self.attempts += 1;
             let tag = self.attempts;
             let tx = self.tx.clone();
-            provider::spawn(ready, move |piece| {
+            provider::spawn(ready.clone(), move |piece| {
                 let _ = tx.send(Msg::Piece(tag, piece));
             });
             match self.stream(tag, &target)? {
@@ -765,20 +812,36 @@ impl Core {
         let mut unsaved: Vec<Value> = Vec::new();
         let mut open: Option<u64> = None;
         let mut has_calls = false;
+        // The provider's last sign of life: silence longer than `stall` fails the attempt.
+        let mut heard = Instant::now();
         loop {
-            let piece = match self.recv()? {
-                Msg::Piece(t, piece) if t == tag => piece,
-                Msg::Piece(..) | Msg::Builtin(..) => continue,
-                Msg::Op(op) => {
+            let piece = match self.recv_until(Some(heard + self.stall))? {
+                None => Piece::Failed(Failure::Retryable(format!(
+                    "provider_stream_stalled: nothing for {}s",
+                    self.stall.as_secs()
+                ))),
+                Some(Msg::Piece(t, piece)) if t == tag => {
+                    heard = Instant::now();
+                    piece
+                }
+                Some(Msg::Piece(..) | Msg::Builtin(..)) => continue,
+                Some(Msg::Op(op)) => {
                     if self.during_turn(op)? {
                         self.abort(open.map(|r| (r, unsaved.as_slice())))?;
                         return Ok(Streamed::Ended(End::Aborted));
                     }
                     continue;
                 }
-                Msg::Closed => return Err(Error::Format("stdin closed mid-reply".into())),
+                Some(Msg::Closed) => return Err(Error::Format("stdin closed mid-reply".into())),
             };
             match piece {
+                Piece::Response(response) => {
+                    let mut ev = json!({"ev": "provider_response"});
+                    if let (Value::Object(e), Value::Object(r)) = (&mut ev, response) {
+                        e.extend(r);
+                    }
+                    emit(ev);
+                }
                 Piece::Text(delta) => emit(json!({"ev": "text_delta", "delta": delta})),
                 Piece::Reasoning(delta) => emit(json!({"ev": "reasoning_delta", "delta": delta})),
                 Piece::Block(block) => {
@@ -903,7 +966,12 @@ fn follow_up(op: &Value) -> bool {
 
 /// pi's `completeSimple`: one request outside the conversation (titles), never saved. Runs on
 /// its own thread and ends with one `completed` event carrying the reply or an error.
-fn start_completion(request: Value, credentials: Value, session_id: String) {
+fn start_completion(
+    request: Value,
+    credentials: Value,
+    session_id: String,
+    reasoning: crate::models::Reasoning,
+) {
     std::thread::spawn(move || {
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let field = |key: &str| {
@@ -944,7 +1012,8 @@ fn start_completion(request: Value, credentials: Value, session_id: String) {
                 .get("instructions")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
-            reasoning: request.get("reasoning").and_then(Value::as_str),
+            reasoning: &reasoning,
+            service_tier: None,
             tools: &[],
             session_id: &session_id,
             token,
@@ -977,7 +1046,7 @@ fn start_completion(request: Value, credentials: Value, session_id: String) {
                     emit(json!({"ev": "completed", "id": id, "error": e}));
                     return;
                 }
-                Piece::Text(_) | Piece::Reasoning(_) => {}
+                Piece::Text(_) | Piece::Reasoning(_) | Piece::Response(_) => {}
             }
         }
         emit(json!({"ev": "completed", "id": id, "error": "the stream ended without a reply"}));
