@@ -143,9 +143,13 @@ impl Session {
         message: &Value,
         source: &str,
         display: bool,
+        text: bool,
         details: Option<&Value>,
     ) -> Result<u64> {
         let mut extra = serde_json::json!({"source": source, "display": display});
+        if text {
+            extra["text"] = Value::Bool(true);
+        }
         if let Some(d) = details {
             extra["details"] = d.clone();
         }
@@ -220,6 +224,12 @@ impl Session {
             }
         }
         Ok(out)
+    }
+
+    /// History as handed out (see entries.rs): complete entries for records `from..=to`.
+    pub fn entries(&self, from: u64, to: u64) -> Result<Vec<Value>> {
+        let records = self.history(from, u64::MAX, true)?;
+        Ok(crate::entries::entries(&records, to))
     }
 
     /// Replies opened but never closed (a crash mid-reply), oldest first.

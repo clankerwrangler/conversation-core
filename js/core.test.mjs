@@ -68,8 +68,9 @@ test("a turn streams text, settles, and is saved", async (t) => {
   assert.equal(core.busy, false);
   assert.equal(streamed, "hello");
   assert.equal(ends[0].stopReason, "stop");
-  const { records } = await core.history({});
-  assert.deepEqual(records.filter((r) => r.k === "user" || r.k === "assistant").map((r) => r.k), ["user", "assistant"]);
+  const entries = await core.history({});
+  assert.deepEqual(entries.map((e) => e.message?.role), ["user", "assistant"]);
+  assert.equal(entries[1].message.content.find((b) => b.type === "text").text, "hello");
   await core.close(); p.close();
 });
 

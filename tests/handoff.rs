@@ -759,17 +759,22 @@ fn injected_messages_and_entries_like_pi_custom_messages() {
         "the note reached the next request"
     );
     // History shows the bookkeeping entry and the injected message's source.
-    core.op(json!({"op": "history", "id": "h1", "from": 1, "to": 4, "resolve": true}));
+    core.op(json!({"op": "history", "id": "h1", "from": 1, "to": 4}));
     let h = core.until("history");
-    let kinds: Vec<&str> = h["records"]
+    let kinds: Vec<&str> = h["entries"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| r["k"].as_str().unwrap())
+        .map(|r| r["type"].as_str().unwrap())
         .collect();
-    assert_eq!(kinds, ["chunk", "user", "app", "user"]);
-    assert_eq!(h["records"][1]["source"], "family");
-    assert_eq!(h["records"][2]["data"], json!({"x": 1}));
+    assert_eq!(kinds, ["custom_message", "custom", "message"]);
+    assert_eq!(h["entries"][0]["customType"], "family");
+    assert_eq!(
+        h["entries"][0]["content"], "hello from a child",
+        "text given as text comes back as text"
+    );
+    assert_eq!(h["entries"][0]["id"], "2");
+    assert_eq!(h["entries"][1]["data"], json!({"x": 1}));
     core.stop();
 }
 
@@ -860,8 +865,8 @@ fn set_model_is_recorded_and_offered_to_the_runner() {
         .output()
         .unwrap();
     let records: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(records[1]["type"], "model_change");
-    assert_eq!(records[2]["thinkingLevel"], "high");
+    assert_eq!(records[0]["type"], "model_change");
+    assert_eq!(records[1]["thinkingLevel"], "high");
     core.stop();
 }
 
@@ -1132,7 +1137,7 @@ fn a_provider_error_is_reported_and_saved_as_fixed_codes() {
         ["user", "assistant", "user", "assistant"]
     );
     core.op(json!({"op": "history", "id": "h", "from": first["n"], "to": first["n"]}));
-    let saved = &core.until("history")["records"][0]["m"];
+    let saved = &core.until("history")["entries"][0]["message"];
     assert_eq!(
         (saved["stopReason"].clone(), saved["errorMessage"].clone()),
         (json!("error"), json!("context_length_exceeded"))

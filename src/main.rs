@@ -3,6 +3,7 @@ mod budget;
 mod catalog;
 mod completions;
 mod context_file;
+mod entries;
 mod grok;
 mod models;
 mod process;
@@ -201,7 +202,7 @@ fn main() -> ExitCode {
         [_, cmd, dir, from, to] if cmd == "history" => {
             match (from.parse::<u64>(), to.parse::<u64>()) {
                 (Ok(from), Ok(to)) => store::Session::open(Path::new(dir))
-                    .and_then(|session| session.history(from, to, true))
+                    .and_then(|session| session.entries(from, to))
                     .and_then(|records| {
                         serde_json::to_string(&records).map_err(store::Error::from)
                     }),

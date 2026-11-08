@@ -349,11 +349,8 @@ impl Core {
                 let num = |key: &str| op.get(key).and_then(Value::as_u64);
                 let from = num("from").unwrap_or(1);
                 let to = num("to").unwrap_or(u64::MAX);
-                let resolve = op.get("resolve") == Some(&Value::Bool(true));
-                let records = self.session.history(from, to, resolve)?;
-                emit(
-                    json!({"ev": "history", "id": id, "records": records, "last": self.session.last_seq()?}),
-                );
+                let entries = self.session.entries(from, to)?;
+                emit(json!({"ev": "history", "id": id, "entries": entries}));
             }
             // The models the core knows: the models file's, and OpenRouter's own list.
             Some("models") => {
@@ -475,6 +472,8 @@ impl Core {
     /// gets a reply in that turn (pi's steer), or with `"deliver": "follow_up"` after the turn.
     fn inject(&mut self, op: &Value) -> Result<()> {
         let m = op.get("message").cloned().unwrap_or(Value::Null);
+        // Text given as text is handed back as text (pi keeps custom content as given).
+        let text = matches!(m.get("content"), Some(Value::String(_)));
         let content = match m.get("content") {
             Some(Value::String(s)) => json!([{"type": "text", "text": s}]),
             Some(blocks @ Value::Array(_)) => blocks.clone(),
@@ -488,7 +487,7 @@ impl Core {
         let message = json!({"role": "user", "content": content, "timestamp": provider::now_ms()});
         let n = self
             .session
-            .append_injected(&message, source, display, m.get("details"))?;
+            .append_injected(&message, source, display, text, m.get("details"))?;
         emit(json!({"ev": "added", "id": op.get("id"), "n": n}));
         Ok(())
     }

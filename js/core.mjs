@@ -84,9 +84,9 @@ export class Core extends EventEmitter {
   setModel({ provider, model, reasoning } = {}) {
     return this.#request("set_model", { provider, model, reasoning }).then(({ model, reasoning }) => ({ model, reasoning }));
   }
-  /** Records `from`..`to` (`resolve`: stored data read back). */
-  history({ from, to, resolve } = {}) {
-    return this.#request("history", { from, to, resolve }).then(({ records, last }) => ({ records, last }));
+  /** Complete history entries with ids `from`..`to` (to continue: last id + 1). */
+  history({ from, to } = {}) {
+    return this.#request("history", { from, to }).then((event) => event.entries);
   }
   models(provider) { return this.#request("models", { provider }).then((event) => event.models); }
   /** One request outside the conversation, never saved (pi's completeSimple). */
