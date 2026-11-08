@@ -721,6 +721,51 @@ fn a_new_context_waits_while_a_cleanup_holds_the_references_lock() {
 }
 
 #[test]
+fn history_is_the_current_chunk_unless_older_is_asked_for() {
+    let (base, server) = server(vec![vec![text("one"), done()], vec![text("two"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "first"}}));
+    core.until("settled");
+    let messages = core.context();
+    core.op(json!({"op": "checkpoint", "messages": messages}));
+    core.until("checkpointed");
+    core.op(json!({"op": "send", "input": {"text": "second"}}));
+    core.until("settled");
+    server.join().unwrap();
+    let texts = |entries: &Value| -> Vec<String> {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.pointer("/message/content/0/text").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    };
+    core.op(json!({"op": "history", "id": "h1"}));
+    assert_eq!(
+        texts(&core.until("history")["entries"]),
+        ["second", "two"],
+        "current chunk only"
+    );
+    core.op(json!({"op": "history", "id": "h2", "from": 1}));
+    assert_eq!(
+        texts(&core.until("history")["entries"]),
+        ["first", "one", "second", "two"],
+        "older when asked for"
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_core"))
+        .args(["history", d.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        texts(&serde_json::from_slice(&out.stdout).unwrap()),
+        ["second", "two"]
+    );
+    core.stop();
+}
+
+#[test]
 fn injected_messages_and_entries_like_pi_custom_messages() {
     let (base, server) = server(vec![
         vec![call("c1", json!({})), done()],

@@ -84,7 +84,7 @@ export class Core extends EventEmitter {
   setModel({ provider, model, reasoning } = {}) {
     return this.#request("set_model", { provider, model, reasoning }).then(({ model, reasoning }) => ({ model, reasoning }));
   }
-  /** Complete history entries with ids `from`..`to` (to continue: last id + 1). */
+  /** Complete history entries: the current chunk, or ids `from`..`to` (to continue: last id + 1). */
   history({ from, to } = {}) {
     return this.#request("history", { from, to }).then((event) => event.entries);
   }

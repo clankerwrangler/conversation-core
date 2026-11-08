@@ -194,7 +194,20 @@ impl Session {
             dir: self.dir.clone(),
             files: HashMap::new(),
         };
-        for number in self.chunk_numbers()? {
+        // Only the chunks that hold the range are read; a chunk's first line says where it starts.
+        let numbers = self.chunk_numbers()?;
+        let firsts = numbers
+            .iter()
+            .map(|&c| self.chunk_first(c))
+            .collect::<Result<Vec<u64>>>()?;
+        for (index, &number) in numbers.iter().enumerate() {
+            let next = firsts.get(index + 1).copied();
+            if next.is_some_and(|next| next <= from) {
+                continue;
+            }
+            if firsts[index] > to {
+                break;
+            }
             let chunk = self.load_chunk(number)?;
             let last = chunk
                 .records
@@ -202,9 +215,6 @@ impl Session {
                 .and_then(|r| r.get("n"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            if last < from {
-                continue;
-            }
             for record in &chunk.records {
                 let n = record.get("n").and_then(Value::as_u64).unwrap_or(0);
                 if n < from || n > to {
@@ -224,6 +234,31 @@ impl Session {
             }
         }
         Ok(out)
+    }
+
+    /// Where the current chunk begins: history starts here unless older records are asked for.
+    pub fn current_start(&self) -> Result<u64> {
+        let last = *self
+            .chunk_numbers()?
+            .last()
+            .ok_or_else(|| Error::Format("no chunk".into()))?;
+        self.chunk_first(last)
+    }
+
+    /// The number of a chunk's first record (its opening `chunk` record), from its first line.
+    fn chunk_first(&self, number: u32) -> Result<u64> {
+        use std::io::BufRead;
+        let path = self.log_path(number, None);
+        let file = fs::File::open(&path).map_err(|e| Error::Io(path.clone(), e))?;
+        let mut line = String::new();
+        std::io::BufReader::new(file)
+            .read_line(&mut line)
+            .map_err(|e| Error::Io(path.clone(), e))?;
+        let first: Value = serde_json::from_str(&line)?;
+        first
+            .get("n")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::Format(format!("chunk {number} has no first record")))
     }
 
     /// History as handed out (see entries.rs): complete entries for records `from..=to`.

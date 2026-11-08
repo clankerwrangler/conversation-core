@@ -199,6 +199,10 @@ fn main() -> ExitCode {
                     .map_err(store::Error::from)
             }),
         // Records numbered from..=to (with stored data read back), for a session not running.
+        // The current chunk's entries.
+        [_, cmd, dir] if cmd == "history" => store::Session::open(Path::new(dir))
+            .and_then(|session| session.entries(session.current_start()?, u64::MAX))
+            .and_then(|entries| serde_json::to_string(&entries).map_err(store::Error::from)),
         [_, cmd, dir, from, to] if cmd == "history" => {
             match (from.parse::<u64>(), to.parse::<u64>()) {
                 (Ok(from), Ok(to)) => store::Session::open(Path::new(dir))

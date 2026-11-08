@@ -347,7 +347,11 @@ impl Core {
             }
             Some("history") => {
                 let num = |key: &str| op.get(key).and_then(Value::as_u64);
-                let from = num("from").unwrap_or(1);
+                // The current chunk unless older records are asked for (scroll-back).
+                let from = match num("from") {
+                    Some(from) => from,
+                    None => self.session.current_start()?,
+                };
                 let to = num("to").unwrap_or(u64::MAX);
                 let entries = self.session.entries(from, to)?;
                 emit(json!({"ev": "history", "id": id, "entries": entries}));
