@@ -703,7 +703,7 @@ fn a_new_context_waits_while_a_cleanup_holds_the_references_lock() {
     let d = dir();
     let mut core = Core::start(&d, &base);
     core.op(json!({"op": "send", "input": {"text": "hi"}}));
-    core.until("turn_end");
+    core.until("settled");
     // A cleanup takes the lock; the next turn's context check must wait for it.
     let lock = std::fs::File::open(d.join("references.lock")).unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);

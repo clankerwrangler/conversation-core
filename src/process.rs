@@ -2,7 +2,7 @@
 //!
 //! Harness -> core: send, steer, abort, prepared, credentials, tool_result, context, checkpoint
 //! Core -> harness: prepare_request, need_credentials, text_delta, reasoning_delta, tool_call,
-//!   cancel, retry, cut_off, message_end, turn_end, context_file, error
+//!   cancel, retry, cut_off, message_end, turn_end, settled, context_file, error
 //!
 //! Tool hand-off (specification/CoreToolHandoff.tla): a call is saved as soon as it is
 //! complete in the stream, then handed to the runner (`tool_call`); the reply keeps
@@ -112,6 +112,11 @@ struct Core {
     catalog_dir: PathBuf,
     /// The core's own credentials file.
     auth_path: PathBuf,
+    /// The id of the last op taken from the runner (answers to the core's own questions
+    /// aside), reported by `settled` so the runner knows which of its ops are done.
+    seen: Value,
+    /// A turn-starting op was handled since the last `settled`.
+    unsettled: bool,
 }
 
 /// Where the core keeps what it fetches and what it is signed in with.
@@ -187,10 +192,20 @@ pub fn run(
         sources,
         catalog_dir: paths.catalog,
         auth_path: paths.auth,
+        seen: Value::Null,
+        unsettled: false,
     };
     while let Some(op) = core.next_idle_op() {
         if let Err(err) = core.idle(&op) {
-            emit(json!({"ev": "error", "error": err.to_string()}));
+            emit(
+                json!({"ev": "error", "id": op.get("id"), "op": op.get("op"), "error": err.to_string()}),
+            );
+        }
+        // pi's agent_settled: turns are over and nothing taken is waiting. `through` names
+        // the last op taken, so a runner knows whether ops it sent since are still to come.
+        if core.unsettled && core.queued.is_empty() {
+            core.unsettled = false;
+            emit(json!({"ev": "settled", "through": core.seen}));
         }
     }
     Ok(())
@@ -271,6 +286,16 @@ impl Core {
                     return Ok(Some(Msg::Builtin(id, Value::Null)));
                 }
                 Some(Msg::Closed) | None => self.closed = true,
+                Some(Msg::Op(op)) => {
+                    let answer = matches!(
+                        op.get("op").and_then(Value::as_str),
+                        Some("prepared" | "credentials" | "review_request" | "login_input")
+                    );
+                    if !answer && let Some(id) = op.get("id") {
+                        self.seen = id.clone();
+                    }
+                    return Ok(Some(Msg::Op(op)));
+                }
                 Some(msg) => return Ok(Some(msg)),
             }
         }
@@ -499,7 +524,11 @@ impl Core {
         if self.anytime(op)? {
             return Ok(());
         }
-        match op.get("op").and_then(Value::as_str) {
+        let kind = op.get("op").and_then(Value::as_str);
+        if matches!(kind, Some("send" | "steer" | "add_context")) {
+            self.unsettled = true;
+        }
+        match kind {
             Some("send") | Some("steer") => {
                 let input = op
                     .get("input")
@@ -534,8 +563,16 @@ impl Core {
 
     /// Handle an op that arrives mid-turn. Returns true on abort.
     fn during_turn(&mut self, op: Value) -> Result<bool> {
-        if self.anytime(&op)? {
-            return Ok(false);
+        // A malformed op is reported to its sender; it does not end the turn.
+        match self.anytime(&op) {
+            Ok(true) => return Ok(false),
+            Ok(false) => {}
+            Err(err) => {
+                emit(
+                    json!({"ev": "error", "id": op.get("id"), "op": op.get("op"), "error": err.to_string()}),
+                );
+                return Ok(false);
+            }
         }
         match op.get("op").and_then(Value::as_str) {
             Some("add_context") => {

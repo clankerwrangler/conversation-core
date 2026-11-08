@@ -168,6 +168,36 @@ The same things pi offered, as ops on `core run` (each may carry an `id`, echoed
 - `history`: records `from`..`to`, optionally with stored data read back (`resolve`). Event `history`. For a session that is not running: `core history <dir> <from> <to>`.
 - `complete` (pi's `completeSimple`): `{model, instructions, messages, reasoning}`, one request outside the conversation, never saved. It asks for credentials like a turn; event `completed` with `message` or `error`.
 
+An op the core refuses is answered with `error` carrying the op's `id` and `op`; during a
+turn it does not end the turn. After turns, once nothing taken is waiting, the core reports
+`settled` (pi's agent_settled) with `through`, the id of the last op it has taken (answers to
+its own questions aside), so a runner knows whether ops it sent since are still to come.
+
+## JavaScript API
+
+`js/core.mjs` is the core's API for JavaScript runners: one `core run` process as an object
+with plain functions, the JSON lines hidden. Handlers answer the core's questions; every
+event is also emitted by name (`error` as `core_error`).
+
+```js
+import { Core } from "./js/core.mjs";
+const core = Core.start({ bin, dir, args: ["--auth", file], cwd,
+  prepare: async ({ context, selected, contextFiles }) => ({ model, instructions, tools }),
+  credentials: async (provider) => ({ token }),   // only when the core holds no sign-in
+  review: async (request) => ({ body, headers }), // with reviewRequest
+  tool: async ({ call, name, arguments: args }, signal) => ({ content, isError, details }),
+});
+core.on("text_delta", (e) => process.stdout.write(e.delta));
+core.send("hello"); await core.idle();
+```
+
+Turns: `send`, `steer`, `abort`, `idle()`, `busy`, `addContext(message, {wake, deliver})`,
+`toolResult(call, result)` for async calls. Any time: `record`, `setModel`, `history`,
+`models`, `complete`, `login` / `loginInput` / `logout` / `authStatus`. When idle:
+`context`, `checkpoint`. `close()` ends input and waits for the core to exit. A handler
+that throws aborts the turn (`handler_error`); a tool handler that throws gives an error
+result. Tests: `CORE_BIN=target/release/core node --test js/core.test.mjs`.
+
 ## Built-in tools
 
 The core has pi 1.5's seven basic tools built in: `read`, `bash`, `edit`,
