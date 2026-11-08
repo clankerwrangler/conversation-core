@@ -307,6 +307,9 @@ pub fn refresh_codex(
     Ok(models)
 }
 
+/// Fetches a provider's list now and caches it (cache folder, endpoint, key).
+type Refresh = fn(&Path, &str, Option<&str>) -> Result<Vec<Value>, String>;
+
 /// A provider's fetched list: the cache, fetched first when there is none, refreshed in the
 /// background when it is older than 4 hours.
 fn fetched(
@@ -314,7 +317,7 @@ fn fetched(
     provider: &'static str,
     base_url: &str,
     key: Option<&str>,
-    refresh: fn(&Path, &str, Option<&str>) -> Result<Vec<Value>, String>,
+    refresh: Refresh,
 ) -> Vec<Value> {
     match read_cache(dir, provider) {
         Some((checked, models, _)) => {
