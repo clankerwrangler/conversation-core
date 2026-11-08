@@ -1008,7 +1008,7 @@ impl Reply {
             if let Block::Text(t) = &mut self.blocks[i] {
                 t.push_str(piece);
             }
-            report(Piece::Text(piece.to_string()));
+            report(Piece::Text(piece.to_string(), None));
         }
         for call in delta
             .get("tool_calls")

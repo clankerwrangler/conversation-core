@@ -56,7 +56,8 @@ pub fn developer_role(model: &Value, reasoning: &crate::models::Reasoning) -> bo
 /// What the stream thread reports.
 #[derive(Debug)]
 pub enum Piece {
-    Text(String),
+    /// Streamed text, with the provider's id for the output item it belongs to (when it has one).
+    Text(String, Option<String>),
     Reasoning(String),
     /// A finished output item (reasoning, text or a tool call) as a content block.
     Block(Value),
@@ -750,7 +751,14 @@ fn handle(
             .to_string()
     };
     match kind {
-        "response.output_text.delta" => report(Piece::Text(text("delta"))),
+        "response.output_text.delta" => {
+            let item = event
+                .get("item_id")
+                .and_then(Value::as_str)
+                .filter(|i| !i.is_empty())
+                .map(str::to_string);
+            report(Piece::Text(text("delta"), item))
+        }
         "response.reasoning_summary_text.delta" => report(Piece::Reasoning(text("delta"))),
         "response.output_item.done" => {
             if let Some(item) = event.get("item") {

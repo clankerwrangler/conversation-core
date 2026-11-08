@@ -1109,8 +1109,14 @@ impl Core {
                 Piece::ProviderError(e) => provider_error = Some(e),
                 // `attempt` names the reply being streamed (a retry streams a new one), so a
                 // runner can show it live until `message_end` names its saved entry.
-                Piece::Text(delta) => {
-                    emit(json!({"ev": "text_delta", "attempt": tag, "delta": delta}))
+                // `item`: the provider's id for the text item (Responses), which the saved
+                // text keeps in its signature, so a runner can name the live text as saved.
+                Piece::Text(delta, item) => {
+                    let mut ev = json!({"ev": "text_delta", "attempt": tag, "delta": delta});
+                    if let Some(item) = item {
+                        ev["item"] = Value::String(item);
+                    }
+                    emit(ev)
                 }
                 Piece::Reasoning(delta) => {
                     emit(json!({"ev": "reasoning_delta", "attempt": tag, "delta": delta}))
@@ -1414,7 +1420,7 @@ fn start_completion(
                     emit(json!({"ev": "completed", "id": id, "error": e}));
                     return;
                 }
-                Piece::Text(_)
+                Piece::Text(..)
                 | Piece::Reasoning(_)
                 | Piece::Response(_)
                 | Piece::ProviderError(_) => {}
@@ -1428,5 +1434,10 @@ fn user_message(input: &Value) -> Value {
     let content = input.get("content").cloned().unwrap_or_else(
         || json!([{"type": "text", "text": input.get("text").cloned().unwrap_or(Value::Null)}]),
     );
-    json!({"role": "user", "content": content, "timestamp": provider::now_ms()})
+    let mut message = json!({"role": "user", "content": content, "timestamp": provider::now_ms()});
+    // The runner's id for this input (pi keeps a user message's `id`); never sent to the model.
+    if let Some(id) = input.get("id").and_then(Value::as_str) {
+        message["id"] = Value::String(id.to_string());
+    }
+    message
 }
