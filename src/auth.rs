@@ -2,7 +2,7 @@
 //! add-on run them), the stored credentials, and their renewal.
 //!
 //! Credentials live in one file (`--auth <file>`, default
-//! `~/.config/conversation-core/auth.json`), in pi's `auth.json` shape, readable only by its
+//! `~/.local/share/conversation-core/auth.json`), in pi's `auth.json` shape, readable only by its
 //! owner:
 //!
 //! ```json
@@ -43,10 +43,9 @@ const OPENROUTER_REDIRECT: &str = "http://localhost:3000/openrouter/callback";
 const RENEW_EARLY_MS: u64 = 120_000;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Sign-ins are data (they cannot be fetched again without signing in).
 pub fn default_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(|h| Path::new(&h).join(".config/conversation-core/auth.json"))
-        .unwrap_or_else(|| PathBuf::from(".config/conversation-core/auth.json"))
+    crate::dirs::data().join("auth.json")
 }
 
 fn now_ms() -> u64 {

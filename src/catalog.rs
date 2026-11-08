@@ -18,10 +18,9 @@ const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
 const REFRESH: Duration = Duration::from_secs(4 * 60 * 60);
 const TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Fetched model lists can be fetched again: they are cache.
 pub fn default_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(|h| Path::new(&h).join(".config/conversation-core/catalog"))
-        .unwrap_or_else(|| PathBuf::from(".config/conversation-core/catalog"))
+    crate::dirs::cache().join("catalog")
 }
 
 fn now_ms() -> u64 {

@@ -15,6 +15,14 @@ core referenced <session-dir>   print the stored files the context and the lates
 core tool <name> <arguments-json>   run one built-in tool in the current folder, print its result
 ```
 
+## Where things are kept
+
+By the usual Linux convention (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` move them):
+
+- configuration: `~/.config/conversation-core` (`models.json`, the AGENTS file, `skills/`);
+- data: `~/.local/share/conversation-core` (`auth.json`; runners keep sessions in `sessions/`);
+- cache: `~/.cache/conversation-core` (`catalog/`, fetched model lists).
+
 ## Models file and model lists
 
 The runner only has to name a model (`provider` and `id`); the core fills in its details
@@ -22,7 +30,7 @@ The runner only has to name a model (`provider` and `id`); the core fills in its
 
 - OpenRouter: OpenRouter's own list, fetched from OpenRouter (`/models/user` with the
   account's key, as pi does) and cached in `--catalog <dir>` (default
-  `~/.config/conversation-core/catalog`), refreshed every 4 hours. OpenRouter does not say
+  `~/.cache/conversation-core/catalog`), refreshed every 4 hours. OpenRouter does not say
   which models cannot switch reasoning off: when it refuses "off", the core sends again
   without the setting and remembers that for the model (`learned.json`).
 - Codex: OpenAI's own list, as the Codex CLI fetches it (`<base>/codex/models` with the
@@ -46,7 +54,7 @@ images, and if it still does not fit it sends nothing and reports
 
 The core signs in, stores credentials and renews them itself, with the providers' own flows
 (as pi and the pi-grok-cli add-on run them). Credentials live in `--auth <file>` (default
-`~/.config/conversation-core/auth.json`, pi's `auth.json` shape, owner-only). A request uses
+`~/.local/share/conversation-core/auth.json`, pi's `auth.json` shape, owner-only). A request uses
 the stored sign-in for its provider, renewed shortly before it expires; only when there is
 none is the runner asked (`need_credentials`). Renewal holds `<file>.lock` and re-reads the
 file first, so sessions sharing it never send a refresh token twice (providers rotate them).
@@ -168,7 +176,7 @@ The same things pi offered, as ops on `core run` (each may carry an `id`, echoed
 - `history`: the current chunk's entries (everything since the latest checkpoint), or with `from` / `to` older ones (scroll-back); only the chunks holding the range are read. Entries are complete: a reply saved in parts comes as one message, stored data is read back (an entry whose data was deleted keeps its references and says `"expired": true`). Entries are pi's (`message`, `custom_message`, `custom`, `model_change`, `thinking_level_change`, with `id` and `timestamp`); `id` is the sequence number as text, with no parent links. A reply still being written is held back with everything after it, so handed-out entries never change and `from` = last id + 1 continues. Event `history` with `entries`. For a session that is not running: `core history <dir> [<from> <to>]`.
 - `complete` (pi's `completeSimple`): `{model, instructions, messages, reasoning}`, one request outside the conversation, never saved. It asks for credentials like a turn; event `completed` with `message` or `error`.
 
-An op the core refuses is answered with `error` carrying the op's `id` and `op`; during a
+Each turn begins with `turn_start` (pi's agent_start). `text_delta`, `reasoning_delta` and `message_end` carry `attempt`, naming the reply being streamed (a retry streams a new one), and `message_end` carries `n`, its saved entry's id. An op the core refuses is answered with `error` carrying the op's `id` and `op`; during a
 turn it does not end the turn. After turns, once nothing taken is waiting, the core reports
 `settled` (pi's agent_settled) with `through`, the id of the last op it has taken (answers to
 its own questions aside), so a runner knows whether ops it sent since are still to come.

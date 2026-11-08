@@ -27,11 +27,7 @@ pub struct Sources {
 impl Sources {
     /// `~/.config/conversation-core` unless `--agent-dir` names another.
     pub fn new(agent_dir: Option<PathBuf>, skill_paths: Vec<PathBuf>) -> Sources {
-        let agent_dir = agent_dir.unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| Path::new(&h).join(".config/conversation-core"))
-                .unwrap_or_else(|| PathBuf::from(".config/conversation-core"))
-        });
+        let agent_dir = agent_dir.unwrap_or_else(crate::dirs::config);
         Sources {
             agent_dir,
             skill_paths,

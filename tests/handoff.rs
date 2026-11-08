@@ -276,7 +276,8 @@ impl Core {
                 Some("text_delta")
                 | Some("reasoning_delta")
                 | Some("window_unknown")
-                | Some("provider_response") => {}
+                | Some("provider_response")
+                | Some("turn_start") => {}
                 _ => return ev,
             }
         }
@@ -897,6 +898,10 @@ fn set_model_is_recorded_and_offered_to_the_runner() {
         (&json!("gpt-6.1-sol"), &json!("high"))
     );
     core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    assert_eq!(
+        core.events.recv_timeout(Duration::from_secs(20)).unwrap()["ev"],
+        "turn_start"
+    );
     let ev = core.events.recv_timeout(Duration::from_secs(20)).unwrap();
     assert_eq!(ev["ev"], "prepare_request");
     assert_eq!(ev["selected"]["model"]["id"], "gpt-6.1-sol");

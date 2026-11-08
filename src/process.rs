@@ -2,7 +2,7 @@
 //!
 //! Harness -> core: send, steer, abort, prepared, credentials, tool_result, context, checkpoint
 //! Core -> harness: prepare_request, need_credentials, text_delta, reasoning_delta, tool_call,
-//!   cancel, retry, cut_off, message_end, turn_end, settled, context_file, error
+//!   turn_start, cancel, retry, cut_off, message_end, turn_end, settled, context_file, error
 //!
 //! Tool hand-off (specification/CoreToolHandoff.tla): a call is saved as soon as it is
 //! complete in the stream, then handed to the runner (`tool_call`); the reply keeps
@@ -683,6 +683,8 @@ impl Core {
     /// One turn, starting with `user` if given (else with what was just added). False if aborted.
     fn turn(&mut self, user: Option<Value>) -> Result<bool> {
         self.boundary()?;
+        // pi's agent_start: a turn begins (each turn of a chain, before its first request).
+        emit(json!({"ev": "turn_start"}));
         if let Some(user) = user {
             self.session.append("user", &user)?;
         }
@@ -1105,8 +1107,14 @@ impl Core {
                     emit(ev);
                 }
                 Piece::ProviderError(e) => provider_error = Some(e),
-                Piece::Text(delta) => emit(json!({"ev": "text_delta", "delta": delta})),
-                Piece::Reasoning(delta) => emit(json!({"ev": "reasoning_delta", "delta": delta})),
+                // `attempt` names the reply being streamed (a retry streams a new one), so a
+                // runner can show it live until `message_end` names its saved entry.
+                Piece::Text(delta) => {
+                    emit(json!({"ev": "text_delta", "attempt": tag, "delta": delta}))
+                }
+                Piece::Reasoning(delta) => {
+                    emit(json!({"ev": "reasoning_delta", "attempt": tag, "delta": delta}))
+                }
                 Piece::Block(block) => {
                     let is_call = block.get("type").and_then(Value::as_str) == Some("toolCall");
                     unsaved.push(block.clone());
@@ -1187,7 +1195,7 @@ impl Core {
                     let context = json!({"tokens": tokens, "contextWindow": window,
                         "percent": window.zip(tokens).map(|(w, t)| t as f64 / w as f64 * 100.0)});
                     emit(
-                        json!({"ev": "message_end", "n": n, "stopReason": stop, "usage": usage, "contextUsage": context}),
+                        json!({"ev": "message_end", "attempt": tag, "n": n, "stopReason": stop, "usage": usage, "contextUsage": context}),
                     );
                     return Ok(Streamed::Ended(End::Reply { calls: has_calls }));
                 }

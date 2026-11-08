@@ -15,7 +15,7 @@ pub struct Models {
 }
 
 pub fn default_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| Path::new(&h).join(".config/conversation-core/models.json"))
+    Some(crate::dirs::config().join("models.json"))
 }
 
 impl Models {

@@ -3,6 +3,7 @@ mod budget;
 mod catalog;
 mod completions;
 mod context_file;
+mod dirs;
 mod entries;
 mod grok;
 mod models;

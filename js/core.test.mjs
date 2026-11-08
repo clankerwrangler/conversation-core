@@ -59,8 +59,9 @@ test("a turn streams text, settles, and is saved", async (t) => {
   const p = await provider([[delta("hel"), delta("lo"), text("hello"), done]]);
   const core = start(p.base, {}, t, p);
   let streamed = "";
-  const ends = [];
-  core.on("text_delta", (e) => { streamed += e.delta; });
+  const ends = [], names = [];
+  core.on("event", (e) => names.push(e.ev));
+  core.on("text_delta", (e) => { streamed += e.delta; assert.ok(Number.isInteger(e.attempt)); });
   core.on("message_end", (e) => ends.push(e));
   core.send("hi");
   assert.equal(core.busy, true);
@@ -68,6 +69,8 @@ test("a turn streams text, settles, and is saved", async (t) => {
   assert.equal(core.busy, false);
   assert.equal(streamed, "hello");
   assert.equal(ends[0].stopReason, "stop");
+  assert.equal(ends[0].attempt, 1);
+  assert.deepEqual(names.filter((n) => ["turn_start", "turn_end", "settled"].includes(n)), ["turn_start", "turn_end", "settled"]);
   const entries = await core.history({});
   assert.deepEqual(entries.map((e) => e.message?.role), ["user", "assistant"]);
   assert.equal(entries[1].message.content.find((b) => b.type === "text").text, "hello");
