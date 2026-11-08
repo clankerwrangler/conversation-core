@@ -1018,6 +1018,65 @@ fn a_reply_reports_its_usage_cost_and_how_full_the_context_is() {
 }
 
 #[test]
+fn a_provider_error_is_reported_and_saved_as_fixed_codes() {
+    let (base, server) = server(vec![
+        vec![Step::Event(
+            json!({"type": "error", "code": "context_length_exceeded", "message": "secret request text here"}),
+        )],
+        vec![Step::Event(
+            json!({"type": "response.failed", "response": {"status": "failed", "error": {"code": "weird_new_code", "type": "server_error", "message": "x"}}}),
+        )],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "one"}}));
+    let first = core.until("error");
+    assert_eq!(first["error"], "context_length_exceeded");
+    assert_eq!(
+        first["providerError"],
+        json!({"version": 2, "code": "context_length_exceeded", "category": "context", "event": "error",
+        "codeState": "known", "typeState": "absent", "errorShape": "missing", "messageShape": "string"})
+    );
+    core.until("turn_end");
+    core.op(json!({"op": "send", "input": {"text": "two"}}));
+    let second = core.until("error");
+    assert_eq!(second["error"], "provider_response_failed");
+    assert_eq!(
+        (
+            second["providerError"]["code"].clone(),
+            second["providerError"]["category"].clone(),
+            second["providerError"]["codeState"].clone()
+        ),
+        (json!("unknown"), json!("server"), json!("unknown"))
+    );
+    core.until("turn_end");
+    // The failed replies are saved, as pi saves them, but never sent to the model.
+    assert_eq!(
+        roles(&core.context()),
+        ["user", "assistant", "user", "assistant"]
+    );
+    core.op(json!({"op": "history", "id": "h", "from": first["n"], "to": first["n"]}));
+    let saved = &core.until("history")["records"][0]["m"];
+    assert_eq!(
+        (saved["stopReason"].clone(), saved["errorMessage"].clone()),
+        (json!("error"), json!("context_length_exceeded"))
+    );
+    assert!(
+        !saved.to_string().contains("secret"),
+        "the provider's text is not kept"
+    );
+    let bodies = server.join().unwrap();
+    assert!(
+        bodies[1]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["role"] != "assistant")
+    );
+    core.stop();
+}
+
+#[test]
 fn an_item_listed_only_in_the_final_message_is_not_lost() {
     let late = json!({"type": "function_call", "id": "fc_c1", "call_id": "c1", "name": "add", "arguments": "{\"a\":1}", "status": "completed"});
     let (base, server) = server(vec![

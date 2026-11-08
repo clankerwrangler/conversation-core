@@ -93,16 +93,13 @@ impl Session {
     }
 
     /// More blocks of an open reply. With `end` (usage, stop reason) it closes the reply.
-    pub fn append_more(
-        &self,
-        reply: u64,
-        blocks: &[Value],
-        end: Option<(&Value, &str)>,
-    ) -> Result<u64> {
+    pub fn append_more(&self, reply: u64, blocks: &[Value], end: Option<&Value>) -> Result<u64> {
         let message = serde_json::json!({"role": "assistant", "content": blocks});
         let mut extra = serde_json::json!({"reply": reply});
-        if let Some((usage, stop)) = end {
-            extra["end"] = serde_json::json!({"usage": usage, "stopReason": stop});
+        // The reply's closing fields: usage and stopReason, and for a failure errorMessage
+        // and providerError.
+        if let Some(end) = end {
+            extra["end"] = end.clone();
         }
         self.append_record("assistant-more", &message, extra)
     }
@@ -653,6 +650,11 @@ impl Session {
                         messages[index]["usage"] = end.get("usage").cloned().unwrap_or(Value::Null);
                         messages[index]["stopReason"] =
                             end.get("stopReason").cloned().unwrap_or(Value::Null);
+                        for key in ["errorMessage", "providerError"] {
+                            if let Some(value) = end.get(key) {
+                                messages[index][key] = value.clone();
+                            }
+                        }
                     }
                     continue;
                 }

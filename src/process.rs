@@ -184,7 +184,8 @@ pub fn run(
 /// On open: a crash may have left a reply open and calls without results.
 fn recover_calls(session: &Session) -> Result<()> {
     for reply in session.unfinished_replies()? {
-        session.append_more(reply, &[], Some((&provider::zero_usage(), "error")))?;
+        let end = json!({"usage": provider::zero_usage(), "stopReason": "error", "errorMessage": "interrupted"});
+        session.append_more(reply, &[], Some(&end))?;
     }
     let messages = session.context_refs()?;
     let mut results: Vec<String> = Vec::new();
@@ -634,9 +635,8 @@ impl Core {
             }
         }
         if let Some((reply, rest)) = open {
-            let usage = provider::zero_usage();
-            self.session
-                .append_more(reply, rest, Some((&usage, "aborted")))?;
+            let end = json!({"usage": provider::zero_usage(), "stopReason": "aborted", "errorMessage": "request_aborted"});
+            self.session.append_more(reply, rest, Some(&end))?;
         }
         emit(json!({"ev": "turn_end", "stopReason": "aborted"}));
         Ok(())
@@ -863,12 +863,27 @@ impl Core {
                     std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
                 }
                 Streamed::Retry(reason) => {
-                    emit(json!({"ev": "error", "error": reason}));
+                    let end = failure_end(&reason, None);
+                    let n = self.save_failed_reply(&target, &end)?;
+                    emit(error_event(&end, n));
                     return Ok(End::Failed);
                 }
             }
         }
         Ok(End::Failed)
+    }
+
+    /// A reply that failed before anything was saved: saved empty with its error, as pi does
+    /// (the context leaves failed replies out).
+    fn save_failed_reply(&self, target: &Target, end: &Value) -> Result<u64> {
+        let mut message = provider::empty_reply(target);
+        message["content"] = json!([]);
+        if let Value::Object(fields) = end {
+            for (key, value) in fields {
+                message[key.as_str()] = value.clone();
+            }
+        }
+        self.session.append("assistant", &message)
     }
 
     /// Stream one attempt, saving and handing off each tool call as soon as it is complete.
@@ -883,14 +898,13 @@ impl Core {
         let mut unsaved: Vec<Value> = Vec::new();
         let mut open: Option<u64> = None;
         let mut has_calls = false;
+        // The provider's own error, as safe fixed tokens (the harness's nativeProviderError).
+        let mut provider_error: Option<Value> = None;
         // The provider's last sign of life: silence longer than `stall` fails the attempt.
         let mut heard = Instant::now();
         loop {
             let piece = match self.recv_until(Some(heard + self.stall))? {
-                None => Piece::Failed(Failure::Retryable(format!(
-                    "provider_stream_stalled: nothing for {}s",
-                    self.stall.as_secs()
-                ))),
+                None => Piece::Failed(Failure::Retryable("provider_stream_stalled".into())),
                 Some(Msg::Piece(t, piece)) if t == tag => {
                     heard = Instant::now();
                     piece
@@ -913,6 +927,7 @@ impl Core {
                     }
                     emit(ev);
                 }
+                Piece::ProviderError(e) => provider_error = Some(e),
                 Piece::Text(delta) => emit(json!({"ev": "text_delta", "delta": delta})),
                 Piece::Reasoning(delta) => emit(json!({"ev": "reasoning_delta", "delta": delta})),
                 Piece::Block(block) => {
@@ -980,8 +995,8 @@ impl Core {
                     };
                     let n = match open {
                         Some(reply) => {
-                            self.session
-                                .append_more(reply, &unsaved, Some((&usage, stop)))?
+                            let end = json!({"usage": usage, "stopReason": stop});
+                            self.session.append_more(reply, &unsaved, Some(&end))?
                         }
                         None => {
                             message["content"] = Value::Array(unsaved);
@@ -1007,16 +1022,17 @@ impl Core {
                         Failure::Retryable(r) => (r, false),
                         Failure::Fatal(r) => (r, true),
                     };
+                    let end = failure_end(&reason, provider_error.as_ref());
                     let Some(reply) = open else {
-                        emit(json!({"ev": "error", "error": reason}));
+                        // Nothing was saved: the failed reply is saved empty, as pi does.
+                        let n = self.save_failed_reply(target, &end)?;
+                        emit(error_event(&end, n));
                         return Ok(Streamed::Ended(End::Failed));
                     };
                     // Something was saved: keep it, let the started calls finish.
-                    let usage = provider::zero_usage();
-                    self.session
-                        .append_more(reply, &unsaved, Some((&usage, "error")))?;
+                    let n = self.session.append_more(reply, &unsaved, Some(&end))?;
                     if fatal {
-                        emit(json!({"ev": "error", "error": reason}));
+                        emit(error_event(&end, n));
                         if !self.wait_for_normal_calls()? {
                             return Ok(Streamed::Ended(End::Aborted));
                         }
@@ -1039,6 +1055,27 @@ enum Streamed {
 /// An injected message wakes the model unless it says `"wake": false`.
 fn wakes(op: &Value) -> bool {
     op.get("wake") != Some(&Value::Bool(false))
+}
+
+/// The closing fields of a failed reply: pi's stopReason "error" and errorMessage (a fixed
+/// code such as `provider_http_429` or `context_length_exceeded`, never provider text), and
+/// the provider's own error when it sent one.
+fn failure_end(code: &str, provider_error: Option<&Value>) -> Value {
+    let mut end =
+        json!({"usage": provider::zero_usage(), "stopReason": "error", "errorMessage": code});
+    if let Some(e) = provider_error {
+        end["providerError"] = e.clone();
+    }
+    end
+}
+
+/// The `error` event for a saved failed reply `n`.
+fn error_event(end: &Value, n: u64) -> Value {
+    let mut ev = json!({"ev": "error", "n": n, "error": end["errorMessage"]});
+    if let Some(e) = end.get("providerError") {
+        ev["providerError"] = e.clone();
+    }
+    ev
 }
 
 /// Delivered after the current turn rather than at its next safe point.
@@ -1138,7 +1175,10 @@ fn start_completion(
                     emit(json!({"ev": "completed", "id": id, "error": e}));
                     return;
                 }
-                Piece::Text(_) | Piece::Reasoning(_) | Piece::Response(_) => {}
+                Piece::Text(_)
+                | Piece::Reasoning(_)
+                | Piece::Response(_)
+                | Piece::ProviderError(_) => {}
             }
         }
         emit(json!({"ev": "completed", "id": id, "error": "the stream ended without a reply"}));

@@ -37,6 +37,16 @@ models file; per million tokens, with `tiers` above an input size), then service
 pricing: flex half, priority double (Codex reports "default" for a priority request, which
 still counts as priority). Without rates the cost stays zero.
 
+## Errors
+
+A reply that fails is saved as pi saves it (`stopReason: "error"`, never sent to the model
+again), and the `error` event names it (`n`). Its `errorMessage` is a fixed code, never the
+provider's text: `provider_http_<status>`, `provider_request_failed`,
+`provider_stream_incomplete`, `provider_stream_stalled`, `invalid_provider_json`,
+`context_length_exceeded`, `provider_error`, `provider_response_failed`. When the provider
+sent its own error, `providerError` describes it in fixed tokens as the harness does
+(`code` and `category` from a known list, else "unknown", plus what shape the error had).
+
 ## System prompt
 
 The core builds the parts of the system prompt that change, the way pi 1.5 does, as

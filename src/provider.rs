@@ -48,6 +48,110 @@ pub enum Piece {
     Failed(Failure),
     /// The response's status and headers, as soon as they arrive (pi's after_provider_response).
     Response(Value),
+    /// The provider's own error event, reduced to fixed tokens, just before the failure.
+    ProviderError(Value),
+}
+
+/// Error codes the harness recognises, with their category (native-provider.mjs).
+const PROVIDER_ERROR_CODES: &[(&str, &str)] = &[
+    ("context_length_exceeded", "context"),
+    ("invalid_request_error", "request"),
+    ("invalid_value", "request"),
+    ("missing_required_parameter", "request"),
+    ("unsupported_parameter", "request"),
+    ("unknown_parameter", "request"),
+    ("invalid_api_key", "authentication"),
+    ("authentication_error", "authentication"),
+    ("permission_denied", "permission"),
+    ("model_not_found", "not_found"),
+    ("rate_limit_exceeded", "rate_limit"),
+    ("insufficient_quota", "quota"),
+    ("server_error", "server"),
+    ("internal_error", "server"),
+    ("service_unavailable", "server"),
+    ("previous_response_not_found", "transport"),
+    ("websocket_connection_limit_reached", "transport"),
+    ("invalid_prompt", "request"),
+    ("data_residency_mismatch", "permission"),
+    ("bio_policy", "content_policy"),
+    ("misalignment_policy_violation", "content_policy"),
+    ("vector_store_timeout", "server"),
+    ("invalid_image", "request"),
+    ("invalid_image_format", "request"),
+    ("invalid_base64_image", "request"),
+    ("invalid_image_url", "request"),
+    ("image_too_large", "request"),
+    ("image_too_small", "request"),
+    ("image_parse_error", "request"),
+    ("image_content_policy_violation", "content_policy"),
+    ("invalid_image_mode", "request"),
+    ("image_file_too_large", "request"),
+    ("unsupported_image_media_type", "request"),
+    ("empty_image_file", "request"),
+    ("failed_to_download_image", "request"),
+    ("image_file_not_found", "request"),
+];
+const PROVIDER_ERROR_TYPES: &[(&str, &str)] = &[
+    ("invalid_request_error", "request"),
+    ("authentication_error", "authentication"),
+    ("permission_error", "permission"),
+    ("not_found_error", "not_found"),
+    ("rate_limit_error", "rate_limit"),
+    ("server_error", "server"),
+    ("api_error", "server"),
+];
+
+fn lookup(table: &[(&'static str, &'static str)], key: Option<&Value>) -> Option<&'static str> {
+    let key = key?.as_str()?;
+    table.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+}
+
+fn state(value: Option<&Value>, known: bool) -> &'static str {
+    match value {
+        None | Some(Value::Null) => "absent",
+        _ if known => "known",
+        Some(Value::String(_)) => "unknown",
+        _ => "invalid",
+    }
+}
+
+fn shape(value: Option<&Value>) -> &'static str {
+    match value {
+        None => "missing",
+        Some(Value::Null) => "null",
+        Some(Value::String(_)) => "string",
+        Some(Value::Object(_)) => "object",
+        _ => "other",
+    }
+}
+
+/// The harness's safeProviderError: what the provider said went wrong, as fixed tokens
+/// only (never its text, ids or parameters).
+pub fn provider_error(raw: &Value, code: Option<&Value>) -> Value {
+    let kind = raw.get("type").and_then(Value::as_str).unwrap_or("");
+    let error = if kind == "response.failed" {
+        raw.pointer("/response/error")
+    } else {
+        raw.get("error")
+    };
+    let error_type = error.and_then(|e| e.get("type"));
+    let message = if kind == "error" && raw.get("message").is_some() {
+        raw.get("message")
+    } else if error.is_some_and(Value::is_string) {
+        error
+    } else {
+        error.and_then(|e| e.get("message"))
+    };
+    let known_code = lookup(PROVIDER_ERROR_CODES, code);
+    let known_type = lookup(PROVIDER_ERROR_TYPES, error_type);
+    json!({"version": 2,
+        "code": if known_code.is_some() { code.and_then(Value::as_str).unwrap_or("unknown") } else { "unknown" },
+        "category": known_code.or(known_type).unwrap_or("unknown"),
+        "event": kind,
+        "codeState": state(code, known_code.is_some()),
+        "typeState": state(error_type, known_type.is_some()),
+        "errorShape": shape(error),
+        "messageShape": shape(message)})
 }
 
 #[derive(Debug)]
@@ -205,7 +309,7 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
     }
     let mut response = call
         .send(p.body.as_str())
-        .map_err(|e| Failure::Retryable(format!("provider_request_failed: {e}")))?;
+        .map_err(|_| Failure::Retryable("provider_request_failed".into()))?;
     let status = response.status().as_u16();
     let headers: serde_json::Map<String, Value> = response
         .headers()
@@ -221,12 +325,9 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
     ));
     let reader = response.body_mut().as_reader();
     if status != 200 {
-        let mut text = String::new();
-        let _ = reader.take(4096).read_to_string(&mut text);
-        let detail = format!(
-            "provider_http_{status}: {}",
-            text.chars().take(300).collect::<String>()
-        );
+        // Only the status: an error body can echo the request.
+        let _ = std::io::copy(&mut reader.take(64 * 1024), &mut std::io::sink());
+        let detail = format!("provider_http_{status}");
         return Err(if status == 429 || status >= 500 {
             Failure::Retryable(detail)
         } else {
@@ -236,7 +337,7 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
     let mut data = String::new();
     let mut seen = std::collections::HashSet::new();
     for line in BufReader::new(reader).lines() {
-        let line = line.map_err(|e| Failure::Retryable(format!("provider_stream_read: {e}")))?;
+        let line = line.map_err(|_| Failure::Retryable("provider_request_failed".into()))?;
         if let Some(rest) = line.strip_prefix("data:") {
             data.push_str(rest.trim_start());
             continue;
@@ -250,7 +351,7 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
             return Ok(());
         }
     }
-    Err(Failure::Retryable("provider_stream_ended_early".into()))
+    Err(Failure::Retryable("provider_stream_incomplete".into()))
 }
 
 /// Report one stream event; true once the response is complete. `seen` holds the ids of
@@ -316,13 +417,28 @@ fn handle(
             });
             return Ok(true);
         }
-        "response.failed" | "error" => {
-            let detail = event
-                .pointer("/response/error/message")
-                .or_else(|| event.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            return Err(Failure::Fatal(format!("provider_error: {detail}")));
+        // Fixed codes as the harness gives them; the provider's text is never passed on.
+        "error" => {
+            let code = event.get("code").or_else(|| event.pointer("/error/code"));
+            report(Piece::ProviderError(provider_error(event, code)));
+            return Err(Failure::Fatal(
+                if code.and_then(Value::as_str) == Some("context_length_exceeded") {
+                    "context_length_exceeded".into()
+                } else {
+                    "provider_error".into()
+                },
+            ));
+        }
+        "response.failed" => {
+            let code = event.pointer("/response/error/code");
+            report(Piece::ProviderError(provider_error(event, code)));
+            return Err(Failure::Fatal(
+                if code.and_then(Value::as_str) == Some("context_length_exceeded") {
+                    "context_length_exceeded".into()
+                } else {
+                    "provider_response_failed".into()
+                },
+            ));
         }
         _ => {}
     }
