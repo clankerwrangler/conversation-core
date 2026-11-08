@@ -441,66 +441,97 @@ pub fn resolve(models: &Models, dir: &Path, requested: &Value, key: Option<&str>
     model
 }
 
+/// The providers whose lists the core discovers, with their default endpoints.
+const DISCOVERED: [(&str, &str); 2] = [(OPENROUTER, OPENROUTER_BASE), (CODEX, CODEX_BASE)];
+
+/// A provider's discovered list (empty for providers the core cannot ask).
+fn discovered(dir: &Path, provider: &str, base_url: Option<&str>, key: Option<&str>) -> Vec<Value> {
+    match provider {
+        OPENROUTER => openrouter_models(dir, base_url.unwrap_or(OPENROUTER_BASE), key),
+        CODEX => codex_models(dir, base_url.unwrap_or(CODEX_BASE), key),
+        _ => Vec::new(),
+    }
+}
+
+/// `over`'s fields over `base`'s.
+fn overlay(base: Option<Value>, over: Option<&Value>) -> Option<Value> {
+    match (base, over) {
+        (Some(Value::Object(mut b)), Some(Value::Object(o))) => {
+            for (k, v) in o {
+                b.insert(k.clone(), v.clone());
+            }
+            Some(Value::Object(b))
+        }
+        (b, None) => b,
+        (_, Some(o)) => Some(o.clone()),
+    }
+}
+
+/// A provider's list: the shipped one (the models file), updated by what was discovered:
+/// a discovered model's fields replace the shipped ones, and new models are added (as pi
+/// merges its built-in list with downloaded ones).
+fn provider_models(
+    models: &Models,
+    dir: &Path,
+    provider: &str,
+    base_url: Option<&str>,
+    key: Option<&str>,
+) -> Vec<Value> {
+    let found = discovered(dir, provider, base_url, key);
+    let mut out: Vec<Value> = models
+        .all()
+        .filter(|m| m.get("provider").and_then(Value::as_str) == Some(provider))
+        .map(|m| {
+            let newer = found.iter().find(|f| f["id"] == m["id"]);
+            overlay(Some(m), newer).unwrap_or(Value::Null)
+        })
+        .collect();
+    for model in found {
+        if !out.iter().any(|m| m["id"] == model["id"]) {
+            out.push(model);
+        }
+    }
+    out
+}
+
 fn resolve_listed(models: &Models, dir: &Path, requested: &Value, key: Option<&str>) -> Value {
     let provider = requested
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or("");
     let id = requested.get("id").and_then(Value::as_str).unwrap_or("");
-    let file = || {
+    let base_url = requested.get("baseUrl").and_then(Value::as_str);
+    let listed = provider_models(models, dir, provider, base_url, key)
+        .into_iter()
+        .find(|m| m["id"] == id);
+    // A shipped entry without a provider applies to any provider.
+    let listed = listed.or_else(|| {
         models
             .get(id)
-            .filter(|m| {
-                m.get("provider")
-                    .and_then(Value::as_str)
-                    .is_none_or(|p| p == provider)
-            })
+            .filter(|m| m.get("provider").is_none())
             .cloned()
-    };
-    let base_url = requested.get("baseUrl").and_then(Value::as_str);
-    let base = match provider {
-        OPENROUTER => openrouter_models(dir, base_url.unwrap_or(OPENROUTER_BASE), key)
-            .into_iter()
-            .find(|m| m["id"] == id),
-        // OpenAI's own list first; the models file when it cannot be fetched.
-        CODEX => codex_models(dir, base_url.unwrap_or(CODEX_BASE), key)
-            .into_iter()
-            .find(|m| m["id"] == id)
-            .or_else(file),
-        _ => file(),
-    };
-    let Some(Value::Object(mut merged)) = base else {
-        return requested.clone();
-    };
-    if let Value::Object(own) = requested {
-        for (k, v) in own {
-            merged.insert(k.clone(), v.clone());
-        }
-    }
-    Value::Object(merged)
+    });
+    overlay(listed, Some(requested)).unwrap_or_else(|| requested.clone())
 }
 
 /// Every model the core knows for a provider (all providers when None).
 pub fn list(models: &Models, dir: &Path, provider: Option<&str>, key: Option<&str>) -> Vec<Value> {
-    let wanted = |p: &str| provider.is_none_or(|w| w == p);
-    let codex = if wanted(CODEX) {
-        codex_models(dir, CODEX_BASE, key)
-    } else {
-        Vec::new()
-    };
-    let mut out: Vec<Value> = models
+    let mut providers: Vec<String> = models
         .all()
-        .filter(|m| {
-            let p = m.get("provider").and_then(Value::as_str).unwrap_or("");
-            // The fetched Codex list replaces the file's, when there is one.
-            wanted(p) && !(p == CODEX && !codex.is_empty())
+        .filter_map(|m| {
+            m.get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_string)
         })
+        .chain(DISCOVERED.iter().map(|(p, _)| p.to_string()))
         .collect();
-    out.extend(codex);
-    if wanted(OPENROUTER) {
-        out.extend(openrouter_models(dir, OPENROUTER_BASE, key));
-    }
-    out
+    providers.dedup();
+    let mut seen = std::collections::HashSet::new();
+    providers
+        .into_iter()
+        .filter(|p| provider.is_none_or(|w| w == p) && seen.insert(p.clone()))
+        .flat_map(|p| provider_models(models, dir, &p, None, key))
+        .collect()
 }
 
 #[cfg(test)]
@@ -548,6 +579,45 @@ mod tests {
         );
         assert!(
             codex_model(&json!({"slug": "hidden", "visibility": "hide"}), CODEX_BASE).is_none()
+        );
+    }
+
+    #[test]
+    fn discovery_updates_the_shipped_list() {
+        let dir = std::env::temp_dir().join(format!("core-catalog-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shipped = Models::parse(
+            r#"{"models": {
+            "a": {"provider": "openai-codex", "contextWindow": 1, "maxTokens": 5},
+            "gone": {"provider": "openai-codex", "contextWindow": 2}}}"#,
+        )
+        .unwrap();
+        let found = [
+            json!({"id": "a", "provider": "openai-codex", "contextWindow": 10}),
+            json!({"id": "new", "provider": "openai-codex"}),
+        ];
+        write_cache(&dir, CODEX, &found, None).unwrap();
+        let ids = |list: &[Value]| {
+            list.iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let listed = list(&shipped, &dir, Some(CODEX), None);
+        assert_eq!(ids(&listed), ["a", "gone", "new"]);
+        assert_eq!(listed[0]["contextWindow"], 10, "the discovered value wins");
+        assert_eq!(
+            listed[0]["maxTokens"], 5,
+            "a shipped value nothing replaced is kept"
+        );
+        let got = resolve(
+            &shipped,
+            &dir,
+            &json!({"provider": "openai-codex", "id": "a"}),
+            None,
+        );
+        assert_eq!(
+            (got["contextWindow"].clone(), got["maxTokens"].clone()),
+            (json!(10), json!(5))
         );
     }
 
