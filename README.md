@@ -205,6 +205,12 @@ A `send` or `steer` input may carry an `id` (the runner's name for it), kept on 
 turn it does not end the turn. After turns, once nothing taken is waiting, the core reports
 `settled` (pi's agent_settled) with `through`, the id of the last op it has taken (answers to
 its own questions aside), so a runner knows whether ops it sent since are still to come.
+An async tool result saved after a request's context snapshot wakes a follow-up, including
+when it arrives after `settled`; duplicate or cancelled results do not wake another. The
+wake is in-memory and is not recovered if the core stops before the follow-up.
+Responses replay keeps its chronological order. Chat Completions requires adjacent
+call/results, so a late result is projected as a clearly labeled, core-supplied user-role
+message after the intervening reply; the earlier call gets a pending placeholder.
 
 ## JavaScript API
 

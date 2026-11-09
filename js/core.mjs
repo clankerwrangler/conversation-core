@@ -198,6 +198,7 @@ export class Core extends EventEmitter {
         void this.#answer("credentials", event.id, () => this.#need("credentials")(event.provider, event));
         break;
       case "review_request": void this.#answer("review_request", event.id, async () => (await this.#handlers.review?.(event.request)) ?? {}); break;
+      case "turn_start": if (!this.#turn) this.#turnStarted(null); break;
       case "tool_call": if (!event.builtin) this.#runTool(event); break;
       case "cancel": for (const call of event.calls ?? []) this.#tools.get(call)?.controller.abort(); break;
       case "settled": this.#settled(event.through); break;

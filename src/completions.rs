@@ -265,7 +265,8 @@ fn normalize_id(id: &str, model: &Value) -> String {
 
 /// pi's transformMessages: images a model cannot take become a note; another model's
 /// thinking is dropped and its tool call ids normalized; failed replies are left out; a call
-/// without a result gets "No result provided".
+/// without a result gets a placeholder. A late result becomes a user message at
+/// its actual position: Chat Completions requires tool messages next to their call.
 pub fn transform(messages: &[Value], model: &Value) -> Vec<Value> {
     let images = accepts_images(model);
     let mut ids: HashMap<String, String> = HashMap::new();
@@ -343,7 +344,7 @@ pub fn transform(messages: &[Value], model: &Value) -> Vec<Value> {
         for call in pending.drain(..) {
             if !answered.contains(&text(&call, "id")) {
                 out.push(json!({"role": "toolResult", "toolCallId": call.get("id"), "toolName": call.get("name"),
-                    "content": [{"type": "text", "text": "No result provided"}], "isError": true, "timestamp": crate::provider::now_ms()}));
+                    "content": [{"type": "text", "text": if call.get("async") == Some(&Value::Bool(true)) { "Tool result is pending." } else { "No result provided" }}], "isError": true, "timestamp": crate::provider::now_ms()}));
             }
         }
         answered.clear();
@@ -370,8 +371,25 @@ pub fn transform(messages: &[Value], model: &Value) -> Vec<Value> {
                 out.push(m);
             }
             "toolResult" => {
-                answered.insert(text(&m, "toolCallId"));
-                out.push(m);
+                let id = text(&m, "toolCallId");
+                if pending.iter().any(|call| text(call, "id") == id) && !answered.contains(&id) {
+                    answered.insert(id);
+                    out.push(m);
+                } else {
+                    // The call was already closed before this result arrived. Chat
+                    // cannot accept an orphan tool message; retain chronological order.
+                    close(&mut out, &mut pending, &mut answered, &mut held);
+                    let mut content = vec![json!({"type": "text", "text": format!(
+                        "[Core-delivered late tool result{} for {} (call {}); not user-authored]:", if m.get("isError") == Some(&Value::Bool(true)) { " (error)" } else { "" }, text(&m, "toolName"), id)})];
+                    match m.get("content") {
+                        Some(Value::Array(blocks)) => content.extend(blocks.clone()),
+                        Some(Value::String(value)) => {
+                            content.push(json!({"type": "text", "text": value}))
+                        }
+                        _ => {}
+                    }
+                    out.push(json!({"role": "user", "content": content, "timestamp": m.get("timestamp")}));
+                }
             }
             "system" if !pending.is_empty() => held.push(m),
             "user" => {

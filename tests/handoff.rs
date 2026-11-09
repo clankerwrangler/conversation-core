@@ -483,24 +483,218 @@ fn a_drop_after_a_saved_call_keeps_it_and_continues() {
 }
 
 #[test]
-fn async_calls_do_not_hold_the_next_request() {
+fn async_result_after_settle_wakes_one_follow_up() {
     let (base, server) = server(vec![
         vec![async_call("c1"), done()],
         vec![text("working on it"), done()],
+        vec![text("late result received"), done()],
     ]);
     let d = dir();
     let mut core = Core::start(&d, &base);
     core.op(json!({"op": "send", "input": {"text": "go"}}));
     assert_eq!(core.next()["async"], true);
-    core.until("turn_end");
-    core.result("c1|fc_c1", "late");
+    core.until("settled");
+    core.result("c1|fc_c1", "late-output");
+    core.until("settled");
+    // A duplicate result must not wake another turn or change the saved outcome.
+    core.result("c1|fc_c1", "duplicate");
     let ctx = core.context();
     assert_eq!(
         roles(&ctx),
-        ["user", "assistant", "assistant", "toolResult"],
-        "the late result is appended when it arrives"
+        ["user", "assistant", "assistant", "toolResult", "assistant"]
     );
-    server.join().unwrap();
+    assert_eq!(ctx[3]["content"][0]["text"], "late-output");
+    let bodies = server.join().unwrap();
+    let input = bodies[2]["input"].as_array().unwrap();
+    let call = input
+        .iter()
+        .position(|x| x["type"] == "function_call")
+        .unwrap();
+    let interim = input
+        .iter()
+        .position(|x| x["role"] == "assistant" && x.to_string().contains("working on it"))
+        .unwrap();
+    let results: Vec<_> = input
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x["type"] == "function_call_output")
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert!(call < interim && interim < results[0].0);
+    assert_eq!(results[0].1["output"], "late-output");
+    core.stop();
+}
+
+#[test]
+fn async_result_during_a_stream_wakes_follow_up_if_snapshot_missed_it() {
+    let (base, server) = server(vec![
+        vec![async_call("c1"), done()],
+        vec![Step::Pause(500), text("working on it"), done()],
+        vec![text("late result received"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.show_responses = true;
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    core.until("tool_call");
+    core.until("provider_response"); // second request has already captured its context
+    core.result("c1|fc_c1", "busy-output");
+    core.until("settled");
+    let bodies = server.join().unwrap();
+    assert!(!bodies[1].to_string().contains("busy-output"));
+    assert_eq!(
+        bodies[2]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["type"] == "function_call_output" && x["output"] == "busy-output")
+            .count(),
+        1
+    );
+    assert_eq!(
+        roles(&core.context()),
+        ["user", "assistant", "toolResult", "assistant", "assistant"]
+    );
+    core.stop();
+}
+
+#[test]
+fn async_result_captured_by_next_request_does_not_wake_an_extra_turn() {
+    let (base, server) = server(vec![
+        vec![async_call("c1"), Step::Pause(500), done()],
+        vec![text("got it"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    core.until("tool_call");
+    core.result("c1|fc_c1", "early-output");
+    core.until("settled");
+    let bodies = server.join().unwrap();
+    assert_eq!(
+        bodies[1]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["type"] == "function_call_output" && x["output"] == "early-output")
+            .count(),
+        1
+    );
+    assert_eq!(
+        roles(&core.context()),
+        ["user", "assistant", "toolResult", "assistant"]
+    );
+    core.stop();
+}
+
+#[test]
+fn late_async_builtin_result_wakes_follow_up() {
+    let builtin = item_done(
+        json!({"type": "function_call", "id": "fc_c1", "call_id": "c1", "name": "bash",
+        "arguments": json!({"command": "sleep 1; printf builtin-late"}).to_string(), "async": true}),
+    );
+    let (base, server) = server(vec![
+        vec![builtin, done()],
+        vec![text("working"), done()],
+        vec![text("received"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    assert_eq!(core.until("tool_call")["builtin"], true);
+    core.until("settled");
+    assert_eq!(
+        core.until("tool_result")["result"]["content"][0]["text"],
+        "builtin-late"
+    );
+    core.until("settled");
+    let bodies = server.join().unwrap();
+    assert_eq!(
+        bodies[2]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["type"] == "function_call_output" && x["output"] == "builtin-late")
+            .count(),
+        1
+    );
+    core.stop();
+}
+
+#[test]
+fn aborted_async_call_ignores_late_result_without_waking() {
+    let (base, _server) = server(vec![vec![async_call("c1"), Step::Pause(500), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    core.until("tool_call");
+    core.op(json!({"op": "abort"}));
+    assert_eq!(core.until("cancel")["calls"], json!(["c1|fc_c1"]));
+    assert_eq!(core.until("turn_end")["stopReason"], "aborted");
+    core.until("settled");
+    core.result("c1|fc_c1", "must-not-appear");
+    let ctx = core.context();
+    assert_eq!(roles(&ctx), ["user", "assistant", "toolResult"]);
+    assert_eq!(ctx[2]["content"][0]["text"], "Cancelled.");
+    core.stop();
+}
+
+#[test]
+fn abort_suppresses_wake_for_an_already_saved_async_result() {
+    let (base, _server) = server(vec![vec![async_call("c1"), Step::Pause(500), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    core.until("tool_call");
+    core.result("c1|fc_c1", "completed-before-abort");
+    core.op(json!({"op": "record", "id": "barrier", "ns": "test", "data": {}}));
+    core.until("recorded");
+    core.op(json!({"op": "abort"}));
+    assert_eq!(core.until("turn_end")["stopReason"], "aborted");
+    core.until("settled");
+    let ctx = core.context();
+    assert_eq!(roles(&ctx), ["user", "assistant", "toolResult"]);
+    assert_eq!(ctx[2]["content"][0]["text"], "completed-before-abort");
+    core.stop();
+}
+
+#[test]
+fn late_async_result_after_switch_to_chat_has_valid_order() {
+    let (base, server) = server(vec![
+        vec![async_call("c1"), done()],
+        vec![text("working on it"), done()],
+        vec![Step::Event(
+            json!({"choices": [{"delta": {"content": "received"}, "finish_reason": "stop"}]}),
+        )],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    core.until("tool_call");
+    core.until("settled");
+    core.extra = json!({"model": {"api": "openai-completions"}});
+    core.result("c1|fc_c1", "chat-late-output");
+    core.until("settled");
+    let bodies = server.join().unwrap();
+    let messages = bodies[2]["messages"].as_array().unwrap();
+    let call = messages
+        .iter()
+        .position(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+        .unwrap();
+    assert_eq!(messages[call + 1]["role"], "tool");
+    let interim = messages
+        .iter()
+        .position(|m| m["role"] == "assistant" && m.to_string().contains("working on it"))
+        .unwrap();
+    let actual: Vec<_> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.to_string().contains("chat-late-output"))
+        .collect();
+    assert_eq!(actual.len(), 1);
+    assert!(call + 1 < interim && interim < actual[0].0);
+    assert_eq!(actual[0].1["role"], "user");
+    assert!(actual[0].1.to_string().contains("not user-authored"));
     core.stop();
 }
 

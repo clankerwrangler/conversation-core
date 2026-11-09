@@ -117,6 +117,8 @@ struct Core {
     seen: Value,
     /// A turn-starting op was handled since the last `settled`.
     unsettled: bool,
+    /// An async result was saved after the last request captured its context.
+    async_result_pending: bool,
 }
 
 /// Where the core keeps what it fetches and what it is signed in with.
@@ -196,12 +198,23 @@ pub fn run(
         auth_path: paths.auth,
         seen: Value::Null,
         unsettled: false,
+        async_result_pending: false,
     };
-    while let Some(op) = core.next_idle_op() {
-        if let Err(err) = core.idle(&op) {
-            emit(
-                json!({"ev": "error", "id": op.get("id"), "op": op.get("op"), "error": err.to_string()}),
-            );
+    while let Some(msg) = core.next_idle_op() {
+        match msg {
+            Msg::Op(op) => {
+                if let Err(err) = core.idle(&op) {
+                    emit(
+                        json!({"ev": "error", "id": op.get("id"), "op": op.get("op"), "error": err.to_string()}),
+                    );
+                }
+            }
+            Msg::Builtin(..) => {
+                if let Err(err) = core.wake_for_async_result() {
+                    emit(json!({"ev": "error", "error": err.to_string()}));
+                }
+            }
+            _ => unreachable!(),
         }
         // pi's agent_settled: turns are over and nothing taken is waiting. `through` names
         // the last op taken, so a runner knows whether ops it sent since are still to come.
@@ -303,14 +316,17 @@ impl Core {
         }
     }
 
-    fn next_idle_op(&mut self) -> Option<Value> {
+    fn next_idle_op(&mut self) -> Option<Msg> {
         if let Some(op) = self.queued.pop_front() {
-            return Some(op);
+            return Some(Msg::Op(op));
         }
         loop {
             match self.recv() {
-                Ok(Msg::Op(op)) => return Some(op),
+                Ok(msg @ Msg::Op(_)) => return Some(msg),
                 Ok(Msg::Closed) => return None,
+                Ok(msg @ Msg::Builtin(..)) if self.async_result_pending && !self.closed => {
+                    return Some(msg);
+                }
                 Ok(_) => continue, // a stale reply after an abort
                 Err(err) => emit(json!({"ev": "error", "error": err.to_string()})),
             }
@@ -520,7 +536,7 @@ impl Core {
     fn run_turns(&mut self, mut start: Option<Value>) -> Result<()> {
         loop {
             let finished = self.turn(start.take())?;
-            let wake = finished && self.injected.iter().any(wakes);
+            let wake = finished && (self.async_result_pending || self.injected.iter().any(wakes));
             self.flush_injected(true)?;
             if !wake {
                 return Ok(());
@@ -550,7 +566,10 @@ impl Core {
                 }
                 Ok(())
             }
-            Some("tool_result") => self.save_result(op),
+            Some("tool_result") => {
+                self.save_result(op)?;
+                self.wake_for_async_result()
+            }
             Some("abort") => Ok(()),
             Some("context") => self
                 .session
@@ -567,6 +586,14 @@ impl Core {
             },
             other => Err(Error::Format(format!("unknown op {other:?}"))),
         }
+    }
+
+    fn wake_for_async_result(&mut self) -> Result<()> {
+        if self.async_result_pending {
+            self.unsettled = true;
+            self.run_turns(None)?;
+        }
+        Ok(())
     }
 
     /// Handle an op that arrives mid-turn. Returns true on abort.
@@ -663,6 +690,9 @@ impl Core {
             message["details"] = details.clone();
         }
         self.session.append("tool", &message)?;
+        if call.is_async {
+            self.async_result_pending = true;
+        }
         if builtin {
             emit(json!({"ev": "tool_result", "call": id, "result": result}));
         }
@@ -757,6 +787,7 @@ impl Core {
 
     /// Cancel every unfinished call (async ones too) and close an open reply.
     fn abort(&mut self, open: Option<(u64, &[Value])>) -> Result<()> {
+        self.async_result_pending = false;
         let unfinished: Vec<String> = self
             .calls
             .iter()
@@ -823,6 +854,9 @@ impl Core {
         context_file::publish(&self.session)?;
         let (refs, from_checkpoint) = self.session.context_parts()?;
         let context = self.session.resolve(&refs)?;
+        // This snapshot contains all results saved so far. Later results must wake
+        // a further request, even if they arrive while this one is preparing.
+        self.async_result_pending = false;
         self.requests += 1;
         let id = format!("r{}", self.requests);
         // The model and reasoning last chosen with set_model, for the runner to use.

@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { Core, CoreError } from "./core.mjs";
+import { once } from "node:events";
 
 const BIN = process.env.CORE_BIN ?? "core";
 
@@ -144,4 +145,27 @@ test("a failing prepare handler aborts the turn instead of hanging it", async (t
   assert.deepEqual(failures, ["prepared"]);
   assert.equal(p.bodies.length, 0);
   await core.close(); p.close();
+});
+
+test("an autonomous late-result turn reports busy and idle", async (t) => {
+  const background = { ...call("c1", "add", {}), item: { ...call("c1", "add", {}).item, async: true } };
+  const p = await provider([[background, done], [text("working"), done], [{ pause: 200 }, text("got result"), done]]);
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const core = start(p.base, {
+    prepare: async () => ({ model: { api: "openai-responses", provider: "test", id: "m", baseUrl: p.base }, tools: [ADD] }),
+    tool: async () => { await gate; return { content: [{ type: "text", text: "late-output" }] }; },
+  }, t, p);
+  core.send("go");
+  await core.idle();
+  assert.equal(core.busy, false);
+  const started = once(core, "turn_start");
+  release();
+  await started;
+  assert.equal(core.busy, true);
+  await core.idle();
+  assert.equal(core.busy, false);
+  const outputs = p.bodies[2].input.filter((item) => item.type === "function_call_output");
+  assert.equal(outputs.length, 1);
+  assert.equal(outputs[0].output, "late-output");
 });
