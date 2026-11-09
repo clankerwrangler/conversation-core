@@ -13,11 +13,12 @@ mod provider;
 mod responses;
 mod store;
 mod tools;
+mod usage;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "core run <session-dir> [--no-tool <name>]... [--models <file>] [--agent-dir <dir>] [--skills <path>]... | core context <session-dir> | core input <session-dir> <api> <provider> <model> | core referenced <session-dir> | core history <session-dir> <from> <to> | core tool <name> <arguments-json> | core prompt [--agent-dir <dir>] [--skills <path>]... [--tool <name>]...";
+const USAGE: &str = "core run <session-dir> [--no-tool <name>]... [--models <file>] [--agent-dir <dir>] [--skills <path>]... | core context <session-dir> | core input <session-dir> <api> <provider> <model> | core referenced <session-dir> | core history <session-dir> <from> <to> | core tool <name> <arguments-json> | core usage <provider> [--auth <file>] | core prompt [--agent-dir <dir>] [--skills <path>]... [--tool <name>]...";
 
 #[derive(Default)]
 struct Flags {
@@ -82,11 +83,29 @@ fn main() -> ExitCode {
             }
         };
     }
-    // Sign-in from a terminal: `core login <provider> [device|browser|key] [--auth <file>]`.
+    // A provider's remaining usage, read with the core's own sign-in, as one JSON object.
+    if let [_, cmd, provider, rest @ ..] = args.as_slice()
+        && cmd == "usage"
+    {
+        let Some(f) = flags(rest, false) else {
+            eprintln!("error: usage: core usage <provider> [--auth <file>]");
+            return ExitCode::FAILURE;
+        };
+        let path = f.auth.unwrap_or_else(auth::default_path);
+        println!("{}", usage::usage(&path, provider, provider::now_ms()));
+        return ExitCode::SUCCESS;
+    }
+    // Sign-in from a terminal: `core login <provider> [device|browser|key] [--auth <file>] [--json]`.
     // A pasted address or API key is read from standard input, never taken as an argument.
+    // With --json each step is one JSON line on standard output, for a program to follow:
+    // {"step":"device_code","url","code","expiresIn"} | {"step":"open_and_paste","url"},
+    // then {"done":<what was saved>} or {"error":<message>}.
     if let [_, cmd, provider, rest @ ..] = args.as_slice()
         && (cmd == "login" || cmd == "logout")
     {
+        let json_steps = rest.iter().any(|a| a == "--json");
+        let rest: Vec<String> = rest.iter().filter(|a| *a != "--json").cloned().collect();
+        let rest = rest.as_slice();
         let (method, rest) = match rest {
             [m, rest @ ..] if !m.starts_with("--") => (Some(m.as_str()), rest),
             _ => (None, rest),
@@ -131,11 +150,38 @@ fn main() -> ExitCode {
                 .filter(|s| !s.is_empty())
         };
         let key = if method == "key" {
-            eprintln!("Paste the API key, then press Enter:");
+            if !json_steps {
+                eprintln!("Paste the API key, then press Enter:");
+            }
             line()
         } else {
             None
         };
+        if json_steps {
+            let show = |step: auth::Step| {
+                let line = match step {
+                    auth::Step::DeviceCode {
+                        url,
+                        code,
+                        expires_in,
+                    } => {
+                        serde_json::json!({"step": "device_code", "url": url, "code": code, "expiresIn": expires_in})
+                    }
+                    auth::Step::OpenAndPaste { url } => {
+                        serde_json::json!({"step": "open_and_paste", "url": url})
+                    }
+                };
+                println!("{line}");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            };
+            let (outcome, code) =
+                match auth::login(&path, provider, method, key.as_deref(), &show, &line) {
+                    Ok(done) => (serde_json::json!({"done": done}), ExitCode::SUCCESS),
+                    Err(e) => (serde_json::json!({"error": e}), ExitCode::FAILURE),
+                };
+            println!("{outcome}");
+            return code;
+        }
         let show = |step: auth::Step| match step {
             auth::Step::DeviceCode {
                 url,

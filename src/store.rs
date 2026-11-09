@@ -860,6 +860,11 @@ pub fn now_iso() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0) as i64;
+    iso_from_ms(ms)
+}
+
+/// A time in milliseconds since 1970 as RFC 3339 UTC with milliseconds.
+pub fn iso_from_ms(ms: i64) -> String {
     let (secs, millis) = (ms.div_euclid(1000), ms.rem_euclid(1000));
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     // Civil-from-days (Howard Hinnant).
