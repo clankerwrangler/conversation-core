@@ -1052,6 +1052,23 @@ fn the_runner_can_review_the_exact_request() {
 }
 
 #[test]
+fn body_only_review_never_sends_auth_headers_to_the_runner() {
+    let (base, server) = server(vec![vec![text("ok"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.extra = json!({"reviewRequest": "body"});
+    core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    let review = core.until("review_request");
+    assert!(review["request"].get("headers").is_none());
+    assert!(review["request"].get("url").is_none());
+    assert_eq!(review["request"]["body"]["stream"], true);
+    core.op(json!({"op": "review_request", "id": review["id"]}));
+    core.until("turn_end");
+    assert_eq!(server.join().unwrap().len(), 1);
+    core.stop();
+}
+
+#[test]
 fn reasoning_levels_and_fast_mode_reach_the_request_as_pi_sends_them() {
     let (base, server) = server(vec![vec![text("a"), done()], vec![text("b"), done()]]);
     let d = dir();

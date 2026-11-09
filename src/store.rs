@@ -304,6 +304,148 @@ impl Session {
         Ok(crate::entries::entries(&records, to))
     }
 
+    /// Project fields from matching message entries without loading their content payloads.
+    /// The selection is generic: exact top-level message matches, top-level fields and
+    /// selected `details` fields. Payload files are scanned once, one line at a time.
+    pub fn projected_entries(&self, from: u64, to: u64, select: &Value) -> Result<Vec<Value>> {
+        use std::io::BufRead;
+        let criteria = select
+            .get("where")
+            .and_then(Value::as_object)
+            .ok_or_else(|| Error::Format("history selection needs where".into()))?;
+        if criteria.len() > 16 || criteria.values().any(|v| v.is_array() || v.is_object()) {
+            return Err(Error::Format("invalid history selection where".into()));
+        }
+        let names = |key: &str| -> Result<Vec<String>> {
+            let values = select
+                .get(key)
+                .and_then(Value::as_array)
+                .ok_or_else(|| Error::Format(format!("history selection needs {key}")))?;
+            if values.len() > 32 {
+                return Err(Error::Format(format!("too many history {key}")));
+            }
+            values
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .filter(|s| !s.is_empty() && s.len() <= 128)
+                        .map(str::to_string)
+                        .ok_or_else(|| Error::Format(format!("invalid history {key}")))
+                })
+                .collect()
+        };
+        let fields = names("fields")?;
+        let detail_fields = names("details")?;
+        let pick_details = |value: &Value| -> Value {
+            let mut out = Map::new();
+            for field in &detail_fields {
+                if let Some((outer, inner)) = field.split_once('.') {
+                    if inner.contains('.') || outer.is_empty() || inner.is_empty() {
+                        continue;
+                    }
+                    if let Some(value) = value.get(outer).and_then(|nested| nested.get(inner)) {
+                        let nested = out
+                            .entry(outer.to_string())
+                            .or_insert_with(|| Value::Object(Map::new()));
+                        if let Some(nested) = nested.as_object_mut() {
+                            nested.insert(inner.to_string(), value.clone());
+                        }
+                    }
+                } else if let Some(value) = value.get(field) {
+                    out.insert(field.clone(), value.clone());
+                }
+            }
+            Value::Object(out)
+        };
+        let records = self.history(from, u64::MAX, false)?;
+        let entries = crate::entries::entries(&records, to);
+        let mut selected = Vec::new();
+        // Each payload file is read once; only requested detail values are retained.
+        let mut needed: HashMap<String, HashMap<String, Vec<usize>>> = HashMap::new();
+        for mut entry in entries {
+            let Some(message) = entry.get("message").and_then(Value::as_object) else {
+                continue;
+            };
+            if !criteria
+                .iter()
+                .all(|(key, value)| message.get(key) == Some(value))
+            {
+                continue;
+            }
+            let mut projected = Map::new();
+            for field in &fields {
+                if let Some(value) = message.get(field) {
+                    projected.insert(field.clone(), value.clone());
+                }
+            }
+            if !detail_fields.is_empty()
+                && let Some(details) = message.get("details")
+            {
+                if let Some(reference) = details.get("$ref") {
+                    let file = reference
+                        .get("file")
+                        .and_then(Value::as_str)
+                        .filter(|f| side_file_path(f))
+                        .ok_or_else(|| Error::Format("invalid history reference".into()))?;
+                    let key = reference
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| Error::Format("invalid history reference key".into()))?;
+                    needed
+                        .entry(file.to_string())
+                        .or_default()
+                        .entry(key.to_string())
+                        .or_default()
+                        .push(selected.len());
+                } else {
+                    projected.insert("details".into(), pick_details(details));
+                }
+            }
+            entry["message"] = Value::Object(projected);
+            selected.push(entry);
+        }
+        for (file, mut keys) in needed {
+            let path = self.dir.join(&file);
+            match fs::File::open(&path) {
+                Ok(input) => {
+                    let mut reader = std::io::BufReader::new(input);
+                    let mut line = String::new();
+                    while !keys.is_empty() {
+                        line.clear();
+                        if reader
+                            .read_line(&mut line)
+                            .map_err(|e| Error::Io(path.clone(), e))?
+                            == 0
+                        {
+                            break;
+                        }
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let value: Value = serde_json::from_str(&line)?;
+                        let Some(key) = value.get("key").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        if let Some(indexes) = keys.remove(key) {
+                            let details = pick_details(value.get("v").unwrap_or(&Value::Null));
+                            for index in indexes {
+                                selected[index]["message"]["details"] = details.clone();
+                            }
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::Io(path, error)),
+            }
+            for indexes in keys.into_values() {
+                for index in indexes {
+                    selected[index]["expired"] = Value::Bool(true);
+                }
+            }
+        }
+        Ok(selected)
+    }
+
     /// Replies opened but never closed (a crash mid-reply), oldest first.
     pub fn unfinished_replies(&self) -> Result<Vec<u64>> {
         let mut open: Vec<u64> = Vec::new();
@@ -1061,6 +1203,69 @@ mod tests {
 
     fn context(dir: &Path) -> Vec<Value> {
         Session::open(dir).unwrap().context().unwrap()
+    }
+
+    #[test]
+    fn projected_history_returns_only_requested_details_and_marks_missing_payloads() {
+        let dir = session(&[
+            (
+                "log/000001.jsonl",
+                vec![
+                    json!({"n":1,"k":"chunk"}),
+                    json!({"n":2,"k":"tool","m":{"role":"toolResult","toolCallId":"a", "toolName":"example",
+                    "content":{"$ref":{"f":"payload","k":"2.0"}}, "details":{"$ref":{"f":"payload","k":"2.1"}},"isError":false}}),
+                    json!({"n":3,"k":"tool","m":{"role":"toolResult","toolCallId":"b","toolName":"other",
+                    "details":{"$ref":{"f":"payload","k":"3.1"}}}}),
+                ],
+            ),
+            (
+                "log/000001.payload.jsonl",
+                vec![
+                    json!({"key":"2.0","v":[{"type":"text","text":"large output"}]}),
+                    json!({"key":"2.1","v":{"identity":{"value":"saved", "opaque":"private body"}, "large":"private body"}}),
+                    json!({"key":"3.1","v":{"identity":"other"}}),
+                ],
+            ),
+            (
+                "log/000002.jsonl",
+                vec![
+                    json!({"n":4,"k":"chunk"}),
+                    json!({"n":5,"k":"tool","m":{"role":"toolResult","toolCallId":"c","toolName":"example",
+                    "details":{"$ref":{"f":"payload","k":"5.1"}},"isError":false}}),
+                ],
+            ),
+            (
+                "log/000002.payload.jsonl",
+                vec![json!({"key":"5.1","v":{"identity":{"value":"new"}}})],
+            ),
+        ]);
+        let session = Session::open(&dir).unwrap();
+        let select = json!({"where":{"role":"toolResult","toolName":"example"},
+            "fields":["role","toolCallId","toolName","isError"], "details":["identity.value"]});
+        let got = session.projected_entries(1, u64::MAX, &select).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1]["message"]["details"]["identity"]["value"], "new");
+        assert_eq!(
+            got[0]["message"],
+            json!({"role":"toolResult","toolCallId":"a","toolName":"example",
+            "isError":false,"details":{"identity":{"value":"saved"}}})
+        );
+        assert!(
+            !serde_json::to_string(&got)
+                .unwrap()
+                .contains("large output")
+        );
+        assert!(
+            !serde_json::to_string(&got)
+                .unwrap()
+                .contains("private body")
+        );
+        fs::remove_file(dir.join("log/000001.payload.jsonl")).unwrap();
+        let expired = session.projected_entries(1, u64::MAX, &select).unwrap();
+        assert_eq!(expired[0]["expired"], true);
+        assert!(expired[0]["message"].get("details").is_none());
+        assert_eq!(expired[1]["message"]["details"]["identity"]["value"], "new");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

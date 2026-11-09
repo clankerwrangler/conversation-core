@@ -355,7 +355,10 @@ impl Core {
                     None => self.session.current_start()?,
                 };
                 let to = num("to").unwrap_or(u64::MAX);
-                let entries = self.session.entries(from, to)?;
+                let entries = match op.get("select") {
+                    Some(select) => self.session.projected_entries(from, to, select)?,
+                    None => self.session.entries(from, to)?,
+                };
                 emit(json!({"ev": "history", "id": id, "entries": entries}));
             }
             // The models the core knows: the models file's, and OpenRouter's own list.
@@ -1004,8 +1007,15 @@ impl Core {
         }
         // pi's before_provider_request / before_provider_headers: the runner may review and
         // change the exact request (body and headers) before it is sent.
-        if prepared.get("reviewRequest") == Some(&Value::Bool(true)) {
-            emit(json!({"ev": "review_request", "id": id, "request": ready.view()}));
+        let review = prepared.get("reviewRequest");
+        if review == Some(&Value::Bool(true)) || review.and_then(Value::as_str) == Some("body") {
+            let mut request = ready.view();
+            if review.and_then(Value::as_str) == Some("body") {
+                let request = request.as_object_mut().expect("request is an object");
+                request.remove("headers");
+                request.remove("url");
+            }
+            emit(json!({"ev": "review_request", "id": id, "request": request}));
             let Some(reviewed) = self.answer("review_request", &id)? else {
                 self.abort(None)?;
                 return Ok(End::Aborted);

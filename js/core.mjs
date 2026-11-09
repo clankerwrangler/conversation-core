@@ -91,8 +91,8 @@ export class Core extends EventEmitter {
     return this.#request("set_model", { provider, model, reasoning }).then(({ model, reasoning }) => ({ model, reasoning }));
   }
   /** Complete history entries: the current chunk, or ids `from`..`to` (to continue: last id + 1). */
-  history({ from, to } = {}) {
-    return this.#request("history", { from, to }).then((event) => event.entries);
+  history({ from, to, select } = {}) {
+    return this.#request("history", { from, to, select }).then((event) => event.entries);
   }
   models(provider) { return this.#request("models", { provider }).then((event) => event.models); }
   /** One request outside the conversation, never saved (pi's completeSimple). */
