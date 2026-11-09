@@ -667,6 +667,35 @@ mod tests {
     }
 
     #[test]
+    fn supported_codex_async_survives_discovery() {
+        let dir = std::env::temp_dir().join(format!("core-async-catalog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let models = Models::parse(include_str!("../models.json")).unwrap();
+        let capability = |entries: &[Value], id: &str| {
+            entries.iter().find(|m| m["id"] == id).unwrap()["compat"]["supportsAsyncTools"].clone()
+        };
+        let shipped = list(&models, &dir, Some(CODEX), None);
+        for id in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"] {
+            assert_eq!(capability(&shipped, id), json!(true));
+        }
+        assert_ne!(capability(&shipped, "gpt-6-sol"), json!(true));
+        let discovered = codex_model(
+            &json!({"slug": "gpt-6.1-sol", "visibility": "list",
+            "context_window": 333333}),
+            CODEX_BASE,
+        )
+        .unwrap();
+        write_cache(&dir, CODEX, &[discovered], None).unwrap();
+        let refreshed = list(&models, &dir, Some(CODEX), None);
+        assert_eq!(capability(&refreshed, "gpt-6.1-sol"), json!(true));
+        assert_eq!(
+            refreshed.iter().find(|m| m["id"] == "gpt-6.1-sol").unwrap()["contextWindow"],
+            333333
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn the_runners_fields_win_and_other_providers_come_from_the_models_file() {
         let models = Models::parse(r#"{"models": {"gpt-x": {"provider": "openai-codex", "contextWindow": 1, "api": "openai-codex-responses"}}}"#).unwrap();
         let dir = std::env::temp_dir().join("core-catalog-none");

@@ -224,7 +224,9 @@ Turns: `send`, `steer`, `abort`, `idle()`, `busy`, `addContext(message, {wake, d
 `models`, `complete`, `login` / `loginInput` / `logout` / `authStatus`. When idle:
 `context`, `checkpoint`. `close()` ends input and waits for the core to exit. A handler
 that throws aborts the turn (`handler_error`); a tool handler that throws gives an error
-result. Tests: `CORE_BIN=target/release/core node --test js/core.test.mjs`.
+result. `waitForToolHandlers(name)` waits for the matching handlers already running and for
+their returned results to be written to the core; it does not wait for a separately supplied
+pending result. Tests: `CORE_BIN=target/release/core node --test js/*.test.mjs`.
 
 ## Built-in tools
 

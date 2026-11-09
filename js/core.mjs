@@ -61,7 +61,7 @@ export class Core extends EventEmitter {
   /** Add a user message to the running turn at its next safe point (or start one when idle). */
   steer(input) { const id = this.#id(); this.#turnStarted(id); this.#write({ op: "steer", id, input: userInput(input) }); }
   /** Stop the running turn; unfinished tool calls are cancelled. */
-  abort() { for (const run of this.#tools.values()) run.abort(); this.#write({ op: "abort", id: this.#id() }); }
+  abort() { for (const run of this.#tools.values()) run.controller.abort(); this.#write({ op: "abort", id: this.#id() }); }
   /** Resolves once the core has settled after every turn-starting op sent so far. */
   idle() { return this.#turn?.promise ?? Promise.resolve(); }
   get busy() { return this.#turn !== null; }
@@ -71,6 +71,12 @@ export class Core extends EventEmitter {
     return this.#request("add_context", { message, ...(wake === false ? { wake } : {}), ...(deliver ? { deliver } : {}) },
       (id) => { if (wake !== false) this.#turnStarted(id); })
       .then((event) => event.n);
+  }
+
+  /** Wait for earlier handlers of this tool to return and write any results. */
+  async waitForToolHandlers(name) {
+    const earlier = [...this.#tools.values()].filter((run) => run.name === name).map((run) => run.done);
+    await Promise.all(earlier);
   }
 
   /** Give the result of an async runner call (normal calls return it from the `tool` handler). */
@@ -172,7 +178,7 @@ export class Core extends EventEmitter {
   #failAll(error) {
     for (const [id, waiter] of this.#pending) { this.#pending.delete(id); waiter.reject(error); }
     for (const queue of this.#ordered.values()) for (const waiter of queue.splice(0)) waiter.reject(error);
-    for (const run of this.#tools.values()) run.abort();
+    for (const run of this.#tools.values()) run.controller.abort();
     const turn = this.#turn; this.#turn = null; turn?.resolve();
   }
 
@@ -193,7 +199,7 @@ export class Core extends EventEmitter {
         break;
       case "review_request": void this.#answer("review_request", event.id, async () => (await this.#handlers.review?.(event.request)) ?? {}); break;
       case "tool_call": if (!event.builtin) this.#runTool(event); break;
-      case "cancel": for (const call of event.calls ?? []) this.#tools.get(call)?.abort(); break;
+      case "cancel": for (const call of event.calls ?? []) this.#tools.get(call)?.controller.abort(); break;
       case "settled": this.#settled(event.through); break;
       case "error":
         if (event.id != null) this.#rejectId(event.id, new CoreError(event.error, event.op));
@@ -237,7 +243,9 @@ export class Core extends EventEmitter {
 
   async #runTool(event) {
     const controller = new AbortController();
-    this.#tools.set(event.call, controller);
+    let finished;
+    const done = new Promise((resolve) => { finished = resolve; });
+    this.#tools.set(event.call, { controller, name: event.name, done });
     let result;
     try {
       const handler = this.#handlers.tool;
@@ -245,9 +253,12 @@ export class Core extends EventEmitter {
       result = await handler(event, controller.signal);
     } catch (error) {
       result = { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true };
-    } finally { this.#tools.delete(event.call); }
-    // A cancelled call already has its result ("Cancelled."); the core ignores a late one.
-    if (!controller.signal.aborted && result !== undefined) this.toolResult(event.call, result);
+    }
+    try {
+      // The pipe is FIFO: a waiting handler may answer only after this write.
+      // A cancelled call already has its result ("Cancelled.").
+      if (!controller.signal.aborted && result !== undefined) this.toolResult(event.call, result);
+    } finally { this.#tools.delete(event.call); finished(); }
   }
 }
 
