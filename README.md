@@ -131,6 +131,15 @@ sends `instructions` alone. Outside Codex the prompt is the first input message,
 role `developer` for a reasoning model (unless `compat.supportsDeveloperRole` is false),
 otherwise `system`.
 
+## One writer per session
+
+`core run` takes the session's `writer.lock` (an `flock`) before it reads or
+writes anything and holds it while it runs; a second core started on the same
+session stops at once with `another core is writing this session`. The operating
+system releases the lock when the core ends, also after a crash. `history`,
+`context` and `referenced` only read and never take it. Modeled in
+`specification/CoreWriterLock.tla`.
+
 ## Cleaning up old stored data
 
 Deleting old data is not the core's job. A cleanup must hold the session's

@@ -132,6 +132,8 @@ pub fn run(
     sources: prompt::Sources,
     paths: Paths,
 ) -> Result<()> {
+    // One writer per session, held for as long as this core runs.
+    let _writer = crate::store::lock_writer(dir)?;
     let session = if dir.join("meta.json").exists() {
         Session::open(dir)?
     } else {

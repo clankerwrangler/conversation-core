@@ -24,6 +24,8 @@ pub enum Error {
     Io(PathBuf, std::io::Error),
     Json(String),
     Format(String),
+    /// Another core process holds the session's writer lock.
+    Locked(PathBuf),
 }
 
 impl fmt::Display for Error {
@@ -33,6 +35,7 @@ impl fmt::Display for Error {
             Error::Io(p, e) => write!(f, "{}: {e}", p.display()),
             Error::Json(e) => write!(f, "json: {e}"),
             Error::Format(e) => write!(f, "format: {e}"),
+            Error::Locked(p) => write!(f, "{}: another core is writing this session", p.display()),
         }
     }
 }
@@ -47,6 +50,40 @@ type Result<T> = std::result::Result<T, Error>;
 
 /// Record kinds that are sent to the model.
 const MODEL_KINDS: [&str; 3] = ["user", "assistant", "tool"];
+
+/// The session's writer lock (`writer.lock`, specification/CoreWriterLock.tla): one core
+/// process at a time reads a session's tail and appends to it, so record numbers stay
+/// unique. Taken without waiting: a second core on the same session fails at once. The
+/// operating system releases it when the holder stops, even after a crash. Readers
+/// (`history`, `context`) never take it.
+pub struct WriterLock {
+    _file: fs::File,
+}
+
+/// Takes the writer lock of the session in `dir` (created if missing).
+pub fn lock_writer(dir: &Path) -> Result<WriterLock> {
+    use std::os::fd::AsRawFd;
+    fs::create_dir_all(dir).map_err(|e| Error::Io(dir.to_path_buf(), e))?;
+    let path = dir.join("writer.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| Error::Io(path.clone(), e))?;
+    loop {
+        // SAFETY: flock on a descriptor this function owns; released when the lock is dropped.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(WriterLock { _file: file });
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => return Err(Error::Locked(dir.to_path_buf())),
+            _ => return Err(Error::Io(path, e)),
+        }
+    }
+}
 
 pub struct Session {
     dir: PathBuf,

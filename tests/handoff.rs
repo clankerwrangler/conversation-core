@@ -326,6 +326,34 @@ fn roles(ctx: &[Value]) -> Vec<String> {
 }
 
 #[test]
+fn a_session_has_one_writing_core_at_a_time() {
+    let d = dir();
+    let mut first = Core::start(&d, "http://127.0.0.1:9");
+    first.op(json!({"op": "context"}));
+    first.until("context");
+    let second = Command::new(env!("CARGO_BIN_EXE_core"))
+        .args(["run", d.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        !second.status.success(),
+        "a second core on the same session stops at once"
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("another core is writing this session")
+    );
+    // A core that ends without closing (a crash) leaves the session free.
+    first.child.kill().unwrap();
+    first.child.wait().unwrap();
+    let mut third = Core::start(&d, "http://127.0.0.1:9");
+    third.op(json!({"op": "context"}));
+    third.until("context");
+    third.stop();
+}
+#[test]
 fn reply_text_is_saved_with_when_its_first_words_arrived() {
     let (base, server) = server(vec![vec![
         Step::Pause(400),
