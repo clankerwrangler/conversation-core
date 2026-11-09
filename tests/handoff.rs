@@ -438,6 +438,139 @@ fn a_call_is_saved_and_handed_off_before_the_reply_ends() {
 }
 
 #[test]
+fn repeated_completed_call_is_dispatched_and_saved_once() {
+    let marker = std::env::temp_dir().join(format!(
+        "core-dedup-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let args = json!({"command": format!("printf 'x\\n' >> {}", marker.display())});
+    let (base, server) = server(vec![
+        vec![
+            named_call("c1", "bash", args.clone()),
+            Step::Pause(400),
+            named_call("c1", "bash", args.clone()),
+            named_call("c2", "bash", args),
+            done(),
+        ],
+        vec![text("done"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    let mut calls = Vec::new();
+    loop {
+        let event = core.next();
+        if event["ev"] == "tool_call" {
+            calls.push(event["call"].as_str().unwrap().to_string());
+        }
+        if event["ev"] == "settled" {
+            break;
+        }
+    }
+    assert_eq!(calls, ["c1|fc_c1", "c2|fc_c2"]);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().lines().count(),
+        2,
+        "one side effect per distinct call, including when the duplicate follows completion"
+    );
+    let ctx = core.context();
+    let blocks: Vec<_> = ctx
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+        .filter(|b| b["type"] == "toolCall")
+        .collect();
+    assert_eq!(
+        blocks.len(),
+        2,
+        "the duplicate is not persisted as a second call"
+    );
+    let bodies = server.join().unwrap();
+    assert_eq!(
+        bodies[1]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["type"] == "function_call")
+            .count(),
+        2
+    );
+    let _ = std::fs::remove_file(marker);
+    core.stop();
+}
+
+#[test]
+fn repeated_runner_call_in_later_reply_is_not_handed_off_again() {
+    let (base, server) = server(vec![
+        vec![call("c1", json!({"a": 1})), done()],
+        vec![call("c1", json!({"a": 1})), text("continued"), done()],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    assert_eq!(core.until("tool_call")["call"], "c1|fc_c1");
+    core.result("c1|fc_c1", "done-once");
+    let mut dispatched = 0;
+    loop {
+        let event = core.next();
+        if event["ev"] == "tool_call" {
+            dispatched += 1;
+        }
+        if event["ev"] == "settled" {
+            break;
+        }
+    }
+    assert_eq!(dispatched, 0);
+    let ctx = core.context();
+    assert_eq!(ctx.iter().filter(|m| m["role"] == "toolResult").count(), 1);
+    assert_eq!(server.join().unwrap().len(), 2);
+    core.stop();
+}
+
+#[test]
+fn repeated_call_does_not_replace_the_running_cancellation_handle() {
+    let marker = std::env::temp_dir().join(format!(
+        "core-dedup-cancel-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let args = json!({"command": format!("sleep 1.5; touch {}", marker.display())});
+    let (base, _server) = server(vec![vec![
+        named_call("c1", "bash", args.clone()),
+        named_call("c1", "bash", args),
+        Step::Event(json!({"type": "response.output_text.delta", "delta": "barrier"})),
+        Step::Pause(3000),
+        done(),
+    ]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    core.until("tool_call");
+    loop {
+        let event = core
+            .events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("provider barrier");
+        if event["ev"] == "text_delta" && event["delta"] == "barrier" {
+            break;
+        }
+    }
+    core.op(json!({"op": "abort"}));
+    assert_eq!(core.until("cancel")["calls"], json!(["c1|fc_c1"]));
+    assert_eq!(core.until("turn_end")["stopReason"], "aborted");
+    std::thread::sleep(Duration::from_millis(2200));
+    assert!(
+        !marker.exists(),
+        "abort must cancel the original running action"
+    );
+    let ctx = core.context();
+    assert_eq!(ctx.iter().filter(|m| m["role"] == "toolResult").count(), 1);
+    let _ = std::fs::remove_file(marker);
+    core.stop();
+}
+
+#[test]
 fn a_drop_before_anything_is_saved_is_retried() {
     let (base, server) = server(vec![vec![Step::Drop], vec![text("hello"), done()]]);
     let d = dir();

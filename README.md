@@ -207,7 +207,9 @@ turn it does not end the turn. After turns, once nothing taken is waiting, the c
 its own questions aside), so a runner knows whether ops it sent since are still to come.
 An async tool result saved after a request's context snapshot wakes a follow-up, including
 when it arrives after `settled`; duplicate or cancelled results do not wake another. The
-wake is in-memory and is not recovered if the core stops before the follow-up.
+wake is in-memory and is not recovered if the core stops before the follow-up. During one
+core process, repeated provider call items with the same call identity are not saved or
+dispatched again.
 Responses replay keeps its chronological order. Chat Completions requires adjacent
 call/results, so a late result is projected as a clearly labeled, core-supplied user-role
 message after the intervening reply; the earlier call gets a pending placeholder.

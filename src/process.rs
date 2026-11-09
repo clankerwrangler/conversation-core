@@ -1176,6 +1176,21 @@ impl Core {
                 }
                 Piece::Block(mut block) => {
                     let is_call = block.get("type").and_then(Value::as_str) == Some("toolCall");
+                    let call_id = is_call.then(|| {
+                        block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    });
+                    // A repeated completed provider item is not a new action. The
+                    // existing call owns its result and cancellation handle.
+                    if call_id
+                        .as_ref()
+                        .is_some_and(|id| self.calls.contains_key(id))
+                    {
+                        continue;
+                    }
                     if block.get("type").and_then(Value::as_str) == Some("text") {
                         let started = text_starts.pop_front().unwrap_or_else(provider::now_ms);
                         block["startedAt"] = json!(started);
@@ -1198,11 +1213,7 @@ impl Core {
                                 )?;
                             }
                         }
-                        let id = block
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
+                        let id = call_id.expect("tool call has an id");
                         let name = block
                             .get("name")
                             .and_then(Value::as_str)
