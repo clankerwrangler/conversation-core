@@ -13,6 +13,7 @@ core context <session-dir>    print the context the next request would send
 core input <session-dir> <api> <provider> <model>   print the Responses request input
 core referenced <session-dir>   print the stored files the context and the latest two checkpoints refer to
 core tool <name> <arguments-json>   run one built-in tool in the current folder, print its result
+core usage <provider> [--auth <file>]   print the provider's remaining usage as JSON
 ```
 
 ## Where things are kept
@@ -63,7 +64,10 @@ Modeled in `specification/CredentialRefresh.tla`.
 - `core login openai-codex|grok-cli [device|browser]`, `core login openrouter [key|browser]`,
   `core logout <provider>`: from a terminal. Device sign-in prints a page and a code to
   approve; browser sign-in prints a page and waits for the address it ends on to be pasted;
-  an API key is read from standard input.
+  an API key is read from standard input. With `--json`, `core login <provider> device`,
+  for programs that run a sign-in for someone, prints one JSON object per line instead:
+  `{"step": "device_code", "url", "code", "expiresIn"}`, then `{"done": ...}` once the
+  sign-in is saved or `{"error": ...}`.
 - The same as ops: `{"op": "login", "id", "provider", "method", "key"?}` with `login` events
   (`step`: `device_code`, `open_and_paste`, `done`, `failed`), `{"op": "login_input", "id",
   "input"}` for the pasted address, `logout`, and `auth_status` (who is signed in, never the
@@ -98,6 +102,13 @@ models file; per million tokens, with `tiers` above an input size), then service
 pricing: flex half, priority double (Codex reports "default" for a priority request, which
 still counts as priority). Without rates the cost stays zero.
 
+`core usage <provider>` asks the provider how much of the account's allowance is left and
+prints `{"provider", "model": null, "status", "remaining"}`. `status` is `ready`,
+`sign_in_required` (no sign-in, or the provider refused it), `unavailable` (the question
+failed) or `unsupported` (a provider without a usage endpoint). For Codex, `remaining` is the
+most-used rate-limit window (`kind: "rate_limits"`); for Grok it is the weekly allowance
+with the plan (`kind: "weekly_allowance"`). It uses and renews the stored sign-in like a
+request does, and never prints credentials.
 ## Errors
 
 A reply that fails is saved as pi saves it (`stopReason: "error"`, never sent to the model
