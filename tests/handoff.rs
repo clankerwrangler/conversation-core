@@ -326,6 +326,38 @@ fn roles(ctx: &[Value]) -> Vec<String> {
 }
 
 #[test]
+fn reply_text_is_saved_with_when_its_first_words_arrived() {
+    let (base, server) = server(vec![vec![
+        Step::Pause(400),
+        Step::Event(
+            json!({"type": "response.output_text.delta", "item_id": "msg_1", "delta": "Hel"}),
+        ),
+        Step::Pause(400),
+        text("Hello"),
+        done(),
+    ]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    core.until("turn_end");
+    let ctx = core.context();
+    let reply = &ctx[1];
+    let began = reply["timestamp"].as_u64().unwrap();
+    let started = reply["content"][0]["startedAt"]
+        .as_u64()
+        .expect("the text keeps its start");
+    assert!(
+        started >= began + 300,
+        "not when the request began ({began}), but at the first words ({started})"
+    );
+    assert!(
+        started + 300 <= began + 800,
+        "not when the text finished ({started})"
+    );
+    server.join().unwrap();
+    core.stop();
+}
+#[test]
 fn a_call_is_saved_and_handed_off_before_the_reply_ends() {
     let (base, server) = server(vec![
         vec![

@@ -1079,6 +1079,10 @@ impl Core {
         let mut has_calls = false;
         // The provider's own error, as safe fixed tokens (the harness's nativeProviderError).
         let mut provider_error: Option<Value> = None;
+        // When each text item's first words arrived, in order, for its saved block
+        // (`startedAt`): the reply's timestamp is when the request began.
+        let mut text_items: HashSet<Option<String>> = HashSet::new();
+        let mut text_starts: VecDeque<u64> = VecDeque::new();
         // The provider's last sign of life: silence longer than `stall` fails the attempt.
         let mut heard = Instant::now();
         loop {
@@ -1112,6 +1116,9 @@ impl Core {
                 // `item`: the provider's id for the text item (Responses), which the saved
                 // text keeps in its signature, so a runner can name the live text as saved.
                 Piece::Text(delta, item) => {
+                    if text_items.insert(item.clone()) {
+                        text_starts.push_back(provider::now_ms());
+                    }
                     let mut ev = json!({"ev": "text_delta", "attempt": tag, "delta": delta});
                     if let Some(item) = item {
                         ev["item"] = Value::String(item);
@@ -1121,8 +1128,12 @@ impl Core {
                 Piece::Reasoning(delta) => {
                     emit(json!({"ev": "reasoning_delta", "attempt": tag, "delta": delta}))
                 }
-                Piece::Block(block) => {
+                Piece::Block(mut block) => {
                     let is_call = block.get("type").and_then(Value::as_str) == Some("toolCall");
+                    if block.get("type").and_then(Value::as_str) == Some("text") {
+                        let started = text_starts.pop_front().unwrap_or_else(provider::now_ms);
+                        block["startedAt"] = json!(started);
+                    }
                     unsaved.push(block.clone());
                     if is_call {
                         has_calls = true;
