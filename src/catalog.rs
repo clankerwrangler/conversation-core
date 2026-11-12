@@ -560,7 +560,14 @@ fn resolve_listed(models: &Models, dir: &Path, requested: &Value, key: Option<&s
 }
 
 /// Every model the core knows for a provider (all providers when None).
-pub fn list(models: &Models, dir: &Path, provider: Option<&str>, key: Option<&str>) -> Vec<Value> {
+/// Every model the core knows, or one provider's. `key` gives a provider's sign-in token,
+/// used when its list must be fetched.
+pub fn list(
+    models: &Models,
+    dir: &Path,
+    provider: Option<&str>,
+    key: &dyn Fn(&str) -> Option<String>,
+) -> Vec<Value> {
     let mut providers: Vec<String> = models
         .all()
         .filter_map(|m| {
@@ -575,7 +582,7 @@ pub fn list(models: &Models, dir: &Path, provider: Option<&str>, key: Option<&st
     providers
         .into_iter()
         .filter(|p| provider.is_none_or(|w| w == p) && seen.insert(p.clone()))
-        .flat_map(|p| provider_models(models, dir, &p, None, key))
+        .flat_map(|p| provider_models(models, dir, &p, None, key(&p).as_deref()))
         .collect()
 }
 
@@ -647,7 +654,7 @@ mod tests {
                 .map(|m| m["id"].as_str().unwrap().to_string())
                 .collect::<Vec<_>>()
         };
-        let listed = list(&shipped, &dir, Some(CODEX), None);
+        let listed = list(&shipped, &dir, Some(CODEX), &|_| None);
         assert_eq!(ids(&listed), ["a", "gone", "new"]);
         assert_eq!(listed[0]["contextWindow"], 10, "the discovered value wins");
         assert_eq!(
@@ -674,7 +681,7 @@ mod tests {
         let capability = |entries: &[Value], id: &str| {
             entries.iter().find(|m| m["id"] == id).unwrap()["compat"]["supportsAsyncTools"].clone()
         };
-        let shipped = list(&models, &dir, Some(CODEX), None);
+        let shipped = list(&models, &dir, Some(CODEX), &|_| None);
         for id in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"] {
             assert_eq!(capability(&shipped, id), json!(true));
         }
@@ -686,7 +693,16 @@ mod tests {
         )
         .unwrap();
         write_cache(&dir, CODEX, &[discovered], None).unwrap();
-        let refreshed = list(&models, &dir, Some(CODEX), None);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let refreshed = list(&models, &dir, Some(CODEX), &|p| {
+            asked.borrow_mut().push(p.to_string());
+            None
+        });
+        assert_eq!(
+            *asked.borrow(),
+            [CODEX],
+            "the listed provider's own sign-in is asked for"
+        );
         assert_eq!(capability(&refreshed, "gpt-6.1-sol"), json!(true));
         assert_eq!(
             refreshed.iter().find(|m| m["id"] == "gpt-6.1-sol").unwrap()["contextWindow"],

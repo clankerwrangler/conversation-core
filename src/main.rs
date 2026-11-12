@@ -6,6 +6,7 @@ mod context_file;
 mod dirs;
 mod entries;
 mod grok;
+mod import;
 mod models;
 mod process;
 mod prompt;
@@ -18,7 +19,7 @@ mod usage;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "core run <session-dir> [--no-tool <name>]... [--models <file>] [--agent-dir <dir>] [--skills <path>]... | core context <session-dir> | core input <session-dir> <api> <provider> <model> | core referenced <session-dir> | core history <session-dir> <from> <to> | core tool <name> <arguments-json> | core usage <provider> [--auth <file>] | core prompt [--agent-dir <dir>] [--skills <path>]... [--tool <name>]...";
+const USAGE: &str = "core run <session-dir> [--no-tool <name>]... [--models <file>] [--agent-dir <dir>] [--skills <path>]... | core context <session-dir> | core input <session-dir> <api> <provider> <model> | core referenced <session-dir> | core import <new-session-dir> <id> < records | core history <session-dir> <from> <to> | core tool <name> <arguments-json> | core usage <provider> [--auth <file>] | core prompt [--agent-dir <dir>] [--skills <path>]... [--tool <name>]...";
 
 #[derive(Default)]
 struct Flags {
@@ -274,6 +275,11 @@ fn main() -> ExitCode {
                 let body = completions::body(&model, "", &messages, &[], "s", &reasoning);
                 serde_json::to_string(&body).map_err(store::Error::from)
             }),
+        // A new session from an older transcript: record lines on standard input (import.rs).
+        [_, cmd, dir, id] if cmd == "import" => {
+            import::import(Path::new(dir), id, std::io::stdin().lock())
+                .map(|last| serde_json::json!({"records": last}).to_string())
+        }
         [_, cmd, dir] if cmd == "referenced" => store::Session::open(Path::new(dir))
             .and_then(|session| session.referenced())
             .and_then(|files| serde_json::to_string(&files).map_err(store::Error::from)),

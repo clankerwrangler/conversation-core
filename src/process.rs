@@ -377,14 +377,24 @@ impl Core {
                 };
                 emit(json!({"ev": "history", "id": id, "entries": entries}));
             }
-            // The models the core knows: the models file's, and OpenRouter's own list.
+            // The models the core knows: the models file's, and the providers' own lists.
+            // A list that must be fetched uses the token the caller gave, else the
+            // provider's stored sign-in (none: that provider's list is not fetched).
             Some("models") => {
-                let list = catalog::list(
-                    &self.models,
-                    &self.catalog_dir,
-                    text("provider"),
-                    text("token"),
-                );
+                let wanted = text("provider");
+                let given = text("token");
+                let auth_path = &self.auth_path;
+                let key = |p: &str| -> Option<String> {
+                    if let Some(token) = given.filter(|_| wanted.is_none_or(|w| w == p)) {
+                        return Some(token.to_string());
+                    }
+                    let stored = auth::credentials(auth_path, p).ok().flatten()?;
+                    stored
+                        .get("token")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                };
+                let list = catalog::list(&self.models, &self.catalog_dir, wanted, &key);
                 emit(json!({"ev": "models", "id": id, "models": list}));
             }
             Some("complete") => {

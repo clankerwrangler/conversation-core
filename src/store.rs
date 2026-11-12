@@ -10,6 +10,8 @@
 //!
 //! A message in a record may contain `{"$ref": {"f": "payload"|"reasoning", "k": key}}`
 //! in place of a bulky value, and image blocks `{"type":"image","mimeType":..,"$img":sha}`.
+//! A tool result's images meant for the user stay in the record as `"keep"` beside its
+//! reference, so they outlive a payload file that a cleanup deletes.
 
 use base64::Engine;
 use serde_json::{Map, Value};
@@ -143,25 +145,54 @@ impl Session {
 
     fn append_record(&self, kind: &str, message: &Value, extra: Value) -> Result<u64> {
         let (chunk, last) = self.tail()?;
-        let n = last + 1;
+        self.write_record(chunk, last + 1, &now_iso(), kind, message, extra)?;
+        Ok(last + 1)
+    }
+
+    /// Record `n` of `chunk` with time `t`. `append` finds the position itself; an import
+    /// (`core import`) keeps it, since it writes many records in a row with their own times.
+    pub fn write_record(
+        &self,
+        chunk: u32,
+        n: u64,
+        t: &str,
+        kind: &str,
+        message: &Value,
+        extra: Value,
+    ) -> Result<()> {
         let mut sides: Vec<(&'static str, Value)> = Vec::new();
         let stored = self.split(chunk, n, message, &mut sides)?;
         for (file, line) in &sides {
             self.append_line(&self.log_path(chunk, Some(file)), line)?;
         }
-        let mut record = serde_json::json!({"n": n, "t": now_iso(), "k": kind, "m": stored});
+        let mut record = serde_json::json!({"n": n, "t": t, "k": kind, "m": stored});
         if let (Value::Object(r), Value::Object(e)) = (&mut record, extra) {
-            r.extend(e);
+            for (key, value) in e {
+                if !["n", "t", "k", "m"].contains(&key.as_str()) {
+                    r.insert(key, value);
+                }
+            }
         }
-        self.append_line(&self.log_path(chunk, None), &record)?;
-        Ok(n)
+        self.append_line(&self.log_path(chunk, None), &record)
     }
 
     /// A record the model never sees (`app` bookkeeping, `settings`): `{n, t, k, ...fields}`.
     pub fn append_entry(&self, kind: &str, fields: Value) -> Result<u64> {
         let (chunk, last) = self.tail()?;
-        let n = last + 1;
-        let mut record = serde_json::json!({"n": n, "t": now_iso(), "k": kind});
+        self.write_entry(chunk, last + 1, &now_iso(), kind, fields)?;
+        Ok(last + 1)
+    }
+
+    /// `append_entry` at a given position and time (see `write_record`).
+    pub fn write_entry(
+        &self,
+        chunk: u32,
+        n: u64,
+        t: &str,
+        kind: &str,
+        fields: Value,
+    ) -> Result<()> {
+        let mut record = serde_json::json!({"n": n, "t": t, "k": kind});
         if let (Value::Object(r), Value::Object(f)) = (&mut record, fields) {
             for (key, value) in f {
                 if !["n", "t", "k"].contains(&key.as_str()) {
@@ -169,8 +200,12 @@ impl Session {
                 }
             }
         }
-        self.append_line(&self.log_path(chunk, None), &record)?;
-        Ok(n)
+        self.append_line(&self.log_path(chunk, None), &record)
+    }
+
+    /// The current chunk and the highest record number in it.
+    pub fn position(&self) -> Result<(u32, u64)> {
+        self.tail()
     }
 
     /// A message injected by the runner (pi's custom message): a `user` record whose
@@ -230,6 +265,8 @@ impl Session {
         let mut resolver = Resolver {
             dir: self.dir.clone(),
             files: HashMap::new(),
+            expired: false,
+            lenient: true,
         };
         // Only the chunks that hold the range are read; a chunk's first line says where it starts.
         let numbers = self.chunk_numbers()?;
@@ -259,7 +296,13 @@ impl Session {
                 }
                 let mut r = qualify(number, record);
                 if resolve && let Some(m) = r.get("m").cloned() {
+                    resolver.expired = false;
                     match resolver.resolve(&m) {
+                        // Only the kept part (images meant for the user) is left.
+                        Ok(full) if resolver.expired => {
+                            r["m"] = full;
+                            r["expired"] = Value::Bool(true);
+                        }
                         Ok(full) => r["m"] = full,
                         Err(_) => r["expired"] = Value::Bool(true),
                     }
@@ -362,6 +405,8 @@ impl Session {
         let mut selected = Vec::new();
         // Each payload file is read once; only requested detail values are retained.
         let mut needed: HashMap<String, HashMap<String, Vec<usize>>> = HashMap::new();
+        // Detail fields a reference keeps in the record (see Resolver::resolve), by entry.
+        let mut kept: HashMap<usize, Map<String, Value>> = HashMap::new();
         for mut entry in entries {
             let Some(message) = entry.get("message").and_then(Value::as_object) else {
                 continue;
@@ -397,6 +442,9 @@ impl Session {
                         .entry(key.to_string())
                         .or_default()
                         .push(selected.len());
+                    if let Some(Value::Object(keep)) = details.get("keep") {
+                        kept.insert(selected.len(), keep.clone());
+                    }
                 } else {
                     projected.insert("details".into(), pick_details(details));
                 }
@@ -427,9 +475,15 @@ impl Session {
                             continue;
                         };
                         if let Some(indexes) = keys.remove(key) {
-                            let details = pick_details(value.get("v").unwrap_or(&Value::Null));
+                            let stored = value.get("v").cloned().unwrap_or(Value::Null);
                             for index in indexes {
-                                selected[index]["message"]["details"] = details.clone();
+                                let mut details = stored.clone();
+                                if let (Some(out), Some(keep)) =
+                                    (details.as_object_mut(), kept.get(&index))
+                                {
+                                    out.extend(keep.clone());
+                                }
+                                selected[index]["message"]["details"] = pick_details(&details);
                             }
                         }
                     }
@@ -440,6 +494,10 @@ impl Session {
             for indexes in keys.into_values() {
                 for index in indexes {
                     selected[index]["expired"] = Value::Bool(true);
+                    if let Some(keep) = kept.get(&index) {
+                        selected[index]["message"]["details"] =
+                            pick_details(&Value::Object(keep.clone()));
+                    }
                 }
             }
         }
@@ -487,6 +545,11 @@ impl Session {
     /// Order (specification/CoreCheckpoint.tla): content, marker, prune, seal.
     /// The caller writes checkpoints only when no tool call is pending.
     pub fn checkpoint(&self, messages: &[Value]) -> Result<String> {
+        self.checkpoint_at(messages, &now_iso())
+    }
+
+    /// `checkpoint` with the marker's time given (an import keeps the original time).
+    pub fn checkpoint_at(&self, messages: &[Value], t: &str) -> Result<String> {
         let (chunk, through) = self.tail()?;
         let id = format!("{chunk:06}-{}", through + 1);
         let content = serde_json::json!({"id": id, "through": through, "messages": messages});
@@ -494,7 +557,7 @@ impl Session {
             &self.checkpoint_path(&id),
             &serde_json::to_string(&content)?,
         )?;
-        let marker = serde_json::json!({"n": through + 1, "t": now_iso(), "k": "checkpoint", "id": id, "through": through});
+        let marker = serde_json::json!({"n": through + 1, "t": t, "k": "checkpoint", "id": id, "through": through});
         self.append_line(&self.log_path(chunk, None), &marker)?;
         self.prune()?;
         self.seal()?;
@@ -632,24 +695,50 @@ impl Session {
                 }
             }
             "toolResult" => {
+                // Images meant for the user (`details.shownImages`, and the result's own
+                // images when `details.imagesForUser`) outlive the payload: they go to the
+                // session's images, and the record keeps them beside the reference.
+                let for_user = m.pointer("/details/imagesForUser") == Some(&Value::Bool(true));
+                let mut keep_details = Map::new();
+                if let Some(Value::Object(details)) = m.get_mut("details") {
+                    if let Some(Value::Array(images)) = details.remove("shownImages") {
+                        let mut images = images;
+                        for image in &mut images {
+                            self.store_image_block(chunk, image)?;
+                        }
+                        keep_details.insert("shownImages".into(), Value::Array(images));
+                    }
+                    if for_user {
+                        keep_details.insert("imagesForUser".into(), Value::Bool(true));
+                    }
+                }
+                let mut keep_content = Vec::new();
+                if for_user && let Some(Value::Array(blocks)) = m.get_mut("content") {
+                    for block in blocks.iter_mut() {
+                        if block.get("type").and_then(Value::as_str) == Some("image") {
+                            self.store_image_block(chunk, block)?;
+                            keep_content.push(block.clone());
+                        }
+                    }
+                }
                 for field in ["content", "details"] {
                     if m.get(field).is_some_and(|v| !v.is_null()) {
                         let v = m[field].take();
-                        m[field] = put("payload", v);
+                        let mut reference = put("payload", v);
+                        if field == "details" && !keep_details.is_empty() {
+                            reference["keep"] = Value::Object(std::mem::take(&mut keep_details));
+                        } else if field == "content" && !keep_content.is_empty() {
+                            reference["keep"] = Value::Array(std::mem::take(&mut keep_content));
+                        }
+                        m[field] = reference;
                     }
                 }
             }
             "user" => {
                 if let Some(Value::Array(blocks)) = m.get_mut("content") {
                     for b in blocks {
-                        if b.get("type").and_then(Value::as_str) == Some("image")
-                            && let Some(data) = b.get("data").and_then(Value::as_str)
-                        {
-                            let sha = self.store_image(chunk, data)?;
-                            if let Some(obj) = b.as_object_mut() {
-                                obj.remove("data");
-                                obj.insert("$img".into(), Value::String(sha));
-                            }
+                        if b.get("data").is_some() {
+                            self.store_image_block(chunk, b)?;
                         }
                     }
                 }
@@ -657,6 +746,25 @@ impl Session {
             _ => {}
         }
         Ok(m)
+    }
+
+    /// An image block's data moved to the session's images, the block keeping `"$img"`.
+    fn store_image_block(&self, chunk: u32, block: &mut Value) -> Result<()> {
+        if block.get("type").and_then(Value::as_str) != Some("image") {
+            return Ok(());
+        }
+        if let Some(data) = block
+            .get("data")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            let sha = self.store_image(chunk, &data)?;
+            if let Some(obj) = block.as_object_mut() {
+                obj.remove("data");
+                obj.insert("$img".into(), Value::String(sha));
+            }
+        }
+        Ok(())
     }
 
     fn store_image(&self, chunk: u32, data: &str) -> Result<String> {
@@ -720,6 +828,8 @@ impl Session {
         let mut resolver = Resolver {
             dir: self.dir.clone(),
             files: HashMap::new(),
+            expired: false,
+            lenient: false,
         };
         messages.iter().map(|m| resolver.resolve(m)).collect()
     }
@@ -1039,7 +1149,11 @@ fn qualify(chunk: u32, value: &Value) -> Value {
             if let Some(reference) = map.get("$ref") {
                 let file = reference.get("f").and_then(Value::as_str).unwrap_or("");
                 let key = reference.get("k").cloned().unwrap_or(Value::Null);
-                return serde_json::json!({"$ref": {"file": format!("log/{chunk:06}.{file}.jsonl"), "key": key}});
+                let mut out = serde_json::json!({"$ref": {"file": format!("log/{chunk:06}.{file}.jsonl"), "key": key}});
+                if let Some(keep) = map.get("keep") {
+                    out["keep"] = qualify(chunk, keep);
+                }
+                return out;
             }
             let mut out = Map::new();
             for (key, inner) in map {
@@ -1093,6 +1207,16 @@ fn image_path(path: &str) -> bool {
 struct Resolver {
     dir: PathBuf,
     files: HashMap<String, HashMap<String, Value>>,
+    /// Set when a reference's stored data was gone (its kept part, if any, stands in).
+    expired: bool,
+    /// History reads: a reference whose data is gone stays a reference instead of failing
+    /// the whole message, so the rest (kept images included) is still read back.
+    lenient: bool,
+}
+
+/// The chunk number in `log/NNNNNN.<side>.jsonl`.
+fn side_file_chunk(file: &str) -> Option<u32> {
+    file.strip_prefix("log/")?.get(..6)?.parse().ok()
 }
 
 impl Resolver {
@@ -1140,9 +1264,36 @@ impl Resolver {
                 if let Some(reference) = map.get("$ref") {
                     let file = reference.get("file").and_then(Value::as_str);
                     let key = reference.get("key").and_then(Value::as_str);
-                    return match (file, key) {
-                        (Some(file), Some(key)) => self.lookup(file, key),
-                        _ => Err(Error::Format("malformed $ref".into())),
+                    let (Some(file), Some(key)) = (file, key) else {
+                        return Err(Error::Format("malformed $ref".into()));
+                    };
+                    let stored = self.lookup(file, key);
+                    // A reference may keep part of its value in the record (images meant
+                    // for the user). The stored value then holds the session's own image
+                    // references too; kept fields complete it, or stand in when it is gone.
+                    return match (stored, map.get("keep")) {
+                        (Ok(value), None) => Ok(value),
+                        (Ok(value), Some(keep)) => {
+                            let chunk = side_file_chunk(file)
+                                .ok_or_else(|| Error::Format("malformed $ref file".into()))?;
+                            let mut value = self.resolve(&qualify(chunk, &value))?;
+                            if let (Some(out), Value::Object(kept)) = (value.as_object_mut(), keep)
+                            {
+                                for (name, inner) in kept {
+                                    out.insert(name.clone(), self.resolve(inner)?);
+                                }
+                            }
+                            Ok(value)
+                        }
+                        (Err(_), Some(keep)) => {
+                            self.expired = true;
+                            self.resolve(keep)
+                        }
+                        (Err(_), None) if self.lenient => {
+                            self.expired = true;
+                            Ok(Value::Object(map.clone()))
+                        }
+                        (Err(error), None) => Err(error),
                     };
                 }
                 let mut out = Map::new();
@@ -1401,6 +1552,65 @@ mod tests {
             log.contains("\"thinking\":\"sum\""),
             "readable summary stays in the main log"
         );
+    }
+
+    #[test]
+    fn images_meant_for_the_user_outlive_the_payload() {
+        let (dir, session) = fresh();
+        let shown = json!({"role": "toolResult", "toolCallId": "s", "toolName": "ipython",
+            "content": [{"type": "text", "text": "[Image shown to the user: a.png]"}],
+            "details": {"ok": true, "shownImages": [{"type": "image", "data": "U0hPV04=", "mimeType": "image/png", "name": "a.png"}]}});
+        let attached = json!({"role": "toolResult", "toolCallId": "f", "toolName": "ipython",
+            "content": [{"type": "text", "text": "chart"}, {"type": "image", "data": "Rk9S", "mimeType": "image/png"}],
+            "details": {"ok": true, "imagesForUser": true}});
+        let working = json!({"role": "toolResult", "toolCallId": "w", "toolName": "ipython",
+            "content": [{"type": "image", "data": "V09SSw==", "mimeType": "image/png"}], "details": {"ok": true}});
+        for m in [&shown, &attached, &working] {
+            session.append("tool", m).unwrap();
+        }
+        // Nothing changes while the payload is there: the model and the history see the same.
+        assert_eq!(
+            session.context().unwrap(),
+            vec![shown.clone(), attached.clone(), working.clone()]
+        );
+        let full = session.history(1, u64::MAX, true).unwrap();
+        let message =
+            |n: usize| full.iter().filter(|r| r.get("m").is_some()).nth(n).unwrap()["m"].clone();
+        assert_eq!((message(0), message(1)), (shown.clone(), attached.clone()));
+        let images: Vec<_> = fs::read_dir(dir.join("log/000001.images"))
+            .unwrap()
+            .collect();
+        assert_eq!(
+            images.len(),
+            2,
+            "only the images meant for the user are kept as images"
+        );
+        // A cleanup deletes the payload: those images stay, the rest is gone and marked expired.
+        fs::remove_file(dir.join("log/000001.payload.jsonl")).unwrap();
+        let left = session.history(1, u64::MAX, true).unwrap();
+        let left: Vec<_> = left.iter().filter(|r| r.get("m").is_some()).collect();
+        assert!(left.iter().all(|r| r["expired"] == true));
+        assert_eq!(
+            left[0]["m"]["details"],
+            json!({"shownImages": shown["details"]["shownImages"]})
+        );
+        assert_eq!(
+            left[1]["m"]["content"],
+            json!([{"type": "image", "data": "Rk9S", "mimeType": "image/png"}])
+        );
+        assert_eq!(left[1]["m"]["details"], json!({"imagesForUser": true}));
+        assert!(
+            left[2]["m"]["content"].get("$ref").is_some(),
+            "working images are not kept"
+        );
+        let select = json!({"where": {"role": "toolResult"}, "fields": ["toolCallId"], "details": ["imagesForUser", "ok"]});
+        let picked = session.projected_entries(1, u64::MAX, &select).unwrap();
+        assert_eq!(
+            picked[1]["message"]["details"],
+            json!({"imagesForUser": true})
+        );
+        assert_eq!(picked[1]["expired"], true);
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn fresh() -> (PathBuf, Session) {
