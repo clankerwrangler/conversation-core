@@ -990,36 +990,23 @@ impl Session {
     /// none of them (so a selection of kept fields still reads it as complete).
     fn keep_details(&self, chunk: &Chunk, payload: &str, keep_fields: &[String]) -> Result<()> {
         use std::io::BufRead;
-        fn references(value: &Value, out: &mut std::collections::HashSet<String>) {
-            match value {
-                Value::Object(map) => {
-                    if let Some(key) = map
-                        .get("$ref")
-                        .and_then(|r| r.get("k"))
-                        .and_then(Value::as_str)
-                    {
-                        out.insert(key.to_string());
-                    }
-                    map.values().for_each(|v| references(v, out));
-                }
-                Value::Array(items) => items.iter().for_each(|v| references(v, out)),
-                _ => {}
-            }
-        }
         let keys: std::collections::HashSet<String> = chunk
             .records
             .iter()
             .filter_map(|r| r.get("m")?.get("details")?.get("$ref")?.get("k")?.as_str())
             .map(str::to_string)
             .collect();
-        let mut arguments = std::collections::HashSet::new();
-        for record in &chunk.records {
-            if record.get("k").and_then(Value::as_str) == Some("assistant")
-                && let Some(message) = record.get("m")
-            {
-                references(message, &mut arguments);
-            }
-        }
+        // Every tool call's arguments, in whichever record holds the call: a reply's first
+        // record or its later parts (`assistant-more`, one per further streamed call).
+        let arguments: std::collections::HashSet<String> = chunk
+            .records
+            .iter()
+            .filter_map(|r| r.get("m")?.get("content")?.as_array())
+            .flatten()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("toolCall"))
+            .filter_map(|block| block.get("arguments")?.get("$ref")?.get("k")?.as_str())
+            .map(str::to_string)
+            .collect();
         let path = self.dir.join(payload);
         let input = fs::File::open(&path).map_err(|e| Error::Io(path.clone(), e))?;
         let mut body = serde_json::to_string(&serde_json::json!({"fields": keep_fields}))? + "\n";
@@ -1837,11 +1824,15 @@ mod tests {
                 "log/000001.jsonl",
                 vec![
                     json!({"n": 1, "t": old, "k": "chunk"}),
-                    json!({"n": 2, "t": old, "k": "assistant", "m": {"role": "assistant", "content": [
+                    json!({"n": 2, "t": old, "k": "assistant", "open": true, "m": {"role": "assistant", "content": [
+                    {"type": "text", "text": "two calls"},
                     {"type": "toolCall", "id": "a", "name": "py", "arguments": {"$ref": {"f": "payload", "k": "2.a"}}}]}}),
-                    json!({"n": 3, "t": old, "k": "tool", "m": {"role": "toolResult", "toolCallId": "a", "toolName": "py",
+                    // The same reply's second streamed call is a later part of it.
+                    json!({"n": 3, "t": old, "k": "assistant-more", "reply": 2, "end": {"stopReason": "toolUse"}, "m": {"role": "assistant", "content": [
+                    {"type": "toolCall", "id": "b", "name": "py", "arguments": {"$ref": {"f": "payload", "k": "3.a"}}}]}}),
+                    json!({"n": 4, "t": old, "k": "tool", "m": {"role": "toolResult", "toolCallId": "a", "toolName": "py",
                     "content": {"$ref": {"f": "payload", "k": "2.0"}}, "details": {"$ref": {"f": "payload", "k": "2.1"}}}}),
-                    json!({"n": 4, "t": old, "k": "tool", "m": {"role": "toolResult", "toolCallId": "b", "toolName": "py",
+                    json!({"n": 5, "t": old, "k": "tool", "m": {"role": "toolResult", "toolCallId": "b", "toolName": "py",
                     "details": {"$ref": {"f": "payload", "k": "4.1"}}}}),
                 ],
             ),
@@ -1849,6 +1840,7 @@ mod tests {
                 "log/000001.payload.jsonl",
                 vec![
                     json!({"key": "2.a", "v": {"code": "print('the code that ran')"}}),
+                    json!({"key": "3.a", "v": {"code": "print('the second call')"}}),
                     json!({"key": "2.0", "v": [{"type": "text", "text": "big output"}]}),
                     json!({"key": "2.1", "v": {"executionId": "e1", "checkpoint": {"id": 7}, "big": "bulky body"}}),
                     json!({"key": "4.1", "v": {"unrelated": "only this"}}),
@@ -1857,18 +1849,18 @@ mod tests {
             (
                 "log/000002.jsonl",
                 vec![
-                    json!({"n": 5, "t": old, "k": "chunk"}),
-                    json!({"n": 6, "t": old, "k": "checkpoint", "id": "c1"}),
+                    json!({"n": 6, "t": old, "k": "chunk"}),
+                    json!({"n": 7, "t": old, "k": "checkpoint", "id": "c1"}),
                 ],
             ),
             (
                 "log/000003.jsonl",
-                vec![json!({"n": 7, "t": old, "k": "chunk"})],
+                vec![json!({"n": 8, "t": old, "k": "chunk"})],
             ),
             (
                 "checkpoints/c1.json",
                 vec![
-                    json!({"id": "c1", "through": 6, "messages": [{"role": "user", "content": "summary"}]}),
+                    json!({"id": "c1", "through": 7, "messages": [{"role": "user", "content": "summary"}]}),
                 ],
             ),
         ]);
@@ -1890,18 +1882,29 @@ mod tests {
         // A result whose details had none of the kept fields reads as complete and empty.
         assert_eq!(got[1]["message"]["details"], json!({}));
         assert!(got[1].get("expired").is_none());
-        // The tool call's input is kept whole and reads back as before; the output is gone.
+        // Both calls' inputs are kept whole and read back as before, the second one from the
+        // reply's later part; the output is gone.
         let history = session.history(1, u64::MAX, true).unwrap();
-        let call = history.iter().find(|e| e["n"] == 2).unwrap();
+        let first = history.iter().find(|e| e["n"] == 2).unwrap();
         assert_eq!(
-            call["m"]["content"][0]["arguments"],
+            first["m"]["content"][1]["arguments"],
             json!({"code": "print('the code that ran')"})
         );
-        assert!(call.get("expired").is_none());
+        assert!(first.get("expired").is_none());
+        let second = history.iter().find(|e| e["n"] == 3).unwrap();
         assert_eq!(
-            history.iter().find(|e| e["n"] == 3).unwrap()["expired"],
+            second["m"]["content"][0]["arguments"],
+            json!({"code": "print('the second call')"})
+        );
+        assert!(second.get("expired").is_none());
+        assert_eq!(
+            history.iter().find(|e| e["n"] == 4).unwrap()["expired"],
             true
         );
+        // As one reply, the way history is handed out, both calls carry their inputs.
+        let entries = session.entries(1, u64::MAX).unwrap();
+        let reply = serde_json::to_string(&entries).unwrap();
+        assert!(reply.contains("the code that ran") && reply.contains("the second call"));
         // A field that was not kept: expired, with what was kept still shown.
         let more = json!({"where": {"role": "toolResult"}, "fields": ["toolCallId"], "details": ["executionId", "big"]});
         let got = session.projected_entries(1, u64::MAX, &more).unwrap();
