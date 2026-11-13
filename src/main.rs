@@ -19,7 +19,7 @@ mod usage;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "core run <session-dir> [--no-tool <name>]... [--models <file>] [--agent-dir <dir>] [--skills <path>]... | core context <session-dir> | core input <session-dir> <api> <provider> <model> | core referenced <session-dir> | core import <new-session-dir> <id> < records | core history <session-dir> <from> <to> | core tool <name> <arguments-json> | core usage <provider> [--auth <file>] | core prompt [--agent-dir <dir>] [--skills <path>]... [--tool <name>]...";
+const USAGE: &str = "core run <session-dir> [--no-tool <name>]... [--models <file>] [--agent-dir <dir>] [--skills <path>]... | core context <session-dir> | core input <session-dir> <api> <provider> <model> | core referenced <session-dir> | core reap <session-dir> <age-seconds> | core import <new-session-dir> <id> < records | core history <session-dir> <from> <to> | core tool <name> <arguments-json> | core usage <provider> [--auth <file>] | core prompt [--agent-dir <dir>] [--skills <path>]... [--tool <name>]...";
 
 #[derive(Default)]
 struct Flags {
@@ -283,6 +283,21 @@ fn main() -> ExitCode {
         [_, cmd, dir] if cmd == "referenced" => store::Session::open(Path::new(dir))
             .and_then(|session| session.referenced())
             .and_then(|files| serde_json::to_string(&files).map_err(store::Error::from)),
+        // Delete tool output and reasoning older than the age, except what the context uses.
+        [_, cmd, dir, age] if cmd == "reap" => match age.parse::<i64>() {
+            Ok(seconds) if seconds > 0 => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                store::Session::open(Path::new(dir))
+                    .and_then(|session| session.reap(now - seconds * 1000))
+                    .map(|(files, bytes)| {
+                        serde_json::json!({"deleted": files, "bytes": bytes}).to_string()
+                    })
+            }
+            _ => Err(store::Error::Usage("core reap <session-dir> <age-seconds>")),
+        },
         [_, cmd, dir] if cmd == "context" => store::Session::open(Path::new(dir))
             .and_then(|session| session.context())
             .and_then(|messages| serde_json::to_string(&messages).map_err(store::Error::from)),

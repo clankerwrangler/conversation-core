@@ -901,6 +901,54 @@ impl Session {
         result
     }
 
+    /// The cleanup: delete the tool output and reasoning files (`log/NNNNNN.payload.jsonl`,
+    /// `log/NNNNNN.reasoning.jsonl`) of every chunk whose newest record is older than
+    /// `cutoff_ms`, unless `referenced` names them. The current chunk is never touched,
+    /// nor the messages and the images meant for the user, which live elsewhere.
+    /// Everything happens under references.lock (specification/ReaperReferences.tla), so
+    /// the core never accepts a reference to a file while it is being deleted. Returns
+    /// the deleted files (session-relative) and their size in bytes.
+    pub fn reap(&self, cutoff_ms: i64) -> Result<(Vec<String>, u64)> {
+        self.with_references_lock(|| {
+            let referenced: std::collections::BTreeSet<String> =
+                self.referenced()?.into_iter().collect();
+            let numbers = self.chunk_numbers()?;
+            let Some((_, older)) = numbers.split_last() else {
+                return Ok((Vec::new(), 0));
+            };
+            let (mut deleted, mut bytes) = (Vec::new(), 0);
+            for &number in older {
+                // A chunk without a readable time is kept: age unknown is not old.
+                let newest = self
+                    .load_chunk(number)?
+                    .records
+                    .iter()
+                    .filter_map(|r| r.get("t").and_then(Value::as_str).and_then(ms_from_iso))
+                    .max();
+                if !newest.is_some_and(|t| t < cutoff_ms) {
+                    continue;
+                }
+                for kind in ["payload", "reasoning"] {
+                    let name = format!("log/{number:06}.{kind}.jsonl");
+                    if referenced.contains(&name) {
+                        continue;
+                    }
+                    let path = self.dir.join(&name);
+                    match fs::metadata(&path) {
+                        Ok(info) => {
+                            fs::remove_file(&path).map_err(|e| Error::Io(path.clone(), e))?;
+                            bytes += info.len();
+                            deleted.push(name);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(Error::Io(path, e)),
+                    }
+                }
+            }
+            Ok((deleted, bytes))
+        })
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -1113,6 +1161,50 @@ pub fn now_iso() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0) as i64;
     iso_from_ms(ms)
+}
+
+/// An RFC 3339 UTC time (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) as milliseconds since 1970, the
+/// inverse of `iso_from_ms`; None for anything else.
+pub fn ms_from_iso(text: &str) -> Option<i64> {
+    let b = text.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || !text.ends_with('Z')
+    {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let fraction = &text[19..text.len() - 1];
+    let millis = match fraction.strip_prefix('.') {
+        None if fraction.is_empty() => 0,
+        Some(digits) if !digits.is_empty() && digits.bytes().all(|d| d.is_ascii_digit()) => {
+            format!("{digits:0<3}")[..3].parse().ok()?
+        }
+        _ => return None,
+    };
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    // Days-from-civil (Howard Hinnant).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 86_400 + hour * 3600 + minute * 60 + second) * 1000) + millis)
 }
 
 /// A time in milliseconds since 1970 as RFC 3339 UTC with milliseconds.
@@ -1416,6 +1508,122 @@ mod tests {
         assert_eq!(expired[0]["expired"], true);
         assert!(expired[0]["message"].get("details").is_none());
         assert_eq!(expired[1]["message"]["details"]["identity"]["value"], "new");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn times_read_back_as_written() {
+        for ms in [0, 1_794_557_090_262, 951_782_400_000, -86_400_000] {
+            assert_eq!(ms_from_iso(&iso_from_ms(ms)), Some(ms));
+        }
+        assert_eq!(ms_from_iso("2026-11-13T09:11:58Z"), Some(1_794_561_118_000));
+        assert_eq!(
+            ms_from_iso("2026-11-13T09:11:58.5Z"),
+            Some(1_794_561_118_500)
+        );
+        for bad in [
+            "",
+            "2026-11-13",
+            "2026-11-13T09:11:58+01:00",
+            "2026-13-01T00:00:00Z",
+            "2026-11-13T09:11:58.Z",
+        ] {
+            assert_eq!(ms_from_iso(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_cleanup_deletes_only_old_unreferenced_tool_output_and_reasoning() {
+        let old = "2026-01-01T00:00:00.000Z";
+        let tool = |n: u64, k: &str| {
+            json!({"n": n, "t": old, "k": "tool", "m": {"role": "toolResult", "toolCallId": format!("c{n}"),
+                "content": {"$ref": {"f": "payload", "k": k}}}})
+        };
+        let dir = session(&[
+            // Old and before the checkpoint: its tool output and reasoning go.
+            (
+                "log/000001.jsonl",
+                vec![json!({"n": 1, "t": old, "k": "chunk"}), tool(2, "2.0")],
+            ),
+            (
+                "log/000001.payload.jsonl",
+                vec![json!({"key": "2.0", "v": [{"type": "text", "text": "old output"}]})],
+            ),
+            (
+                "log/000001.reasoning.jsonl",
+                vec![json!({"key": "2.r", "v": "old thinking"})],
+            ),
+            // Old, but the context after the checkpoint still points into it: kept.
+            (
+                "log/000002.jsonl",
+                vec![
+                    json!({"n": 3, "t": old, "k": "chunk"}),
+                    json!({"n": 4, "t": old, "k": "checkpoint", "id": "c1"}),
+                    tool(5, "5.0"),
+                ],
+            ),
+            (
+                "log/000002.payload.jsonl",
+                vec![json!({"key": "5.0", "v": [{"type": "text", "text": "still sent"}]})],
+            ),
+            (
+                "log/000002.reasoning.jsonl",
+                vec![json!({"key": "5.r", "v": "unreferenced thinking"})],
+            ),
+            // An old chunk without readable times is kept.
+            ("log/000003.jsonl", vec![json!({"n": 6, "k": "chunk"})]),
+            (
+                "log/000003.payload.jsonl",
+                vec![json!({"key": "6.0", "v": []})],
+            ),
+            // The current chunk is never touched, however old.
+            (
+                "log/000004.jsonl",
+                vec![json!({"n": 7, "t": old, "k": "chunk"}), tool(8, "8.0")],
+            ),
+            (
+                "log/000004.payload.jsonl",
+                vec![json!({"key": "8.0", "v": [{"type": "text", "text": "current"}]})],
+            ),
+            ("log/000001.images/x", vec![]),
+            (
+                "checkpoints/c1.json",
+                vec![json!({"id": "c1", "through": 4, "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "summary"}]}]})],
+            ),
+        ]);
+        let session = Session::open(&dir).unwrap();
+        let before = session.context().unwrap();
+        let now = ms_from_iso("2026-03-01T00:00:00.000Z").unwrap();
+        let (deleted, bytes) = session.reap(now - 14 * 86_400_000).unwrap();
+        assert_eq!(
+            deleted,
+            [
+                "log/000001.payload.jsonl",
+                "log/000001.reasoning.jsonl",
+                "log/000002.reasoning.jsonl"
+            ]
+        );
+        assert!(bytes > 0);
+        for kept in [
+            "log/000002.payload.jsonl",
+            "log/000003.payload.jsonl",
+            "log/000004.payload.jsonl",
+            "log/000001.images/x",
+            "log/000001.jsonl",
+        ] {
+            assert!(dir.join(kept).exists(), "{kept}");
+        }
+        // The model sees exactly what it saw before; history shows the old output expired.
+        assert_eq!(session.context().unwrap(), before);
+        let history = session.history(1, u64::MAX, true).unwrap();
+        let old_result = history.iter().find(|e| e["n"] == 2).unwrap();
+        assert_eq!(old_result["expired"], true);
+        // Nothing is newer than a cutoff a year back: a second run deletes nothing.
+        assert_eq!(
+            session.reap(now - 365 * 86_400_000).unwrap().0,
+            Vec::<String>::new()
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

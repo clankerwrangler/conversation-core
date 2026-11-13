@@ -1,5 +1,5 @@
 ---- MODULE ReaperReferences ----
-\* A cleanup outside the core (the reaper) deletes old stored files, skipping those that
+\* A cleanup (`core reap`, a process separate from the running core) deletes old stored files, skipping those that
 \* `core referenced` lists. Meanwhile the core keeps running: the model can edit its context
 \* file to refer to any stored file that exists (the core rejects references to missing files),
 \* or drop references. Every request resolves the context's references.
