@@ -12,7 +12,7 @@ core prompt [--agent-dir <dir>] [--skills <path>]... [--tool <name>]...   print 
 core context <session-dir>    print the context the next request would send
 core input <session-dir> <api> <provider> <model>   print the Responses request input
 core referenced <session-dir>   print the stored files the context and the latest two checkpoints refer to
-core reap <session-dir> <age-seconds>   delete unreferenced tool output and reasoning older than the age
+core reap <session-dir> <age-seconds> [--keep-details <a,b,...>]   delete unreferenced tool output and reasoning older than the age
 core tool <name> <arguments-json>   run one built-in tool in the current folder, print its result
 core usage <provider> [--auth <file>]   print the provider's remaining usage as JSON
 ```
@@ -154,14 +154,17 @@ system releases the lock when the core ends, also after a crash. `history`,
 
 ## Cleaning up old stored data
 
-`core reap <session-dir> <age-seconds>` deletes the tool output and reasoning files
-(`log/NNNNNN.payload.jsonl`, `log/NNNNNN.reasoning.jsonl`) of every chunk whose newest
-record is older than the age, except those `core referenced` lists. It never touches
-the current chunk, the records (all messages stay) or the images meant for the user,
-and a chunk without readable record times is kept. History then shows the deleted
-parts as `"expired": true`; the context is unchanged. It prints
-`{"deleted": [files], "bytes": n}`. A runner calls it on a schedule (the harness:
-daily, 14 days).
+`core reap <session-dir> <age-seconds> [--keep-details <a,b,...>]` deletes the tool
+output and reasoning files (`log/NNNNNN.payload.jsonl`, `log/NNNNNN.reasoning.jsonl`) of
+every chunk all of whose records are provably older than the age (RFC 3339 times, any
+offset; a record with a missing or unreadable time keeps its chunk), except those
+`core referenced` lists. It never touches the current chunk, the records (all messages
+stay) or the images meant for the user. Before a payload file goes, the named top-level
+fields of each tool result's `details` (the runner's own small facts) are written to
+`log/NNNNNN.kept.jsonl`; a history selection of only kept fields then reads as before.
+Everything else deleted shows in history as `"expired": true`; the context is unchanged.
+It prints `{"deleted": [files], "bytes": n}`. A runner calls it on a schedule (the
+harness: daily, 14 days). A checkpoint that refers to deleted stored data is refused.
 
 It holds the session's `references.lock` (an `flock`) from listing the referenced
 files until it has finished deleting. The core takes the same lock only while

@@ -488,13 +488,46 @@ impl Session {
                         }
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // A cleanup deleted it, keeping named detail fields beside it: an entry
+                    // whose requested fields were all kept reads as before, not expired.
+                    let kept_file = match kept_file_for(&file) {
+                        Some(name) => self.read_kept(&name)?,
+                        None => None,
+                    };
+                    if let Some((kept_fields, values)) = kept_file {
+                        let complete = detail_fields.iter().all(|field| {
+                            let top = field
+                                .split_once('.')
+                                .map_or(field.as_str(), |(outer, _)| outer);
+                            kept_fields.iter().any(|kept| kept == top)
+                        });
+                        keys.retain(|key, indexes| {
+                            let Some(stored) = values.get(key) else {
+                                return true;
+                            };
+                            for &index in indexes.iter() {
+                                let mut details = stored.clone();
+                                if let (Some(out), Some(keep)) =
+                                    (details.as_object_mut(), kept.get(&index))
+                                {
+                                    out.extend(keep.clone());
+                                }
+                                selected[index]["message"]["details"] = pick_details(&details);
+                            }
+                            !complete
+                        });
+                    }
+                }
                 Err(error) => return Err(Error::Io(path, error)),
             }
             for indexes in keys.into_values() {
                 for index in indexes {
                     selected[index]["expired"] = Value::Bool(true);
-                    if let Some(keep) = kept.get(&index) {
+                    // What was kept (beside the reference, or by a cleanup) still shows.
+                    if selected[index]["message"].get("details").is_none()
+                        && let Some(keep) = kept.get(&index)
+                    {
                         selected[index]["message"]["details"] =
                             pick_details(&Value::Object(keep.clone()));
                     }
@@ -550,6 +583,16 @@ impl Session {
 
     /// `checkpoint` with the marker's time given (an import keeps the original time).
     pub fn checkpoint_at(&self, messages: &[Value], t: &str) -> Result<String> {
+        // A checkpoint is a context: like an edited context file, it may only refer to
+        // stored data that exists (a cleanup may have deleted older data).
+        if let Some(file) = stored_files(messages)
+            .into_iter()
+            .find(|file| !self.dir.join(file).exists())
+        {
+            return Err(Error::Format(format!(
+                "checkpoint refers to stored data that is gone: {file}"
+            )));
+        }
         let (chunk, through) = self.tail()?;
         let id = format!("{chunk:06}-{}", through + 1);
         let content = serde_json::json!({"id": id, "through": through, "messages": messages});
@@ -843,35 +886,9 @@ impl Session {
     /// The stored files (session-relative) that the current context and the latest two
     /// checkpoints refer to: what a cleanup outside the core must not delete.
     pub fn referenced(&self) -> Result<Vec<String>> {
-        fn collect(value: &Value, out: &mut std::collections::BTreeSet<String>) {
-            match value {
-                Value::Object(map) => {
-                    if let Some(file) = map
-                        .get("$ref")
-                        .and_then(|r| r.get("file"))
-                        .and_then(Value::as_str)
-                    {
-                        out.insert(file.to_string());
-                    }
-                    if let Some(Value::String(path)) = map.get("$img")
-                        && path.contains('/')
-                    {
-                        out.insert(path.clone());
-                    }
-                    map.values().for_each(|v| collect(v, out));
-                }
-                Value::Array(items) => items.iter().for_each(|v| collect(v, out)),
-                _ => {}
-            }
-        }
-        let mut out = std::collections::BTreeSet::new();
-        for message in self.context_refs()? {
-            collect(&message, &mut out);
-        }
+        let mut out = stored_files(&self.context_refs()?);
         for (_, id) in self.newest_markers(2)? {
-            for message in self.checkpoint_messages(&id)? {
-                collect(&message, &mut out);
-            }
+            out.extend(stored_files(&self.checkpoint_messages(&id)?));
         }
         Ok(out.into_iter().collect())
     }
@@ -902,13 +919,21 @@ impl Session {
     }
 
     /// The cleanup: delete the tool output and reasoning files (`log/NNNNNN.payload.jsonl`,
-    /// `log/NNNNNN.reasoning.jsonl`) of every chunk whose newest record is older than
-    /// `cutoff_ms`, unless `referenced` names them. The current chunk is never touched,
-    /// nor the messages and the images meant for the user, which live elsewhere.
+    /// `log/NNNNNN.reasoning.jsonl`) of every chunk all of whose records (besides its
+    /// timeless opening record) are provably older than `cutoff_ms` (a record with a
+    /// missing or unreadable time keeps its chunk), unless
+    /// `referenced` names them. The current chunk is never touched, nor the messages and the
+    /// images meant for the user, which live elsewhere.
+    ///
+    /// Before a payload file goes, the top-level `keep_fields` of each tool result's
+    /// `details` are written to `log/NNNNNN.kept.jsonl` (first line `{"fields": [...]}`),
+    /// durably, so the runner's own small facts outlive the bulky output: a history
+    /// selection of only kept fields reads them as before.
+    ///
     /// Everything happens under references.lock (specification/ReaperReferences.tla), so
     /// the core never accepts a reference to a file while it is being deleted. Returns
     /// the deleted files (session-relative) and their size in bytes.
-    pub fn reap(&self, cutoff_ms: i64) -> Result<(Vec<String>, u64)> {
+    pub fn reap(&self, cutoff_ms: i64, keep_fields: &[String]) -> Result<(Vec<String>, u64)> {
         self.with_references_lock(|| {
             let referenced: std::collections::BTreeSet<String> =
                 self.referenced()?.into_iter().collect();
@@ -918,14 +943,22 @@ impl Session {
             };
             let (mut deleted, mut bytes) = (Vec::new(), 0);
             for &number in older {
-                // A chunk without a readable time is kept: age unknown is not old.
-                let newest = self
-                    .load_chunk(number)?
+                let chunk = self.load_chunk(number)?;
+                // The chunk's own opening record carries no time; every other record must
+                // carry a readable one older than the cutoff.
+                let mut timed = chunk
                     .records
                     .iter()
-                    .filter_map(|r| r.get("t").and_then(Value::as_str).and_then(ms_from_iso))
-                    .max();
-                if !newest.is_some_and(|t| t < cutoff_ms) {
+                    .filter(|r| r.get("k").and_then(Value::as_str) != Some("chunk"))
+                    .peekable();
+                let old = timed.peek().is_some()
+                    && timed.all(|r| {
+                        r.get("t")
+                            .and_then(Value::as_str)
+                            .and_then(ms_from_iso)
+                            .is_some_and(|t| t < cutoff_ms)
+                    });
+                if !old {
                     continue;
                 }
                 for kind in ["payload", "reasoning"] {
@@ -934,19 +967,94 @@ impl Session {
                         continue;
                     }
                     let path = self.dir.join(&name);
-                    match fs::metadata(&path) {
-                        Ok(info) => {
-                            fs::remove_file(&path).map_err(|e| Error::Io(path.clone(), e))?;
-                            bytes += info.len();
-                            deleted.push(name);
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    let info = match fs::metadata(&path) {
+                        Ok(info) => info,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                         Err(e) => return Err(Error::Io(path, e)),
+                    };
+                    if kind == "payload" && !keep_fields.is_empty() {
+                        self.keep_details(&chunk, &name, keep_fields)?;
                     }
+                    fs::remove_file(&path).map_err(|e| Error::Io(path.clone(), e))?;
+                    bytes += info.len();
+                    deleted.push(name);
                 }
             }
             Ok((deleted, bytes))
         })
+    }
+
+    /// Write `keep_fields` of every tool result's stored `details` in `chunk` (read from
+    /// its payload file `payload`) to the chunk's kept file, replacing any earlier one.
+    fn keep_details(&self, chunk: &Chunk, payload: &str, keep_fields: &[String]) -> Result<()> {
+        use std::io::BufRead;
+        let keys: std::collections::HashSet<String> = chunk
+            .records
+            .iter()
+            .filter_map(|r| r.get("m")?.get("details")?.get("$ref")?.get("k")?.as_str())
+            .map(str::to_string)
+            .collect();
+        let path = self.dir.join(payload);
+        let input = fs::File::open(&path).map_err(|e| Error::Io(path.clone(), e))?;
+        let mut body = serde_json::to_string(&serde_json::json!({"fields": keep_fields}))? + "\n";
+        for line in std::io::BufReader::new(input).lines() {
+            let line = line.map_err(|e| Error::Io(path.clone(), e))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line)?;
+            let (Some(key), Some(Value::Object(details))) =
+                (value.get("key").and_then(Value::as_str), value.get("v"))
+            else {
+                continue;
+            };
+            if !keys.contains(key) {
+                continue;
+            }
+            let kept: Map<String, Value> = keep_fields
+                .iter()
+                .filter_map(|f| details.get(f).map(|v| (f.clone(), v.clone())))
+                .collect();
+            if !kept.is_empty() {
+                body += &serde_json::to_string(&serde_json::json!({"key": key, "v": kept}))?;
+                body.push('\n');
+            }
+        }
+        let kept =
+            kept_file_for(payload).ok_or_else(|| Error::Format("not a payload file".into()))?;
+        self.write_durably(&self.dir.join(kept), &body)
+    }
+
+    /// A kept file: its field list and its values by key; None when there is none.
+    fn read_kept(&self, name: &str) -> Result<Option<Kept>> {
+        let path = self.dir.join(name);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::Io(path, e)),
+        };
+        let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+        let header: Value = serde_json::from_str(lines.next().unwrap_or("{}"))?;
+        let fields = header
+            .get("fields")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut values = HashMap::new();
+        for line in lines {
+            let value: Value = serde_json::from_str(line)?;
+            if let (Some(key), Some(v)) = (value.get("key").and_then(Value::as_str), value.get("v"))
+            {
+                values.insert(key.to_string(), v.clone());
+            }
+        }
+        Ok(Some((fields, values)))
     }
 
     pub fn dir(&self) -> &Path {
@@ -1163,28 +1271,53 @@ pub fn now_iso() -> String {
     iso_from_ms(ms)
 }
 
-/// An RFC 3339 UTC time (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) as milliseconds since 1970, the
-/// inverse of `iso_from_ms`; None for anything else.
+/// An RFC 3339 time (`YYYY-MM-DDTHH:MM:SS[.fff](Z|±HH:MM)`) as milliseconds since 1970
+/// (UTC), the inverse of `iso_from_ms`; None for anything else.
 pub fn ms_from_iso(text: &str) -> Option<i64> {
     let b = text.as_bytes();
-    if b.len() < 20
+    if !text.is_ascii()
+        || b.len() < 20
         || b[4] != b'-'
         || b[7] != b'-'
-        || b[10] != b'T'
+        || !matches!(b[10], b'T' | b't')
         || b[13] != b':'
         || b[16] != b':'
-        || !text.ends_with('Z')
     {
         return None;
     }
-    let num = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
-    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    let fraction = &text[19..text.len() - 1];
-    let millis = match fraction.strip_prefix('.') {
-        None if fraction.is_empty() => 0,
-        Some(digits) if !digits.is_empty() && digits.bytes().all(|d| d.is_ascii_digit()) => {
-            format!("{digits:0<3}")[..3].parse().ok()?
+    let digits = |range: std::ops::Range<usize>| {
+        let part = text.get(range)?;
+        part.bytes()
+            .all(|d| d.is_ascii_digit())
+            .then(|| part.parse::<i64>().ok())?
+    };
+    let (year, month, day) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
+    let (hour, minute, second) = (digits(11..13)?, digits(14..16)?, digits(17..19)?);
+    // The zone: Z, or an offset of hours and minutes east of UTC.
+    let (rest, offset_minutes) = if let Some(rest) = text.strip_suffix(['Z', 'z']) {
+        (&rest[19..], 0)
+    } else {
+        let zone = text.get(text.len().checked_sub(6)?..)?;
+        let zb = zone.as_bytes();
+        let sign = match zb[0] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        if zb[3] != b':' {
+            return None;
+        }
+        let at = text.len() - 6;
+        let (oh, om) = (digits(at + 1..at + 3)?, digits(at + 4..at + 6)?);
+        if oh > 23 || om > 59 || at < 19 {
+            return None;
+        }
+        (&text[19..at], sign * (oh * 60 + om))
+    };
+    let millis = match rest.strip_prefix('.') {
+        None if rest.is_empty() => 0,
+        Some(fraction) if !fraction.is_empty() && fraction.bytes().all(|d| d.is_ascii_digit()) => {
+            format!("{fraction:0<3}")[..3].parse().ok()?
         }
         _ => return None,
     };
@@ -1204,7 +1337,10 @@ pub fn ms_from_iso(text: &str) -> Option<i64> {
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    Some(((days * 86_400 + hour * 3600 + minute * 60 + second) * 1000) + millis)
+    Some(
+        ((days * 86_400 + hour * 3600 + minute * 60 + second - offset_minutes * 60) * 1000)
+            + millis,
+    )
 }
 
 /// A time in milliseconds since 1970 as RFC 3339 UTC with milliseconds.
@@ -1266,6 +1402,45 @@ fn qualify(chunk: u32, value: &Value) -> Value {
         Value::Array(items) => Value::Array(items.iter().map(|v| qualify(chunk, v)).collect()),
         other => other.clone(),
     }
+}
+
+/// The stored files (session-relative) that qualified messages refer to: `$ref` files and
+/// `$img` paths.
+fn stored_files(messages: &[Value]) -> std::collections::BTreeSet<String> {
+    fn collect(value: &Value, out: &mut std::collections::BTreeSet<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(file) = map
+                    .get("$ref")
+                    .and_then(|r| r.get("file"))
+                    .and_then(Value::as_str)
+                {
+                    out.insert(file.to_string());
+                }
+                if let Some(Value::String(path)) = map.get("$img")
+                    && path.contains('/')
+                {
+                    out.insert(path.clone());
+                }
+                map.values().for_each(|v| collect(v, out));
+            }
+            Value::Array(items) => items.iter().for_each(|v| collect(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    messages.iter().for_each(|m| collect(m, &mut out));
+    out
+}
+
+/// What a cleanup kept of a payload file: the kept field names, and the values by key.
+type Kept = (Vec<String>, HashMap<String, Value>);
+
+/// `log/NNNNNN.kept.jsonl` beside a payload file: what a cleanup kept of it.
+fn kept_file_for(payload: &str) -> Option<String> {
+    payload
+        .strip_suffix(".payload.jsonl")
+        .map(|stem| format!("{stem}.kept.jsonl"))
 }
 
 /// `log/NNNNNN.payload.jsonl`, `log/NNNNNN.reasoning.jsonl`: the only side files a reference may name.
@@ -1521,15 +1696,197 @@ mod tests {
             ms_from_iso("2026-11-13T09:11:58.5Z"),
             Some(1_794_561_118_500)
         );
+        // Offsets name the same instant: 10:11:58+01:00 is 09:11:58Z.
+        assert_eq!(
+            ms_from_iso("2026-11-13T10:11:58+01:00"),
+            Some(1_794_561_118_000)
+        );
+        assert_eq!(
+            ms_from_iso("2026-11-13T04:41:58.250-04:30"),
+            Some(1_794_561_118_250)
+        );
+        assert_eq!(ms_from_iso("2026-11-13t09:11:58z"), Some(1_794_561_118_000));
         for bad in [
             "",
             "2026-11-13",
-            "2026-11-13T09:11:58+01:00",
             "2026-13-01T00:00:00Z",
             "2026-11-13T09:11:58.Z",
+            "2026-11-13T09:11:58+0100",
+            "2026-11-13T09:11:58+24:00",
+            "2026-11-13T09:11:58",
+            "Fri, 13 Nov 2026 09:11:58 GMT",
+            "2026-11-13T09:11:5x+01:00",
         ] {
             assert_eq!(ms_from_iso(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_chunk_is_old_only_when_every_record_is_provably_old() {
+        let old = "2026-01-01T00:00:00.000Z";
+        let now = ms_from_iso("2026-03-01T00:00:00.000Z").unwrap();
+        let chunk = |second: Value| {
+            session(&[
+                (
+                    "log/000001.jsonl",
+                    vec![
+                        json!({"n": 1, "t": old, "k": "app", "ns": "x", "data": {}}),
+                        second,
+                    ],
+                ),
+                (
+                    "log/000001.payload.jsonl",
+                    vec![json!({"key": "2.0", "v": []})],
+                ),
+                (
+                    "log/000002.jsonl",
+                    vec![json!({"n": 3, "t": old, "k": "chunk"})],
+                ),
+            ])
+        };
+        for (label, second, deleted) in [
+            (
+                "a recent time with an offset",
+                json!({"n": 2, "t": "2026-02-28T23:00:00+01:00", "k": "app", "ns": "x", "data": {}}),
+                false,
+            ),
+            (
+                "an unreadable time",
+                json!({"n": 2, "t": "yesterday", "k": "app", "ns": "x", "data": {}}),
+                false,
+            ),
+            (
+                "no time",
+                json!({"n": 2, "k": "app", "ns": "x", "data": {}}),
+                false,
+            ),
+            (
+                "an old time with an offset",
+                json!({"n": 2, "t": "2026-01-01T05:00:00+05:00", "k": "app", "ns": "x", "data": {}}),
+                true,
+            ),
+            // The core's own opening record of a chunk has no time and does not count.
+            (
+                "a timeless opening record",
+                json!({"n": 2, "k": "chunk"}),
+                true,
+            ),
+        ] {
+            let dir = chunk(second);
+            let (files, _) = Session::open(&dir)
+                .unwrap()
+                .reap(now - 14 * 86_400_000, &[])
+                .unwrap();
+            assert_eq!(!files.is_empty(), deleted, "{label}");
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn the_cleanup_keeps_named_detail_fields_and_projections_of_them_read_as_before() {
+        let old = "2026-01-01T00:00:00.000Z";
+        let dir = session(&[
+            (
+                "log/000001.jsonl",
+                vec![
+                    json!({"n": 1, "t": old, "k": "chunk"}),
+                    json!({"n": 2, "t": old, "k": "tool", "m": {"role": "toolResult", "toolCallId": "a", "toolName": "py",
+                    "content": {"$ref": {"f": "payload", "k": "2.0"}}, "details": {"$ref": {"f": "payload", "k": "2.1"}}}}),
+                ],
+            ),
+            (
+                "log/000001.payload.jsonl",
+                vec![
+                    json!({"key": "2.0", "v": [{"type": "text", "text": "big output"}]}),
+                    json!({"key": "2.1", "v": {"executionId": "e1", "checkpoint": {"id": 7}, "big": "bulky body"}}),
+                ],
+            ),
+            (
+                "log/000002.jsonl",
+                vec![
+                    json!({"n": 3, "t": old, "k": "chunk"}),
+                    json!({"n": 4, "t": old, "k": "checkpoint", "id": "c1"}),
+                ],
+            ),
+            (
+                "log/000003.jsonl",
+                vec![json!({"n": 5, "t": old, "k": "chunk"})],
+            ),
+            (
+                "checkpoints/c1.json",
+                vec![
+                    json!({"id": "c1", "through": 4, "messages": [{"role": "user", "content": "summary"}]}),
+                ],
+            ),
+        ]);
+        let session = Session::open(&dir).unwrap();
+        let now = ms_from_iso("2026-03-01T00:00:00.000Z").unwrap();
+        let keep = ["executionId".to_string(), "checkpoint".to_string()];
+        let (files, _) = session.reap(now - 14 * 86_400_000, &keep).unwrap();
+        assert_eq!(files, ["log/000001.payload.jsonl"]);
+        let kept = fs::read_to_string(dir.join("log/000001.kept.jsonl")).unwrap();
+        assert!(!kept.contains("bulky body") && !kept.contains("big output"));
+        // Only kept fields asked for: read as before, not expired.
+        let facts = json!({"where": {"role": "toolResult"}, "fields": ["toolCallId"], "details": ["executionId", "checkpoint.id"]});
+        let got = session.projected_entries(1, u64::MAX, &facts).unwrap();
+        assert_eq!(
+            got[0]["message"]["details"],
+            json!({"executionId": "e1", "checkpoint": {"id": 7}})
+        );
+        assert!(got[0].get("expired").is_none());
+        // A field that was not kept: expired, with what was kept still shown.
+        let more = json!({"where": {"role": "toolResult"}, "fields": ["toolCallId"], "details": ["executionId", "big"]});
+        let got = session.projected_entries(1, u64::MAX, &more).unwrap();
+        assert_eq!(got[0]["expired"], true);
+        assert_eq!(got[0]["message"]["details"], json!({"executionId": "e1"}));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_checkpoint_may_not_refer_to_stored_data_a_cleanup_deleted() {
+        let old = "2026-01-01T00:00:00.000Z";
+        let dir = session(&[
+            (
+                "log/000001.jsonl",
+                vec![
+                    json!({"n": 1, "t": old, "k": "chunk"}),
+                    json!({"n": 2, "t": old, "k": "tool", "m": {"role": "toolResult", "toolCallId": "a", "content": {"$ref": {"f": "payload", "k": "2.0"}}}}),
+                    json!({"n": 3, "t": old, "k": "checkpoint", "id": "c1"}),
+                ],
+            ),
+            (
+                "log/000001.payload.jsonl",
+                vec![json!({"key": "2.0", "v": [{"type": "text", "text": "old"}]})],
+            ),
+            (
+                "log/000002.jsonl",
+                vec![json!({"n": 4, "t": old, "k": "chunk"})],
+            ),
+            (
+                "checkpoints/c1.json",
+                vec![
+                    json!({"id": "c1", "through": 3, "messages": [{"role": "user", "content": "summary"}]}),
+                ],
+            ),
+        ]);
+        let session = Session::open(&dir).unwrap();
+        let now = ms_from_iso("2026-03-01T00:00:00.000Z").unwrap();
+        assert_eq!(
+            session.reap(now - 14 * 86_400_000, &[]).unwrap().0,
+            ["log/000001.payload.jsonl"]
+        );
+        // A runner holding an older copy of the context tries to checkpoint it.
+        let stale = json!({"role": "toolResult", "toolCallId": "a", "content": {"$ref": {"file": "log/000001.payload.jsonl", "key": "2.0"}}});
+        let error = session.checkpoint(&[stale]).unwrap_err().to_string();
+        assert!(error.contains("stored data that is gone"), "{error}");
+        assert!(session.context().is_ok(), "the context stays readable");
+        // Without the stale reference it is accepted.
+        assert!(
+            session
+                .checkpoint(&[json!({"role": "user", "content": "fresh"})])
+                .is_ok()
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1595,7 +1952,7 @@ mod tests {
         let session = Session::open(&dir).unwrap();
         let before = session.context().unwrap();
         let now = ms_from_iso("2026-03-01T00:00:00.000Z").unwrap();
-        let (deleted, bytes) = session.reap(now - 14 * 86_400_000).unwrap();
+        let (deleted, bytes) = session.reap(now - 14 * 86_400_000, &[]).unwrap();
         assert_eq!(
             deleted,
             [
@@ -1621,7 +1978,7 @@ mod tests {
         assert_eq!(old_result["expired"], true);
         // Nothing is newer than a cutoff a year back: a second run deletes nothing.
         assert_eq!(
-            session.reap(now - 365 * 86_400_000).unwrap().0,
+            session.reap(now - 365 * 86_400_000, &[]).unwrap().0,
             Vec::<String>::new()
         );
         let _ = fs::remove_dir_all(dir);
