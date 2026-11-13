@@ -159,10 +159,12 @@ output and reasoning files (`log/NNNNNN.payload.jsonl`, `log/NNNNNN.reasoning.js
 every chunk all of whose records are provably older than the age (RFC 3339 times, any
 offset; a record with a missing or unreadable time keeps its chunk), except those
 `core referenced` lists. It never touches the current chunk, the records (all messages
-stay) or the images meant for the user. Before a payload file goes, the named top-level
-fields of each tool result's `details` (the runner's own small facts) are written to
-`log/NNNNNN.kept.jsonl`; a history selection of only kept fields then reads as before.
-Everything else deleted shows in history as `"expired": true`; the context is unchanged.
+stay) or the images meant for the user. Before a payload file goes, `log/NNNNNN.kept.jsonl`
+gets every tool call's arguments whole (they read back as before) and the named top-level
+fields of each tool result's `details`, the runner's own small facts (an empty object
+when there are none); a history selection of only kept fields then reads as before. Tool
+output and reasoning are what goes: they show in history as `"expired": true`. The
+context is unchanged.
 It prints `{"deleted": [files], "bytes": n}`. A runner calls it on a schedule (the
 harness: daily, 14 days). A checkpoint that refers to deleted stored data is refused.
 

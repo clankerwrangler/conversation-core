@@ -972,7 +972,7 @@ impl Session {
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                         Err(e) => return Err(Error::Io(path, e)),
                     };
-                    if kind == "payload" && !keep_fields.is_empty() {
+                    if kind == "payload" {
                         self.keep_details(&chunk, &name, keep_fields)?;
                     }
                     fs::remove_file(&path).map_err(|e| Error::Io(path.clone(), e))?;
@@ -984,16 +984,42 @@ impl Session {
         })
     }
 
-    /// Write `keep_fields` of every tool result's stored `details` in `chunk` (read from
-    /// its payload file `payload`) to the chunk's kept file, replacing any earlier one.
+    /// Write to the chunk's kept file (replacing any earlier one), from its payload file
+    /// `payload`: every tool call's arguments whole (`"whole": true`), and the
+    /// `keep_fields` of every tool result's stored `details`, an empty object when it has
+    /// none of them (so a selection of kept fields still reads it as complete).
     fn keep_details(&self, chunk: &Chunk, payload: &str, keep_fields: &[String]) -> Result<()> {
         use std::io::BufRead;
+        fn references(value: &Value, out: &mut std::collections::HashSet<String>) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(key) = map
+                        .get("$ref")
+                        .and_then(|r| r.get("k"))
+                        .and_then(Value::as_str)
+                    {
+                        out.insert(key.to_string());
+                    }
+                    map.values().for_each(|v| references(v, out));
+                }
+                Value::Array(items) => items.iter().for_each(|v| references(v, out)),
+                _ => {}
+            }
+        }
         let keys: std::collections::HashSet<String> = chunk
             .records
             .iter()
             .filter_map(|r| r.get("m")?.get("details")?.get("$ref")?.get("k")?.as_str())
             .map(str::to_string)
             .collect();
+        let mut arguments = std::collections::HashSet::new();
+        for record in &chunk.records {
+            if record.get("k").and_then(Value::as_str) == Some("assistant")
+                && let Some(message) = record.get("m")
+            {
+                references(message, &mut arguments);
+            }
+        }
         let path = self.dir.join(payload);
         let input = fs::File::open(&path).map_err(|e| Error::Io(path.clone(), e))?;
         let mut body = serde_json::to_string(&serde_json::json!({"fields": keep_fields}))? + "\n";
@@ -1003,22 +1029,24 @@ impl Session {
                 continue;
             }
             let value: Value = serde_json::from_str(&line)?;
-            let (Some(key), Some(Value::Object(details))) =
+            let (Some(key), Some(stored)) =
                 (value.get("key").and_then(Value::as_str), value.get("v"))
             else {
                 continue;
             };
-            if !keys.contains(key) {
+            let line = if arguments.contains(key) {
+                serde_json::json!({"key": key, "v": stored, "whole": true})
+            } else if keys.contains(key) {
+                let kept: Map<String, Value> = keep_fields
+                    .iter()
+                    .filter_map(|f| stored.get(f).map(|v| (f.clone(), v.clone())))
+                    .collect();
+                serde_json::json!({"key": key, "v": kept})
+            } else {
                 continue;
-            }
-            let kept: Map<String, Value> = keep_fields
-                .iter()
-                .filter_map(|f| details.get(f).map(|v| (f.clone(), v.clone())))
-                .collect();
-            if !kept.is_empty() {
-                body += &serde_json::to_string(&serde_json::json!({"key": key, "v": kept}))?;
-                body.push('\n');
-            }
+            };
+            body += &serde_json::to_string(&line)?;
+            body.push('\n');
         }
         let kept =
             kept_file_for(payload).ok_or_else(|| Error::Format("not a payload file".into()))?;
@@ -1505,6 +1533,25 @@ impl Resolver {
                         map.insert(k.to_string(), v.clone());
                     }
                 }
+            } else if let Some(kept) = kept_file_for(file) {
+                // A cleanup deleted the payload file: what it kept whole (tool-call
+                // arguments) reads as before.
+                let kept = self.dir.join(kept);
+                if kept.exists() {
+                    for line in read(&kept)?
+                        .lines()
+                        .skip(1)
+                        .filter(|l| !l.trim().is_empty())
+                    {
+                        let entry: Value = serde_json::from_str(line)?;
+                        if entry.get("whole") == Some(&Value::Bool(true))
+                            && let (Some(k), Some(v)) =
+                                (entry.get("key").and_then(Value::as_str), entry.get("v"))
+                        {
+                            map.insert(k.to_string(), v.clone());
+                        }
+                    }
+                }
             }
             self.files.insert(file.to_string(), map);
         }
@@ -1790,32 +1837,38 @@ mod tests {
                 "log/000001.jsonl",
                 vec![
                     json!({"n": 1, "t": old, "k": "chunk"}),
-                    json!({"n": 2, "t": old, "k": "tool", "m": {"role": "toolResult", "toolCallId": "a", "toolName": "py",
+                    json!({"n": 2, "t": old, "k": "assistant", "m": {"role": "assistant", "content": [
+                    {"type": "toolCall", "id": "a", "name": "py", "arguments": {"$ref": {"f": "payload", "k": "2.a"}}}]}}),
+                    json!({"n": 3, "t": old, "k": "tool", "m": {"role": "toolResult", "toolCallId": "a", "toolName": "py",
                     "content": {"$ref": {"f": "payload", "k": "2.0"}}, "details": {"$ref": {"f": "payload", "k": "2.1"}}}}),
+                    json!({"n": 4, "t": old, "k": "tool", "m": {"role": "toolResult", "toolCallId": "b", "toolName": "py",
+                    "details": {"$ref": {"f": "payload", "k": "4.1"}}}}),
                 ],
             ),
             (
                 "log/000001.payload.jsonl",
                 vec![
+                    json!({"key": "2.a", "v": {"code": "print('the code that ran')"}}),
                     json!({"key": "2.0", "v": [{"type": "text", "text": "big output"}]}),
                     json!({"key": "2.1", "v": {"executionId": "e1", "checkpoint": {"id": 7}, "big": "bulky body"}}),
+                    json!({"key": "4.1", "v": {"unrelated": "only this"}}),
                 ],
             ),
             (
                 "log/000002.jsonl",
                 vec![
-                    json!({"n": 3, "t": old, "k": "chunk"}),
-                    json!({"n": 4, "t": old, "k": "checkpoint", "id": "c1"}),
+                    json!({"n": 5, "t": old, "k": "chunk"}),
+                    json!({"n": 6, "t": old, "k": "checkpoint", "id": "c1"}),
                 ],
             ),
             (
                 "log/000003.jsonl",
-                vec![json!({"n": 5, "t": old, "k": "chunk"})],
+                vec![json!({"n": 7, "t": old, "k": "chunk"})],
             ),
             (
                 "checkpoints/c1.json",
                 vec![
-                    json!({"id": "c1", "through": 4, "messages": [{"role": "user", "content": "summary"}]}),
+                    json!({"id": "c1", "through": 6, "messages": [{"role": "user", "content": "summary"}]}),
                 ],
             ),
         ]);
@@ -1834,6 +1887,21 @@ mod tests {
             json!({"executionId": "e1", "checkpoint": {"id": 7}})
         );
         assert!(got[0].get("expired").is_none());
+        // A result whose details had none of the kept fields reads as complete and empty.
+        assert_eq!(got[1]["message"]["details"], json!({}));
+        assert!(got[1].get("expired").is_none());
+        // The tool call's input is kept whole and reads back as before; the output is gone.
+        let history = session.history(1, u64::MAX, true).unwrap();
+        let call = history.iter().find(|e| e["n"] == 2).unwrap();
+        assert_eq!(
+            call["m"]["content"][0]["arguments"],
+            json!({"code": "print('the code that ran')"})
+        );
+        assert!(call.get("expired").is_none());
+        assert_eq!(
+            history.iter().find(|e| e["n"] == 3).unwrap()["expired"],
+            true
+        );
         // A field that was not kept: expired, with what was kept still shown.
         let more = json!({"where": {"role": "toolResult"}, "fields": ["toolCallId"], "details": ["executionId", "big"]});
         let got = session.projected_entries(1, u64::MAX, &more).unwrap();
