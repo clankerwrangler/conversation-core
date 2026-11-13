@@ -1085,6 +1085,44 @@ fn referenced_lists_the_files_the_context_points_to() {
 }
 
 #[test]
+fn reap_accepts_only_the_protocol_it_implements_and_refuses_before_deleting() {
+    let (base, server) = server(vec![vec![call("c1", json!({"a": 1})), done()], vec![text("ok"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    core.until("tool_call");
+    core.result("c1|fc_c1", "3");
+    core.until("turn_end");
+    server.join().unwrap();
+    let listing = || {
+        let mut names: Vec<String> = std::fs::read_dir(d.join("log"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing();
+    let reap = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_core"))
+            .args(["reap", d.to_str().unwrap(), "1"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    for refused in [&["--protocol", "1"][..], &["--protocol", "3"], &["--protocol"], &["--unknown", "x"]] {
+        assert!(!reap(refused).status.success(), "{refused:?}");
+    }
+    assert!(before.iter().any(|n| n.ends_with(".payload.jsonl")), "stored tool data exists: {before:?}");
+    assert_eq!(listing(), before, "a refused cleanup deletes nothing");
+    let out = reap(&["--keep-details", "ok", "--protocol", "2"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["deleted"], json!([]), "the current chunk is never touched");
+    core.stop();
+}
+
+#[test]
 fn a_new_context_waits_while_a_cleanup_holds_the_references_lock() {
     use std::os::fd::AsRawFd;
     let (base, server) = server(vec![vec![text("one"), done()], vec![text("two"), done()]]);

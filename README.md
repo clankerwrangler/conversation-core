@@ -12,7 +12,7 @@ core prompt [--agent-dir <dir>] [--skills <path>]... [--tool <name>]...   print 
 core context <session-dir>    print the context the next request would send
 core input <session-dir> <api> <provider> <model>   print the Responses request input
 core referenced <session-dir>   print the stored files the context and the latest two checkpoints refer to
-core reap <session-dir> <age-seconds> [--keep-details <a,b,...>]   delete unreferenced tool output and reasoning older than the age
+core reap <session-dir> <age-seconds> [--keep-details <a,b,...>] [--protocol 2]   delete unreferenced tool output and reasoning older than the age
 core tool <name> <arguments-json>   run one built-in tool in the current folder, print its result
 core usage <provider> [--auth <file>]   print the provider's remaining usage as JSON
 ```
@@ -167,6 +167,11 @@ output and reasoning are what goes: they show in history as `"expired": true`. T
 context is unchanged.
 It prints `{"deleted": [files], "bytes": n}`. A runner calls it on a schedule (the
 harness: daily, 14 days). A checkpoint that refers to deleted stored data is refused.
+
+`--protocol 2` names exactly this behaviour. A runner should always pass it: cores built
+before it reject the flag before touching anything, and some of them reap with weaker
+rules (later tool calls' arguments lost, offset times misread), so they must never run a
+runner's cleanup. Any other protocol value is refused.
 
 It holds the session's `references.lock` (an `flock`) from listing the referenced
 files until it has finished deleting. The core takes the same lock only while

@@ -19,7 +19,7 @@ mod usage;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "core run <session-dir> [--no-tool <name>]... [--models <file>] [--agent-dir <dir>] [--skills <path>]... | core context <session-dir> | core input <session-dir> <api> <provider> <model> | core referenced <session-dir> | core reap <session-dir> <age-seconds> [--keep-details <a,b,...>] | core import <new-session-dir> <id> < records | core history <session-dir> <from> <to> | core tool <name> <arguments-json> | core usage <provider> [--auth <file>] | core prompt [--agent-dir <dir>] [--skills <path>]... [--tool <name>]...";
+const USAGE: &str = "core run <session-dir> [--no-tool <name>]... [--models <file>] [--agent-dir <dir>] [--skills <path>]... | core context <session-dir> | core input <session-dir> <api> <provider> <model> | core referenced <session-dir> | core reap <session-dir> <age-seconds> [--keep-details <a,b,...>] [--protocol 2] | core import <new-session-dir> <id> < records | core history <session-dir> <from> <to> | core tool <name> <arguments-json> | core usage <provider> [--auth <file>] | core prompt [--agent-dir <dir>] [--skills <path>]... [--tool <name>]...";
 
 #[derive(Default)]
 struct Flags {
@@ -285,18 +285,28 @@ fn main() -> ExitCode {
             .and_then(|files| serde_json::to_string(&files).map_err(store::Error::from)),
         // Delete tool output and reasoning older than the age, except what the context uses,
         // keeping the named top-level fields of tool results' details.
+        // `--protocol 2` names this behaviour (every tool call's arguments kept, provably old
+        // chunks only): a runner passes it so an older core, which rejects the flag before
+        // touching anything, can never run its cleanup.
         [_, cmd, dir, age, rest @ ..] if cmd == "reap" => {
-            let keep: Option<Vec<String>> = match rest {
-                [] => Some(Vec::new()),
-                [flag, fields] if flag == "--keep-details" => Some(
-                    fields
-                        .split(',')
-                        .filter(|f| !f.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                ),
-                _ => None,
-            };
+            let mut keep = Some(Vec::new());
+            let mut flags = rest.iter();
+            while let Some(flag) = flags.next() {
+                match (flag.as_str(), flags.next()) {
+                    ("--keep-details", Some(fields)) => {
+                        if let Some(k) = keep.as_mut() {
+                            k.extend(
+                                fields
+                                    .split(',')
+                                    .filter(|f| !f.is_empty())
+                                    .map(str::to_string),
+                            );
+                        }
+                    }
+                    ("--protocol", Some(version)) if version == "2" => {}
+                    _ => keep = None,
+                }
+            }
             match (age.parse::<i64>(), keep) {
                 (Ok(seconds), Some(keep)) if seconds > 0 => {
                     let now = std::time::SystemTime::now()
@@ -310,7 +320,7 @@ fn main() -> ExitCode {
                         })
                 }
                 _ => Err(store::Error::Usage(
-                    "core reap <session-dir> <age-seconds> [--keep-details <a,b,...>]",
+                    "core reap <session-dir> <age-seconds> [--keep-details <a,b,...>] [--protocol 2]",
                 )),
             }
         }
