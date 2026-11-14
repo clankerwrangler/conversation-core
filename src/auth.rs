@@ -44,8 +44,10 @@ const RENEW_EARLY_MS: u64 = 120_000;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Sign-ins are data (they cannot be fetched again without signing in).
-pub fn default_path() -> PathBuf {
-    crate::dirs::data().join("auth.json")
+pub fn default_path() -> Result<PathBuf, &'static str> {
+    crate::dirs::data()
+        .map(|dir| dir.join("auth.json"))
+        .ok_or("cannot determine credentials path: set XDG_DATA_HOME or HOME to an absolute path, or pass --auth")
 }
 
 fn now_ms() -> u64 {

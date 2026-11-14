@@ -55,6 +55,20 @@ fn flags(rest: &[String], prompt: bool) -> Option<Flags> {
     Some(f)
 }
 
+fn auth_path(path: Option<PathBuf>, json_error: bool) -> Option<PathBuf> {
+    match path.map(Ok).unwrap_or_else(auth::default_path) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            if json_error {
+                println!("{}", serde_json::json!({"error": error}));
+            } else {
+                eprintln!("error: {error}");
+            }
+            None
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if let [_, cmd, dir, rest @ ..] = args.as_slice()
@@ -72,9 +86,12 @@ fn main() -> ExitCode {
             }
         };
         let sources = prompt::Sources::new(f.agent_dir, f.skills);
+        let Some(auth) = auth_path(f.auth, false) else {
+            return ExitCode::FAILURE;
+        };
         let paths = process::Paths {
             catalog: f.catalog.unwrap_or_else(catalog::default_dir),
-            auth: f.auth.unwrap_or_else(auth::default_path),
+            auth,
         };
         return match process::run(Path::new(dir), f.no_tool, models, sources, paths) {
             Ok(()) => ExitCode::SUCCESS,
@@ -92,7 +109,9 @@ fn main() -> ExitCode {
             eprintln!("error: usage: core usage <provider> [--auth <file>]");
             return ExitCode::FAILURE;
         };
-        let path = f.auth.unwrap_or_else(auth::default_path);
+        let Some(path) = auth_path(f.auth, false) else {
+            return ExitCode::FAILURE;
+        };
         println!("{}", usage::usage(&path, provider, provider::now_ms()));
         return ExitCode::SUCCESS;
     }
@@ -117,7 +136,9 @@ fn main() -> ExitCode {
             );
             return ExitCode::FAILURE;
         };
-        let path = f.auth.unwrap_or_else(auth::default_path);
+        let Some(path) = auth_path(f.auth, cmd == "login" && json_steps) else {
+            return ExitCode::FAILURE;
+        };
         if cmd == "logout" {
             return match auth::remove(&path, provider) {
                 Ok(removed) => {

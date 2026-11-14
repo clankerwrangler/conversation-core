@@ -4,27 +4,32 @@
 //! again (model lists) in `~/.cache/conversation-core`. `XDG_CONFIG_HOME`, `XDG_DATA_HOME`
 //! and `XDG_CACHE_HOME` move them, as they do for other programs.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 const NAME: &str = "conversation-core";
 
+fn absolute(value: Option<OsString>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|path| path.is_absolute())
+}
+
 fn base(xdg: &str, fallback: &str) -> PathBuf {
-    match std::env::var_os(xdg) {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => match std::env::var_os("HOME") {
+    absolute(std::env::var_os(xdg))
+        .unwrap_or_else(|| match std::env::var_os("HOME") {
             Some(home) => PathBuf::from(home).join(fallback),
             None => PathBuf::from(fallback),
-        },
-    }
-    .join(NAME)
+        })
+        .join(NAME)
 }
 
 pub fn config() -> PathBuf {
     base("XDG_CONFIG_HOME", ".config")
 }
 
-pub fn data() -> PathBuf {
-    base("XDG_DATA_HOME", ".local/share")
+pub fn data() -> Option<PathBuf> {
+    absolute(std::env::var_os("XDG_DATA_HOME"))
+        .or_else(|| absolute(std::env::var_os("HOME")).map(|home| home.join(".local/share")))
+        .map(|base| base.join(NAME))
 }
 
 pub fn cache() -> PathBuf {

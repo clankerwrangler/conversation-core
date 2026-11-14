@@ -29,3 +29,134 @@ fn usage_answers_in_json_without_a_session() {
     assert_eq!(other["status"], "unsupported");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn authentication_defaults_require_an_absolute_data_or_home_directory() {
+    let root = std::env::temp_dir().join(format!(
+        "core-cli-auth-paths-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let command = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_core"));
+        cmd.current_dir(&root)
+            .env_remove("HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_CACHE_HOME");
+        cmd
+    };
+    let home = root.join("home");
+    let data = root.join("data");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Absolute XDG data takes precedence, even without HOME.
+    let out = command()
+        .env("XDG_DATA_HOME", &data)
+        .args(["logout", "openai-codex"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(data.join("conversation-core/auth.json.lock").exists());
+
+    // An absolute HOME supplies the usual default when XDG_DATA_HOME is unset.
+    let default_home = root.join("default-home");
+    std::fs::create_dir_all(&default_home).unwrap();
+    let out = command()
+        .env("HOME", &default_home)
+        .args(["logout", "openai-codex"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        default_home
+            .join(".local/share/conversation-core/auth.json.lock")
+            .exists()
+    );
+
+    // Relative XDG data is ignored; an absolute HOME supplies the fallback.
+    let out = command()
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", "relative-data")
+        .args(["logout", "openai-codex"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        home.join(".local/share/conversation-core/auth.json.lock")
+            .exists()
+    );
+    assert!(!root.join("relative-data").exists());
+
+    // Missing or relative paths fail before a session or credential file is created.
+    for args in [
+        vec!["logout", "openai-codex"],
+        vec!["usage", "openrouter"],
+        vec!["run", "session"],
+    ] {
+        let out = command().args(args).output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("cannot determine credentials path"));
+    }
+    let out = command()
+        .env("HOME", "relative-home")
+        .env("XDG_DATA_HOME", "relative-data")
+        .args(["logout", "openai-codex"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!root.join("relative-home").exists());
+    assert!(!root.join(".local").exists());
+    assert!(!root.join("session").exists());
+
+    // JSON login reports the failure as JSON instead of waiting for a sign-in.
+    let out = command()
+        .args(["login", "openai-codex", "device", "--json"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let error: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot determine credentials path")
+    );
+
+    // An explicit path remains valid, including a path relative to the working directory.
+    let out = command()
+        .args(["logout", "openai-codex", "--auth", "explicit/auth.json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(root.join("explicit/auth.json.lock").exists());
+    let out = command()
+        .args(["run", "explicit-session", "--auth", "explicit/auth.json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Other XDG locations also ignore relative overrides.
+    let config = home.join(".config/conversation-core");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("AGENTS.md"), "configuration fallback marker").unwrap();
+    let out = command()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", "relative-config")
+        .args(["prompt"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("configuration fallback marker"));
+    assert!(!root.join("relative-config").exists());
+
+    // Commands that do not use credentials do not need either environment variable.
+    let out = command().args(["tool", "ls", "{}"]).output().unwrap();
+    assert!(out.status.success());
+    std::fs::remove_dir_all(&root).unwrap();
+}
