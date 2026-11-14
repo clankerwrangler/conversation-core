@@ -1,12 +1,9 @@
-//! The system prompt, built as pi 1.5 builds it but without pi's fixed wording (its
-//! preamble, its two closing rules and its pointers to pi's own documentation). Fixed
-//! wording belongs in AGENTS files. What the core adds is what changes: the tools on
-//! offer and their guidelines, the AGENTS files found, the skills list and the working
-//! directory.
+//! Build the changing system prompt from offered tools and their guidelines, AGENTS files,
+//! skills, and the working directory. Fixed instructions belong in AGENTS files.
 //!
-//! Like pi, every part after the preamble is a named section `<name>\n...\n</name>`, and
-//! parts are joined with a blank line. The runner's `instructions` take pi's preamble
-//! place, and its `sections` follow the core's (one with a core section's name replaces it).
+//! After the runner's `instructions`, each part is a named section
+//! `<name>\n...\n</name>`, separated by blank lines. The runner's `sections` follow
+//! the core's; a section with the same name replaces the core's.
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -57,8 +54,7 @@ pub struct ToolPrompt {
     pub guidelines: Vec<String>,
 }
 
-/// pi 1.5's prompt contributions for its built-in tools. bash's one guideline is about
-/// pi's own environment variables, so it is left out like the rest of pi's own wording.
+/// Prompt snippets and guidelines for the built-in tools.
 pub fn builtin(name: &str) -> ToolPrompt {
     let (snippet, guidelines): (&str, &[&str]) = match name {
         "read" => (
@@ -97,7 +93,7 @@ pub fn builtin(name: &str) -> ToolPrompt {
     }
 }
 
-/// A runner tool's `promptSnippet` and `promptGuidelines` (pi's tool fields), taken off the
+/// A runner tool's `promptSnippet` and `promptGuidelines`, taken off the
 /// definition so they are not sent to the provider.
 pub fn take_tool_prompt(tool: &mut Value) -> ToolPrompt {
     let name = tool
@@ -189,7 +185,7 @@ fn context_file_in(dir: &Path) -> Option<ContextFile> {
     None
 }
 
-/// pi's findGitPaths: the nearest folder with `.git`, and the repository's common git folder.
+/// Find the nearest folder with `.git`, and the repository's common git folder.
 fn git_paths(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
     let mut dir = cwd.to_path_buf();
     loop {
@@ -226,7 +222,7 @@ fn within(parent: &Path, child: &Path) -> bool {
 }
 
 /// The main checkout's AGENTS file that a nested linked worktree's own copy shadows, so the
-/// same instructions are not given twice (pi's findShadowedContextFile).
+/// same instructions are not given twice.
 fn shadowed_context_file(cwd: &Path) -> Option<PathBuf> {
     let (repo_dir, common) = git_paths(cwd)?;
     let common = canonical(&common);
@@ -242,7 +238,7 @@ fn shadowed_context_file(cwd: &Path) -> Option<PathBuf> {
     Some(main_root.join(Path::new(&own.path).file_name()?))
 }
 
-/// pi's loadProjectContextFiles: the global AGENTS file, then those from the filesystem root
+/// Load the global AGENTS file, then those from the filesystem root
 /// down to the working directory.
 pub fn context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     let cwd = resolve(Path::new("/"), cwd);
@@ -276,7 +272,7 @@ pub fn context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     files
 }
 
-/// YAML frontmatter between a leading `---` and the next `\n---`, as pi's parseFrontmatter.
+/// YAML frontmatter between a leading `---` and the next `\n---`.
 /// None when the frontmatter does not parse.
 fn frontmatter(content: &str) -> Option<serde_json::Map<String, Value>> {
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
@@ -298,7 +294,7 @@ fn frontmatter(content: &str) -> Option<serde_json::Map<String, Value>> {
     }
 }
 
-/// pi's loadSkillFromFile, without its warnings.
+/// Load a skill from a file without warnings.
 fn skill_from_file(path: &Path) -> Option<Skill> {
     let content = read_text(path)?;
     let front = frontmatter(&content)?;
@@ -326,7 +322,7 @@ fn skill_from_file(path: &Path) -> Option<Skill> {
     })
 }
 
-/// Ignore files read so far, innermost last (pi applies .gitignore, .ignore and .fdignore).
+/// Ignore files read so far, innermost last (.gitignore, .ignore, and .fdignore).
 fn with_ignores(stack: &[Gitignore], dir: &Path) -> Vec<Gitignore> {
     let mut stack = stack.to_vec();
     let mut builder = GitignoreBuilder::new(dir);
@@ -354,7 +350,7 @@ fn ignored(stack: &[Gitignore], path: &Path, is_dir: bool) -> bool {
     false
 }
 
-/// pi's loadSkillsFromDirInternal: a folder with SKILL.md is one skill; otherwise its
+/// Load skills from a directory: a folder with SKILL.md is one skill; otherwise its
 /// subfolders are searched, and in the top folder loose .md files with a description count.
 fn skills_in_dir(dir: &Path, top: bool, stack: &[Gitignore], out: &mut Vec<Skill>) {
     let Ok(read) = std::fs::read_dir(dir) else {
@@ -400,7 +396,7 @@ fn skills_in_dir(dir: &Path, top: bool, stack: &[Gitignore], out: &mut Vec<Skill
     }
 }
 
-/// pi's loadSkills: `<agent dir>/skills`, then each `--skills` path; the first skill of a
+/// Load skills from `<agent dir>/skills`, then each `--skills` path; the first skill of a
 /// name wins.
 pub fn skills(cwd: &Path, sources: &Sources) -> Vec<Skill> {
     let cwd = resolve(Path::new("/"), cwd);
@@ -445,7 +441,7 @@ fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// pi's formatSkillsForPrompt, trimmed as pi uses it.
+/// Format the model-visible skills for the prompt.
 fn skills_section(skills: &[Skill], reader: &str) -> String {
     let visible: Vec<&Skill> = skills
         .iter()
@@ -714,7 +710,7 @@ mod tests {
             .iter()
             .map(|s| (s.name.as_str(), s.description.as_str()))
             .collect();
-        // A loose file without a name is named after its folder, as in pi.
+        // A loose file without a name is named after its folder.
         assert_eq!(
             names,
             [

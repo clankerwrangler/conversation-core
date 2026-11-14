@@ -13,7 +13,7 @@
 //! every unfinished call. On open, a saved call without a result gets an interrupted
 //! result; nothing is re-run.
 //!
-//! Built-in tools (pi's read, bash, edit, write, grep, find, ls) run inside the core: their
+//! Built-in tools (read, bash, edit, write, grep, find, ls) run inside the core: their
 //! `tool_call` event says `"builtin": true`, so the runner only shows it, and a `tool_result`
 //! event follows once the result is saved. A runner tool with the same name replaces a
 //! built-in; `--no-tool <name>` turns one off.
@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
-/// pi's harness gives up on a reply after this long without a sign of life
+/// Give up on a reply after this long without a sign of life
 /// (`prepared.streamStallMs` changes it).
 const STREAM_STALL_MS: u64 = 10 * 60_000;
 
@@ -216,7 +216,7 @@ pub fn run(
             }
             _ => unreachable!(),
         }
-        // pi's agent_settled: turns are over and nothing taken is waiting. `through` names
+        // Turns are over and nothing taken is waiting. `through` names
         // the last op taken, so a runner knows whether ops it sent since are still to come.
         if core.unsettled && core.queued.is_empty() {
             core.unsettled = false;
@@ -338,7 +338,7 @@ impl Core {
         let id = op.get("id").cloned().unwrap_or(Value::Null);
         let text = |key: &str| op.get(key).and_then(Value::as_str);
         match text("op") {
-            // pi's custom entry: harness bookkeeping the model never sees.
+            // Runner bookkeeping the model never sees.
             Some("record") => {
                 let ns = text("ns").ok_or_else(|| Error::Format("record needs ns".into()))?;
                 let data = op.get("data").cloned().unwrap_or(Value::Null);
@@ -501,13 +501,12 @@ impl Core {
         );
     }
 
-    /// pi's custom message: a message the model sees, added by the runner (family message,
-    /// background notice, reminder). Like pi's `triggerTurn`, it wakes the model unless
-    /// `"wake": false` (internal notes). During a turn it is added at the next safe point and
-    /// gets a reply in that turn (pi's steer), or with `"deliver": "follow_up"` after the turn.
+    /// A runner-added message the model sees. It wakes the model unless `"wake": false`.
+    /// During a turn it is added at the next safe point and gets a reply in that turn, or
+    /// with `"deliver": "follow_up"` after the turn.
     fn inject(&mut self, op: &Value) -> Result<()> {
         let m = op.get("message").cloned().unwrap_or(Value::Null);
-        // Text given as text is handed back as text (pi keeps custom content as given).
+        // Text given as text is handed back as text.
         let text = matches!(m.get("content"), Some(Value::String(_)));
         let content = match m.get("content") {
             Some(Value::String(s)) => json!([{"type": "text", "text": s}]),
@@ -728,7 +727,7 @@ impl Core {
     /// One turn, starting with `user` if given (else with what was just added). False if aborted.
     fn turn(&mut self, user: Option<Value>) -> Result<bool> {
         self.boundary()?;
-        // pi's agent_start: a turn begins (each turn of a chain, before its first request).
+        // A turn begins (each turn of a chain, before its first request).
         emit(json!({"ev": "turn_start"}));
         if let Some(user) = user {
             self.session.append("user", &user)?;
@@ -929,7 +928,7 @@ impl Core {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        // pi's promptSnippet / promptGuidelines go into the prompt, not to the provider.
+        // `promptSnippet` / `promptGuidelines` go into the prompt, not to the provider.
         let runner_prompts: Vec<prompt::ToolPrompt> = runner_tools
             .iter_mut()
             .map(prompt::take_tool_prompt)
@@ -953,7 +952,7 @@ impl Core {
             .get("instructions")
             .and_then(Value::as_str)
             .unwrap_or("");
-        // pi's forceSystemPrompt: `"basePrompt": false` sends the runner's instructions alone.
+        // `"basePrompt": false` sends the runner's instructions alone.
         let instructions = if prepared.get("basePrompt") == Some(&Value::Bool(false)) {
             preamble.to_string()
         } else {
@@ -1000,7 +999,7 @@ impl Core {
             provider: &provider_name,
             model: &model_id,
         };
-        // The level as the model accepts it (pi's clampThinkingLevel and thinkingLevelMap).
+        // Fit the reasoning level to the model's supported levels.
         let reasoning_setting =
             crate::models::reasoning(&model, self.models.get(&model_id), reasoning);
         let req = Request {
@@ -1049,8 +1048,7 @@ impl Core {
         if prepared.get("transport").and_then(Value::as_str) == Some("sse") {
             ready.transport = provider::Transport::Sse;
         }
-        // pi's before_provider_request / before_provider_headers: the runner may review and
-        // change the exact request (body and headers) before it is sent.
+        // The runner may review and change the exact request (body and headers) before it is sent.
         let review = prepared.get("reviewRequest");
         if review == Some(&Value::Bool(true)) || review.and_then(Value::as_str) == Some("body") {
             let mut request = ready.view();
@@ -1108,7 +1106,7 @@ impl Core {
         Ok(End::Failed)
     }
 
-    /// A reply that failed before anything was saved: saved empty with its error, as pi does
+    /// A reply that failed before anything was saved: saved empty with its error
     /// (the context leaves failed replies out).
     fn save_failed_reply(&self, target: &Target, end: &Value) -> Result<u64> {
         let mut message = provider::empty_reply(target);
@@ -1293,7 +1291,7 @@ impl Core {
                     };
                     let end = failure_end(&reason, provider_error.as_ref());
                     let Some(reply) = open else {
-                        // Nothing was saved: the failed reply is saved empty, as pi does.
+                        // Nothing was saved: the failed reply is saved empty.
                         let n = self.save_failed_reply(target, &end)?;
                         emit(error_event(&end, n));
                         return Ok(Streamed::Ended(End::Failed));
@@ -1369,7 +1367,7 @@ fn start_login(path: PathBuf, id: Value, provider: String, method: String, key: 
     });
 }
 
-/// The closing fields of a failed reply: pi's stopReason "error" and errorMessage (a fixed
+/// The closing fields of a failed reply: stopReason "error" and errorMessage (a fixed
 /// code such as `provider_http_429` or `context_length_exceeded`, never provider text), and
 /// the provider's own error when it sent one.
 fn failure_end(code: &str, provider_error: Option<&Value>) -> Value {
@@ -1395,7 +1393,7 @@ fn follow_up(op: &Value) -> bool {
     op.get("deliver").and_then(Value::as_str) == Some("follow_up")
 }
 
-/// pi's `completeSimple`: one request outside the conversation (titles), never saved. Runs on
+/// One request outside the conversation (titles), never saved. Runs on
 /// its own thread and ends with one `completed` event carrying the reply or an error.
 fn start_completion(
     request: Value,
@@ -1513,7 +1511,7 @@ fn user_message(input: &Value) -> Value {
         || json!([{"type": "text", "text": input.get("text").cloned().unwrap_or(Value::Null)}]),
     );
     let mut message = json!({"role": "user", "content": content, "timestamp": provider::now_ms()});
-    // The runner's id for this input (pi keeps a user message's `id`); never sent to the model.
+    // The runner's id for this input; never sent to the model.
     if let Some(id) = input.get("id").and_then(Value::as_str) {
         message["id"] = Value::String(id.to_string());
     }

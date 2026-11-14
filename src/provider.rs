@@ -23,12 +23,11 @@ pub struct Request<'a> {
     pub token: &'a str,
     pub account_id: Option<&'a str>,
     /// Outside Codex the instructions are the first input message, as "developer" for a
-    /// reasoning model that accepts that role and as "system" otherwise (as pi sends them).
+    /// reasoning model that accepts that role and as "system" otherwise.
     pub developer_role: bool,
-    /// Headers from the credentials, then from the model object (pi's `model.headers`, e.g.
-    /// grok-cli's client identification), merged over the defaults; a null value removes one.
+    /// Credential and model headers, merged over defaults; a null value removes one.
     pub extra_headers: Vec<&'a Value>,
-    /// The runner's model object (pi's shape): compat, input kinds and limits for Chat
+    /// The runner's Pi-compatible model object: compat, input kinds and limits for Chat
     /// Completions.
     pub model: &'a Value,
 }
@@ -47,7 +46,7 @@ pub(crate) fn codex_account(token: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_string())
 }
 
-/// pi's instruction role rule: "developer" when the model reasons and its
+/// Instruction role: "developer" when the model reasons and its
 /// `compat.supportsDeveloperRole` is not false.
 pub fn developer_role(model: &Value, reasoning: &crate::models::Reasoning) -> bool {
     reasoning.include && model.pointer("/compat/supportsDeveloperRole") != Some(&Value::Bool(false))
@@ -68,7 +67,7 @@ pub enum Piece {
         service_tier: Option<String>,
     },
     Failed(Failure),
-    /// The response's status and headers, as soon as they arrive (pi's after_provider_response).
+    /// The response's status and headers, as soon as they arrive.
     Response(Value),
     /// The provider's own error event, reduced to fixed tokens, just before the failure.
     ProviderError(Value),
@@ -217,8 +216,7 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    /// The request as it will be sent, for the runner to review (pi's before_provider_request
-    /// and before_provider_headers).
+    /// The exact request, for the runner to review before sending.
     pub fn view(&self) -> Value {
         let headers: serde_json::Map<String, Value> = self
             .headers
@@ -760,7 +758,7 @@ fn handle(
             report(Piece::Text(text("delta"), item))
         }
         "response.reasoning_summary_text.delta" => report(Piece::Reasoning(text("delta"))),
-        // Each summary part ends with a blank line, as pi streams it, so a reader of the live
+        // Each summary part ends with a blank line, so a reader of the live
         // summary can tell where one heading ends and the next begins.
         "response.reasoning_summary_part.done" => report(Piece::Reasoning("\n\n".into())),
         "response.output_item.done" => {
@@ -846,7 +844,7 @@ fn usage_from(usage: Option<&Value>) -> Value {
             .and_then(Value::as_u64)
             .unwrap_or(0)
     };
-    // As pi reads it: input_tokens includes cached and cache-write tokens.
+    // input_tokens includes cached and cache-write tokens.
     let (input, cached, written) = (
         get("/input_tokens"),
         get("/input_tokens_details/cached_tokens"),
@@ -862,7 +860,7 @@ pub fn zero_usage() -> Value {
     usage_from(None)
 }
 
-/// A new assistant message in pi's shape, before any content arrives.
+/// A new assistant message before any content arrives.
 pub fn empty_reply(target: &Target) -> Value {
     json!({
         "role": "assistant", "content": [], "api": target.api, "provider": target.provider,
@@ -871,7 +869,7 @@ pub fn empty_reply(target: &Target) -> Value {
     })
 }
 
-/// A finished output item as a pi content block. Async calls keep their marker.
+/// A finished output item as a content block. Async calls keep their marker.
 pub fn block_from_item(item: &Value) -> Option<Value> {
     match item.get("type").and_then(Value::as_str)? {
         "reasoning" => {

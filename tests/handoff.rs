@@ -1701,7 +1701,7 @@ fn a_provider_error_is_reported_and_saved_as_fixed_codes() {
         (json!("unknown"), json!("server"), json!("unknown"))
     );
     core.until("turn_end");
-    // The failed replies are saved, as pi saves them, but never sent to the model.
+    // Failed replies are saved but never sent to the model.
     assert_eq!(
         roles(&core.context()),
         ["user", "assistant", "user", "assistant"]
@@ -1732,7 +1732,7 @@ fn model_headers_are_merged_over_the_defaults_as_the_harness_does() {
     let (base, server) = server(vec![vec![text("a"), done()]]);
     let d = dir();
     let mut core = Core::start(&d, &base);
-    // grok-cli's model headers (pi's model.headers); a null removes a default.
+    // Grok CLI model headers: a null removes a default.
     core.extra = json!({"reviewRequest": true, "model": {"provider": "grok-cli",
         "headers": {"User-Agent": "grok-shell/1", "x-grok-model-override": "m", "accept": null}}});
     core.op(json!({"op": "send", "input": {"text": "hi"}}));

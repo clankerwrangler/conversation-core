@@ -1,4 +1,4 @@
-//! pi 1.5 `bash` (`bash.js`, `output-accumulator.js`, `utils/shell.js`, `child-process.js`):
+//! The `bash` tool:
 //! `bash -c` in its own process group, combined output kept to the last 2000 lines or 50KB,
 //! the full output in a temp file when that cuts anything.
 
@@ -301,7 +301,7 @@ struct Snapshot {
     full_output_path: Option<PathBuf>,
 }
 
-/// pi's `OutputAccumulator`: a decoded rolling tail, counts, and a temp file once output is big.
+/// Output accumulator: a decoded rolling tail, counts, and a temp file once output is big.
 struct Accumulator {
     pending: Vec<u8>,
     raw_chunks: Vec<u8>,
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn output_exit_codes_timeouts() {
-        // stdout and stderr are two pipes: both are kept, in arrival order (as in pi).
+        // stdout and stderr are two pipes: both are kept in arrival order.
         let (both, failed) = run_cmd(json!({"command": "echo hi; echo err >&2"}));
         let mut lines: Vec<&str> = both.lines().collect();
         lines.sort_unstable();

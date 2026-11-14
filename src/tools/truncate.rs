@@ -1,4 +1,4 @@
-//! pi 1.5 `core/tools/truncate.js`: shared output limits.
+//! Shared output limits.
 
 pub const DEFAULT_MAX_LINES: usize = 2000;
 pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
@@ -18,11 +18,11 @@ pub struct Truncation {
     pub first_line_exceeds_limit: bool,
 }
 
-/// `Number.MAX_SAFE_INTEGER`: pi's "no line limit".
+/// `Number.MAX_SAFE_INTEGER` represents no line limit.
 pub const NO_LINE_LIMIT: usize = 9_007_199_254_740_991;
 
 impl Truncation {
-    /// The truncation object pi keeps in `details`.
+    /// The truncation object kept in `details`.
     pub fn to_json(&self, max_lines: usize, max_bytes: usize) -> serde_json::Value {
         serde_json::json!({
             "content": self.content,

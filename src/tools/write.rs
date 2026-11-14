@@ -1,4 +1,4 @@
-//! pi 1.5 `write`: create parent directories, then write the file.
+//! The `write` tool: create parent directories, then write the file.
 
 use super::paths::{node_error, resolve_to_cwd};
 use super::{Context, Output, ToolResult, str_arg, with_file_lock};

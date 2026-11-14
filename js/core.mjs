@@ -66,7 +66,7 @@ export class Core extends EventEmitter {
   idle() { return this.#turn?.promise ?? Promise.resolve(); }
   get busy() { return this.#turn !== null; }
 
-  /** pi's custom message: the model sees it. Wakes the model unless `wake: false`. */
+  /** A runner-added message the model sees. Wakes the model unless `wake: false`. */
   addContext(message, { wake, deliver } = {}) {
     return this.#request("add_context", { message, ...(wake === false ? { wake } : {}), ...(deliver ? { deliver } : {}) },
       (id) => { if (wake !== false) this.#turnStarted(id); })
@@ -84,7 +84,7 @@ export class Core extends EventEmitter {
 
   // ---- anytime ----
 
-  /** pi's custom entry: bookkeeping the model never sees. Resolves to its record number. */
+  /** Bookkeeping the model never sees. Resolves to its record number. */
   record(ns, data) { return this.#request("record", { ns, data }).then((event) => event.n); }
   /** Choose model (`provider`, `model`) and/or `reasoning`. */
   setModel({ provider, model, reasoning } = {}) {
@@ -95,7 +95,7 @@ export class Core extends EventEmitter {
     return this.#request("history", { from, to, select }).then((event) => event.entries);
   }
   models(provider) { return this.#request("models", { provider }).then((event) => event.models); }
-  /** One request outside the conversation, never saved (pi's completeSimple). */
+  /** One request outside the conversation, never saved. */
   complete({ model, instructions, messages, reasoning }) {
     return this.#request("complete", { model, instructions, messages, reasoning }).then((event) => {
       if (event.error) throw new CoreError(event.error, "complete");

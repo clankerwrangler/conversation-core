@@ -1,8 +1,7 @@
-//! The OpenAI Chat Completions API (`openai-completions`), as pi 1.5 speaks it: what
-//! OpenRouter and other OpenAI-compatible endpoints take. Built from pi-ai's
-//! `openai-completions.js` and `transform-messages.js`.
+//! The OpenAI Chat Completions API (`openai-completions`) for OpenRouter and other
+//! OpenAI-compatible endpoints.
 //!
-//! Covered: pi's compatibility detection and `model.compat` overrides, message conversion
+//! Covered: compatibility detection and `model.compat` overrides, message conversion
 //! (including replay of another model's history: its thinking is dropped and long tool
 //! call ids are shortened), tools, the OpenRouter and OpenAI reasoning settings, Anthropic
 //! cache markers for OpenRouter's anthropic/ models, OpenRouter session affinity and billed
@@ -16,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 pub const API: &str = "openai-completions";
 
-/// pi's resolved compatibility settings (`getCompat`): detected from the provider and
+/// Resolved compatibility settings: detected from the provider and
 /// endpoint, then overridden by `model.compat`.
 #[derive(Debug, Clone)]
 pub struct Compat {
@@ -199,7 +198,7 @@ fn replace_images(content: &[Value], placeholder: &str) -> Vec<Value> {
     out
 }
 
-/// pi's shortHash (a 53-bit cyrb53-style hash in base 36), for shortening tool call ids.
+/// A Pi-compatible 53-bit cyrb53-style hash in base 36, for shortening tool call ids.
 fn short_hash(s: &str) -> String {
     let (mut h1, mut h2): (u32, u32) = (0xdeadbeef, 0x41c6ce57);
     for ch in s.encode_utf16() {
@@ -239,7 +238,7 @@ fn clean(s: &str) -> String {
         .collect()
 }
 
-/// pi's normalizeToolCallId for Chat Completions: Responses ids `call|item` become
+/// Normalize Chat Completions tool call ids: Responses ids `call|item` become
 /// `call_item`, shortened with a hash past 40 characters.
 fn normalize_id(id: &str, model: &Value) -> String {
     if let Some((call, item)) = id.split_once('|') {
@@ -263,7 +262,7 @@ fn normalize_id(id: &str, model: &Value) -> String {
     id.to_string()
 }
 
-/// pi's transformMessages: images a model cannot take become a note; another model's
+/// Transform messages: images a model cannot take become a note; another model's
 /// thinking is dropped and its tool call ids normalized; failed replies are left out; a call
 /// without a result gets a placeholder. A late result becomes a user message at
 /// its actual position: Chat Completions requires tool messages next to their call.
@@ -446,7 +445,7 @@ fn image_part(block: &Value) -> Value {
     json!({"type": "image_url", "image_url": {"url": format!("data:{};base64,{}", text(block, "mimeType"), text(block, "data"))}})
 }
 
-/// pi's convertMessages: the system prompt first, then the conversation.
+/// Convert messages: the system prompt first, then the conversation.
 pub fn messages(model: &Value, c: &Compat, instructions: &str, context: &[Value]) -> Vec<Value> {
     let reasoning = model.get("reasoning") == Some(&Value::Bool(true));
     let role = if reasoning && c.supports_developer_role {
@@ -664,7 +663,7 @@ fn tool(definition: &Value, c: &Compat) -> Value {
     json!({"type": "function", "function": function})
 }
 
-/// pi-ai's estimateContextTokens (3.5 characters a token), for the output limit.
+/// Estimate context tokens at 3.5 characters per token for the output limit.
 fn estimate(messages: &[Value]) -> u64 {
     let len = |s: &str| s.encode_utf16().count();
     let content_chars = |content: &Value| -> usize {
@@ -721,7 +720,7 @@ fn estimate(messages: &[Value]) -> u64 {
     }
 }
 
-/// pi's buildParams for a streamed request.
+/// Build parameters for a streamed request.
 pub fn body(
     model: &Value,
     instructions: &str,
@@ -809,7 +808,7 @@ pub fn body(
             body.insert(k.clone(), v.clone());
         }
     }
-    // pi builds the object in this order; keep "messages" second as pi's params do.
+    // Keep `messages` second to preserve request field order.
     let mut ordered = Map::new();
     for key in ["model", "messages"] {
         if let Some(v) = body.remove(key) {
@@ -857,7 +856,7 @@ fn mark_cache(messages: &mut [Value], tools: &mut [Value]) {
     }
 }
 
-/// The headers pi's client sends: authorization, then session affinity, then the
+/// Request headers: authorization, then session affinity, then the
 /// credentials' and model's headers.
 pub fn headers(model: &Value, token: &str, session_id: &str) -> Vec<(String, String)> {
     let c = compat(model);
@@ -899,7 +898,7 @@ enum Block {
     },
 }
 
-/// One streamed reply, chunk by chunk (pi's stream loop).
+/// One streamed reply, chunk by chunk.
 #[derive(Default)]
 pub struct Reply {
     blocks: Vec<Block>,
@@ -1199,7 +1198,7 @@ mod tests {
 
     #[test]
     fn short_hash_matches_pi() {
-        // Values from pi's shortHash.
+        // Pi-compatible hash examples.
         assert_eq!(
             normalize_id("call_abc|fc_123", &json!({})),
             "call_abc_fc_123"

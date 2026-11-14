@@ -68,7 +68,7 @@ impl Models {
     }
 }
 
-/// What a reply cost: pi's `calculateCost` with the model's `cost` rates (dollars per
+/// What a reply cost, using the model's `cost` rates (dollars per
 /// million tokens, with optional `tiers` above an input size), then the harness's
 /// service-tier pricing (flex half, priority double).
 pub struct Pricing {
@@ -160,7 +160,7 @@ impl Pricing {
     }
 }
 
-/// pi's applyOpenRouterReportedCost.
+/// Apply the cost reported by OpenRouter.
 fn apply_openrouter_cost(usage: &mut Value, reported: &Value) {
     let valid = |v: Option<&Value>| {
         v.and_then(Value::as_f64)
@@ -203,7 +203,7 @@ fn apply_openrouter_cost(usage: &mut Value, reported: &Value) {
 
 const LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// pi's `getSupportedThinkingLevels`.
+/// Get the supported thinking levels.
 fn supported_levels(reasoning: bool, map: Option<&Value>) -> Vec<&'static str> {
     if !reasoning {
         return vec!["off"];
@@ -217,7 +217,7 @@ fn supported_levels(reasoning: bool, map: Option<&Value>) -> Vec<&'static str> {
         .collect()
 }
 
-/// pi's `clampThinkingLevel`: the requested level if supported, else the nearest higher
+/// Fit the reasoning level: the requested level if supported, else the nearest higher
 /// one, else the nearest lower one.
 fn clamp(reasoning: bool, map: Option<&Value>, level: &str) -> &'static str {
     let available = supported_levels(reasoning, map);
@@ -248,7 +248,8 @@ pub struct Reasoning {
 }
 
 /// `requested` is the session's level (None = off). `model` is the runner's model object
-/// (pi's shape); `reasoning` and `thinkingLevelMap` missing there come from the models file.
+/// (in Pi-compatible format); missing `reasoning` and `thinkingLevelMap` fields come from
+/// the models file.
 /// A model nobody describes keeps the old behaviour: the level is sent as given.
 pub fn reasoning(model: &Value, file: Option<&Value>, requested: Option<&str>) -> Reasoning {
     let field = |key: &str| model.get(key).or_else(|| file.and_then(|f| f.get(key)));
@@ -340,7 +341,7 @@ mod tests {
         };
         let plain = Pricing::new(&codex, Some(&file), None);
         let c = cost(&plain, 1000, None);
-        // Same operations in the same order as pi, so the same floating-point results.
+        // Preserve operation order for Pi-compatible floating-point results.
         assert_eq!(c["input"], json!((2.0 / 1_000_000.0) * 1000.0));
         assert_eq!(c["output"], json!((10.0 / 1_000_000.0) * 500.0));
         assert_eq!(c["cacheRead"], json!((0.1 / 1_000_000.0) * 1000.0));

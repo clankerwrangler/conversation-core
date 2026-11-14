@@ -1,9 +1,8 @@
-//! Sign-in, kept by the core itself: the providers' sign-in flows (as pi and the grok-cli
-//! add-on run them), the stored credentials, and their renewal.
+//! Provider sign-in, credential storage, and renewal.
 //!
 //! Credentials live in one file (`--auth <file>`, default
-//! `~/.local/share/conversation-core/auth.json`), in pi's `auth.json` shape, readable only by its
-//! owner:
+//! `~/.local/share/conversation-core/auth.json`), in a Pi-compatible `auth.json` format.
+//! The file is readable only by its owner:
 //!
 //! ```json
 //! {"openai-codex": {"type": "oauth", "access": "...", "refresh": "...", "expires": 0, "accountId": "..."},
@@ -495,7 +494,7 @@ fn poll_device(
     Err("sign_in_timed_out".into())
 }
 
-/// OpenAI's device sign-in for Codex (pi's loginOpenAICodexDeviceCode).
+/// OpenAI's device sign-in for Codex.
 fn codex_device(show: &dyn Fn(Step)) -> Result<Value, String> {
     let auth = codex_auth();
     let (status, body) = post(
@@ -568,7 +567,7 @@ fn codex_exchange(code: &str, verifier: &str, redirect: &str) -> Result<Value, S
     credential_from(CODEX, &body, &url)
 }
 
-/// OpenAI's browser sign-in (pi's loginOpenAICodex), finished by pasting the address the
+/// OpenAI's browser sign-in, finished by pasting the address the
 /// browser ends on (http://localhost:1455/auth/callback?code=...).
 fn codex_browser(show: &dyn Fn(Step), paste: &dyn Fn() -> Option<String>) -> Result<Value, String> {
     let (verifier, challenge) = pkce();
@@ -700,7 +699,7 @@ fn grok_browser(show: &dyn Fn(Step), paste: &dyn Fn() -> Option<String>) -> Resu
     credential_from(GROK, &body, &token_url)
 }
 
-/// OpenRouter's sign-in (pi's loginOpenRouter): it ends with a lasting API key.
+/// OpenRouter's sign-in: it ends with a lasting API key.
 fn openrouter_browser(
     show: &dyn Fn(Step),
     paste: &dyn Fn() -> Option<String>,

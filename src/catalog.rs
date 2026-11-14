@@ -2,10 +2,11 @@
 //! details it wants to set itself); the core fills in the rest:
 //!
 //! - OpenRouter: OpenRouter's own model list, fetched from OpenRouter (`/models/user` with
-//!   the account's key, the models and prices that key may use, as pi does; `/models`
-//!   without one), cached in `<catalog-dir>/openrouter.json` and refreshed every 4 hours.
-//! - Every other provider (Codex, xAI): the models file, whose entries are full model
-//!   descriptions in pi's shape.
+//!   the account's key to get its permitted models and prices, or `/models` without one), cached in
+//!   `<catalog-dir>/openrouter.json` and refreshed every 4 hours.
+//! - Codex and Grok: their provider model lists, with the models file as fallback.
+//!
+//! The models file uses the Pi-compatible model format.
 
 use crate::grok;
 use crate::models::Models;
@@ -30,7 +31,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// pi's openRouterCost: OpenRouter's dollars per token as dollars per million tokens, with
+/// Convert OpenRouter's dollars per token to dollars per million tokens, with
 /// prompt-length overrides as tiers.
 fn per_million(value: Option<&Value>, fallback: f64) -> f64 {
     let parsed = match value {
@@ -72,7 +73,7 @@ fn cost(pricing: Option<&Value>) -> Value {
     out
 }
 
-/// One entry of OpenRouter's list as a model description in pi's shape. None for models
+/// One entry of OpenRouter's list as a model description. None for models
 /// that cannot chat.
 pub fn openrouter_model(entry: &Value, base_url: &str) -> Option<Value> {
     let id = entry.get("id")?.as_str()?;
@@ -201,8 +202,8 @@ const CODEX_BASE: &str = "https://chatgpt.com/backend-api";
 /// OpenAI lists a model only to clients at least as new as its `minimal_client_version`.
 const CODEX_CLIENT_VERSION: &str = "1.5.0";
 
-/// One entry of OpenAI's Codex list as a model description in pi's shape. The reasoning
-/// levels it lists become pi's `thinkingLevelMap` (a level it does not list is null, so
+/// One entry of OpenAI's Codex list as a model description. The reasoning
+/// levels it lists become `thinkingLevelMap` (a level it does not list is null, so
 /// the session's level is fitted to the nearest one it has). OpenAI gives no prices.
 pub fn codex_model(entry: &Value, base_url: &str) -> Option<Value> {
     let id = entry.get("slug")?.as_str()?;
@@ -386,7 +387,7 @@ pub fn openrouter_models(dir: &Path, base_url: &str, key: Option<&str>) -> Vec<V
 
 /// What the core has learned about models from the providers' answers, by `provider/id`.
 /// OpenRouter's list does not say which models cannot switch reasoning off; when a provider
-/// refuses "off" for one, that is remembered here as pi's `thinkingLevelMap.off = null`.
+/// refuses "off" for one, that is remembered here as `thinkingLevelMap.off = null`.
 fn learned_path(dir: &Path) -> PathBuf {
     dir.join("learned.json")
 }
@@ -513,8 +514,7 @@ fn overlay(base: Option<Value>, over: Option<&Value>) -> Option<Value> {
 }
 
 /// A provider's list: the shipped one (the models file), updated by what was discovered:
-/// a discovered model's fields replace the shipped ones, and new models are added (as pi
-/// merges its built-in list with downloaded ones).
+/// a discovered model's fields replace the shipped ones, and new models are added.
 fn provider_models(
     models: &Models,
     dir: &Path,
@@ -623,7 +623,7 @@ mod tests {
             "thinkingLevelMap": {"off": "none", "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"},
             "contextWindow": 500000})
         );
-        // Fitted as pi fits it: minimal goes up to low.
+        // Minimal is fitted up to low.
         let r = |l: Option<&str>| crate::models::reasoning(&m, None, l).effort;
         assert_eq!(
             (r(None), r(Some("minimal"))),

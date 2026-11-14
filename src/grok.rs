@@ -1,15 +1,13 @@
-//! The Grok CLI proxy (`grok-cli`, cli-chat-proxy.grok.com): its client headers, its model
-//! list, and the request changes it needs, as the pi-grok-cli add-on makes them
-//! (`provider/stream.ts`, `models/catalog.ts`, `payload/sanitize.ts`).
+//! Grok CLI proxy client headers, model lists, and request transformations.
 
 use serde_json::{Map, Value, json};
 
 pub const PROVIDER: &str = "grok-cli";
 pub const BASE: &str = "https://cli-chat-proxy.grok.com/v1";
-/// The Grok Build release the add-on identifies as (the proxy rejects clients it deems too old).
+/// The Grok Build release used for client identification (the proxy rejects clients it deems too old).
 const VERSION: &str = "1.0.70";
 const ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
-/// Models whose reasoning effort can be set (the add-on's EFFORT_CAPABLE_PREFIXES).
+/// Models whose reasoning effort can be set.
 const EFFORT_PREFIXES: [&str; 6] = [
     "grok-3-mini",
     "grok-4.20-multi-agent",
@@ -25,8 +23,8 @@ pub fn headers(model_id: &str) -> Value {
         "x-grok-client-version": VERSION, "x-xai-token-auth": "xai-grok-cli", "x-grok-model-override": model_id})
 }
 
-/// One entry of the proxy's `/models` list as a model description in pi's shape. The
-/// largest context window it offers is used, as the add-on does (500k). No prices are given.
+/// One entry of the proxy's `/models` list as a model description. The
+/// largest context window it offers is used (500k). No prices are given.
 pub fn model(entry: &Value, base_url: &str) -> Option<Value> {
     let id = entry.get("id")?.as_str()?;
     let efforts: Vec<&str> = entry

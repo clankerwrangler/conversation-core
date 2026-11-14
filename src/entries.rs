@@ -1,13 +1,13 @@
-//! History as the core hands it out: one complete entry per message or note, in pi's
+//! History as the core hands it out: one complete entry per message or note, in the Pi-compatible
 //! entry shape (`type`, `id`, `timestamp`), with stored data read back. How records are
 //! kept on disk (a reply saved in parts, bulky parts in side files, short field names) is
 //! the store's business and does not show here.
 //!
 //! - a message: `{"type": "message", "message"}` (user, assistant, toolResult);
-//! - a message the runner added (pi's custom message):
+//! - a message the runner added:
 //!   `{"type": "custom_message", "customType", "content", "display", "details"?}`;
-//! - runner bookkeeping (pi's custom entry): `{"type": "custom", "customType", "data"}`;
-//! - `model_change` / `thinking_level_change` as pi has them.
+//! - runner bookkeeping: `{"type": "custom", "customType", "data"}`;
+//! - `model_change` / `thinking_level_change` entries.
 //!
 //! `id` is the record's sequence number, as text. There are no parent links: the history
 //! has no branches. A reply still being written is not handed out, nor is anything after
@@ -69,7 +69,7 @@ fn message(record: &Value) -> Value {
     json!({"type": "message", "message": record.get("m")})
 }
 
-/// pi keeps a custom message's content as it was given: text stays text.
+/// Keep a custom message's content as given: text stays text.
 fn custom_message(record: &Value, source: &str) -> Value {
     let blocks = record.pointer("/m/content").cloned().unwrap_or(Value::Null);
     let content = match (record.get("text"), blocks.as_array().map(Vec::as_slice)) {

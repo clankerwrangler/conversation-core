@@ -1,4 +1,4 @@
-//! pi 1.5 `ls`: entries sorted case-insensitively, `/` after directories, dotfiles included.
+//! The `ls` tool: entries sorted case-insensitively, `/` after directories, dotfiles included.
 
 use super::paths::{access, node_error, resolve_to_cwd};
 use super::truncate::{DEFAULT_MAX_BYTES, NO_LINE_LIMIT, format_size, truncate_head};

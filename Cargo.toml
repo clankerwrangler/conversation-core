@@ -16,9 +16,9 @@ ureq = "3"
 # Codex's WebSocket transport, as the harness uses it.
 tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
-# Skill frontmatter, as pi reads it.
+# Skill frontmatter.
 serde_yaml = "0.9"
-# Built-in tools (pi 1.5's read, bash, edit, write, grep, find, ls).
+# Built-in tools: read, bash, edit, write, grep, find, and ls.
 globset = "0.4"
 grep-matcher = "0.1"
 grep-regex = "0.1"

@@ -1,4 +1,4 @@
-//! pi 1.5 `find`: what `fd --glob --color=never --hidden [--no-require-git] --max-results N
+//! The `find` tool: what `fd --glob --color=never --hidden [--no-require-git] --max-results N
 //! [--full-path]` prints, built on the libraries fd uses (`ignore`, `globset`). Results are in
 //! walk order sorted by name (fd's own order is not deterministic).
 

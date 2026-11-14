@@ -283,7 +283,7 @@ fn main() -> ExitCode {
             }
         }
         // The Chat Completions request body for the session's context and a model object
-        // (pi's shape), with no instructions or tools: for comparing with pi.
+        // in the Pi-compatible format, with no instructions or tools.
         [_, cmd, dir, model, level] if cmd == "chat-body" => std::fs::read_to_string(model)
             .map_err(|e| store::Error::Io(model.into(), e))
             .and_then(|text| {

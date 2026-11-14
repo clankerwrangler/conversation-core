@@ -1,6 +1,6 @@
-//! The context budget: pi's token estimate, the context usage line, and the overflow guard.
+//! The context budget: token estimates, the context usage line, and the overflow guard.
 //!
-//! The estimate is pi's `estimateContextTokens`: the provider's exact count for the last
+//! The estimate uses the provider's exact count for the last
 //! reply (`usage.totalTokens`) plus chars/4 for every message after it. A count from before
 //! the latest checkpoint is not trusted (the context it measured was replaced).
 //!
@@ -14,7 +14,7 @@
 use serde_json::{Value, json};
 use std::path::Path;
 
-/// pi's `ESTIMATED_IMAGE_CHARS`.
+/// Estimated characters per image.
 const IMAGE_CHARS: usize = 4800;
 
 fn utf16(s: &str) -> usize {
@@ -36,7 +36,7 @@ fn text_and_image_chars(content: &Value) -> usize {
     }
 }
 
-/// pi's `estimateTokens` for one message: chars / 4, rounded up.
+/// Estimate tokens for one message: chars / 4, rounded up.
 pub fn estimate_tokens(message: &Value) -> u64 {
     let chars = match message.get("role").and_then(Value::as_str) {
         Some("user" | "toolResult") => {
@@ -65,7 +65,7 @@ pub fn estimate_tokens(message: &Value) -> u64 {
     chars.div_ceil(4) as u64
 }
 
-/// pi's `calculateContextTokens` for a reply whose usage counts (not aborted, failed or zero).
+/// Context tokens for a reply whose usage counts (not aborted, failed or zero).
 fn usage_tokens(message: &Value) -> Option<u64> {
     if message.get("role").and_then(Value::as_str) != Some("assistant") {
         return None;
@@ -77,7 +77,7 @@ fn usage_tokens(message: &Value) -> Option<u64> {
     context_tokens(message.get("usage")?)
 }
 
-/// pi's `calculateContextTokens`: the provider's total, or the sum of its parts; None if zero.
+/// Context tokens: the provider's total, or the sum of its parts; None if zero.
 pub fn context_tokens(usage: &Value) -> Option<u64> {
     let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
     let tokens = match n("totalTokens") {

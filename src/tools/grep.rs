@@ -1,6 +1,7 @@
-//! pi 1.5 `grep`: what `rg --no-config --json --line-number --color=never --hidden
+//! The `grep` tool: what `rg --no-config --json --line-number --color=never --hidden
 //! [--ignore-case] [--fixed-strings] [--glob G]` finds, built on ripgrep's own libraries,
-//! formatted like pi. Files are searched in name order (rg's parallel order is not deterministic).
+//! formatted as tool output. Files are searched in name order (rg's parallel order is not
+//! deterministic).
 
 use super::paths::{relative, resolve_to_cwd};
 use super::truncate::{

@@ -208,8 +208,8 @@ impl Session {
         self.tail()
     }
 
-    /// A message injected by the runner (pi's custom message): a `user` record whose
-    /// `source` says who added it, with pi's `display` flag and `details`.
+    /// A message injected by the runner: a `user` record whose
+    /// `source` says who added it, with a `display` flag and `details`.
     pub fn append_injected(
         &self,
         message: &Value,
@@ -232,7 +232,7 @@ impl Session {
         Ok(serde_json::from_str(&read(&self.dir.join("meta.json"))?)?)
     }
 
-    /// Record a model or reasoning change (pi's `model_change` / `thinking_level_change`)
+    /// Record a model or reasoning change (`model_change` / `thinking_level_change`)
     /// and keep the current choice in meta.json.
     pub fn select(
         &self,

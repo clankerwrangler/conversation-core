@@ -1,5 +1,4 @@
-//! pi 1.5 image handling for `read` (`utils/mime.js`, `image-process.js`, `image-resize-core.js`),
-//! with the `image` crate in place of Photon: same sniffing, limits and encoding search.
+//! Image handling for `read`: format sniffing, size limits, and encoding search using `image`.
 
 use base64::Engine;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, imageops::FilterType};
@@ -123,7 +122,7 @@ fn format_of(mime: &str) -> Option<ImageFormat> {
     }
 }
 
-/// Decode, applying EXIF orientation for JPEG and WebP as pi's `applyExifOrientation` does.
+/// Decode and apply EXIF orientation for JPEG and WebP.
 fn decode(bytes: &[u8], mime: &str) -> Option<DynamicImage> {
     let mut reader = ImageReader::new(Cursor::new(bytes));
     reader.set_format(format_of(mime)?);

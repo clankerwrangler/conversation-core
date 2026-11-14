@@ -1,4 +1,4 @@
-//! pi 1.5 path handling (`utils/paths.js`, `core/tools/path-utils.js`), Unix only.
+//! Path handling on Unix.
 
 use std::path::{Component, Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;

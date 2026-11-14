@@ -1,4 +1,4 @@
-//! pi 1.5 `read`: text with offset/limit and continuation notices, or an image attachment.
+//! The `read` tool: text with offset/limit and continuation notices, or an image attachment.
 
 use super::paths::{access, node_error, resolve_read_path};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncate_head};

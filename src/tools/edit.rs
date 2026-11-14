@@ -1,4 +1,4 @@
-//! pi 1.5 `edit` (`edit.js`, `edit-diff.js`): exact replacement, then a fuzzy fallback that
+//! The `edit` tool: exact replacement, then a fuzzy fallback that
 //! normalizes trailing spaces, quotes, dashes and special spaces; line endings and a BOM are kept.
 
 use super::paths::{access, error_code, node_error, resolve_to_cwd};
