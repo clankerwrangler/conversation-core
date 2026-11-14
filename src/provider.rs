@@ -760,6 +760,9 @@ fn handle(
             report(Piece::Text(text("delta"), item))
         }
         "response.reasoning_summary_text.delta" => report(Piece::Reasoning(text("delta"))),
+        // Each summary part ends with a blank line, as pi streams it, so a reader of the live
+        // summary can tell where one heading ends and the next begins.
+        "response.reasoning_summary_part.done" => report(Piece::Reasoning("\n\n".into())),
         "response.output_item.done" => {
             if let Some(item) = event.get("item") {
                 if let Some(id) = item.get("id").and_then(Value::as_str) {

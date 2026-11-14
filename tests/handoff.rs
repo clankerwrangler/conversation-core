@@ -188,6 +188,8 @@ struct Core {
     extra: Value,
     /// Return `provider_response` events instead of skipping them.
     show_responses: bool,
+    /// Return `reasoning_delta` events instead of skipping them.
+    show_reasoning: bool,
     /// The prepare_request events answered so far.
     prepares: Vec<Value>,
 }
@@ -228,6 +230,7 @@ impl Core {
             tools,
             extra: json!({}),
             show_responses: false,
+            show_reasoning: false,
             prepares: Vec::new(),
         }
     }
@@ -273,6 +276,7 @@ impl Core {
                     json!({"op": "credentials", "id": ev["id"], "token": "t", "accountId": "acct"}),
                 ),
                 Some("provider_response") if self.show_responses => return ev,
+                Some("reasoning_delta") if self.show_reasoning => return ev,
                 Some("text_delta")
                 | Some("reasoning_delta")
                 | Some("window_unknown")
@@ -352,6 +356,61 @@ fn a_session_has_one_writing_core_at_a_time() {
     third.op(json!({"op": "context"}));
     third.until("context");
     third.stop();
+}
+#[test]
+fn reasoning_summary_parts_stream_with_a_break_after_each_as_pi_streams_them() {
+    let summary = |index: u64, delta: &str| {
+        Step::Event(
+            json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "summary_index": index, "delta": delta}),
+        )
+    };
+    let part_done = |index: u64, text: &str| {
+        Step::Event(
+            json!({"type": "response.reasoning_summary_part.done", "item_id": "rs_1", "summary_index": index, "part": {"type": "summary_text", "text": text}}),
+        )
+    };
+    let (base, server) = server(vec![vec![
+        summary(0, "**Checking"),
+        summary(0, " files**"),
+        part_done(0, "**Checking files**"),
+        summary(1, "**Saving**"),
+        part_done(1, "**Saving**"),
+        item_done(
+            json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "**Checking files**"}, {"type": "summary_text", "text": "**Saving**"}]}),
+        ),
+        text("done"),
+        done(),
+    ]]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.show_reasoning = true;
+    core.op(json!({"op": "send", "input": {"text": "hi"}}));
+    let mut streamed = String::new();
+    loop {
+        let ev = core.next();
+        match ev["ev"].as_str() {
+            Some("reasoning_delta") => streamed.push_str(ev["delta"].as_str().unwrap()),
+            Some("turn_end") => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        streamed, "**Checking files**\n\n**Saving**\n\n",
+        "a reader of the live summary sees where each heading ends"
+    );
+    let ctx = core.context();
+    let thinking = ctx[1]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "thinking")
+        .expect("the summary is saved");
+    assert_eq!(
+        thinking["thinking"], "**Checking files**\n\n**Saving**",
+        "the saved summary is unchanged"
+    );
+    server.join().unwrap();
+    core.stop();
 }
 #[test]
 fn reply_text_is_saved_with_when_its_first_words_arrived() {
@@ -1086,7 +1145,10 @@ fn referenced_lists_the_files_the_context_points_to() {
 
 #[test]
 fn reap_accepts_only_the_protocol_it_implements_and_refuses_before_deleting() {
-    let (base, server) = server(vec![vec![call("c1", json!({"a": 1})), done()], vec![text("ok"), done()]]);
+    let (base, server) = server(vec![
+        vec![call("c1", json!({"a": 1})), done()],
+        vec![text("ok"), done()],
+    ]);
     let d = dir();
     let mut core = Core::start(&d, &base);
     core.op(json!({"op": "send", "input": {"text": "go"}}));
@@ -1110,15 +1172,31 @@ fn reap_accepts_only_the_protocol_it_implements_and_refuses_before_deleting() {
             .output()
             .unwrap()
     };
-    for refused in [&["--protocol", "1"][..], &["--protocol", "3"], &["--protocol"], &["--unknown", "x"]] {
+    for refused in [
+        &["--protocol", "1"][..],
+        &["--protocol", "3"],
+        &["--protocol"],
+        &["--unknown", "x"],
+    ] {
         assert!(!reap(refused).status.success(), "{refused:?}");
     }
-    assert!(before.iter().any(|n| n.ends_with(".payload.jsonl")), "stored tool data exists: {before:?}");
+    assert!(
+        before.iter().any(|n| n.ends_with(".payload.jsonl")),
+        "stored tool data exists: {before:?}"
+    );
     assert_eq!(listing(), before, "a refused cleanup deletes nothing");
     let out = reap(&["--keep-details", "ok", "--protocol", "2"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(result["deleted"], json!([]), "the current chunk is never touched");
+    assert_eq!(
+        result["deleted"],
+        json!([]),
+        "the current chunk is never touched"
+    );
     core.stop();
 }
 
