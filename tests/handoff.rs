@@ -6,7 +6,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
@@ -2021,4 +2022,173 @@ fn after_a_crash_a_saved_call_gets_an_interrupted_result_and_is_not_rerun() {
     );
     assert_eq!(ctx[1]["stopReason"], "error", "the open reply was closed");
     again.stop();
+}
+
+/// A counted fake Responses server that accepts requests until `stop` is set, counting every
+/// incoming provider request (even unexpected retries past the scripted replies).
+struct CountedServer {
+    base: String,
+    requests: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Vec<Value>>>,
+}
+
+impl CountedServer {
+    fn start(replies: Vec<Vec<Step>>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reqs = Arc::clone(&requests);
+        let stop_flag = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut replies = replies.into_iter();
+            let mut bodies = Vec::new();
+            let mut writers = Vec::new();
+            while !stop_flag.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        reqs.fetch_add(1, Ordering::SeqCst);
+                        bodies.push(read_request(&mut stream));
+                        let reply = replies
+                            .next()
+                            .unwrap_or_else(|| vec![text("unexpected-retry"), done()]);
+                        writers.push(std::thread::spawn(move || {
+                            if let Some(Step::Status(code, body)) = reply.first() {
+                                let _ = stream.write_all(
+                                    format!(
+                                        "HTTP/1.1 {code} Error\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                        body.len()
+                                    )
+                                    .as_bytes(),
+                                );
+                                return;
+                            }
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                            );
+                            for step in reply {
+                                match step {
+                                    Step::Event(e) => {
+                                        let _ = stream.write_all(format!("data: {e}\n\n").as_bytes());
+                                        let _ = stream.flush();
+                                    }
+                                    Step::Pause(ms) => std::thread::sleep(Duration::from_millis(ms)),
+                                    Step::Drop | Step::Status(..) => break,
+                                }
+                            }
+                        }));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            }
+            for w in writers {
+                let _ = w.join();
+            }
+            bodies
+        });
+        Self {
+            base,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> (usize, Vec<Value>) {
+        self.stop.store(true, Ordering::SeqCst);
+        let bodies = self.handle.take().unwrap().join().unwrap();
+        (self.requests.load(Ordering::SeqCst), bodies)
+    }
+}
+
+#[test]
+fn eof_during_retry_backoff_with_running_builtin_saves_result_without_retrying() {
+    let builtin = item_done(json!({
+        "type": "function_call",
+        "id": "fc_c1",
+        "call_id": "c1",
+        "name": "bash",
+        "arguments": json!({"command": "sleep 1.4; printf builtin-saved"}).to_string(),
+        "async": true
+    }));
+    let srv = CountedServer::start(vec![vec![builtin, done()], vec![Step::Drop]]);
+    let d = dir();
+    let mut core = Core::start(&d, &srv.base);
+    core.op(json!({"op": "send", "input": {"text": "go"}}));
+    assert_eq!(core.until("tool_call")["builtin"], true);
+    assert_eq!(core.until("retry")["attempt"], 2);
+    // Close stdin while the 1.4s async built-in is still running (longer than the 1s backoff).
+    let Core {
+        mut child, stdin, ..
+    } = core;
+    drop(stdin);
+    let _ = child.wait().unwrap();
+    let (count, _bodies) = srv.finish();
+    assert_eq!(
+        count, 2,
+        "must not start a retry after stdin EOF while waiting for a running built-in"
+    );
+    // Verify the outstanding built-in result was preserved in the session before exiting.
+    let mut inspect = Core::start(&d, "http://127.0.0.1:9");
+    let ctx = inspect.context();
+    assert!(
+        ctx.iter().any(|m| {
+            m["role"] == "toolResult"
+                && m["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("builtin-saved"))
+        }),
+        "running built-in result must be saved before exit: {ctx:?}"
+    );
+    inspect.stop();
+}
+
+#[test]
+fn abort_during_retry_backoff_cancels_retry_and_runs_queued_send() {
+    let srv = CountedServer::start(vec![vec![Step::Drop], vec![text("after-abort"), done()]]);
+    let d = dir();
+    let mut core = Core::start(&d, &srv.base);
+    core.op(json!({"op": "send", "input": {"text": "first"}}));
+    assert_eq!(core.until("retry")["attempt"], 2);
+    let started = std::time::Instant::now();
+    // Abort during the 1s backoff and queue a separate send while keeping stdin open.
+    core.op(json!({"op": "abort"}));
+    core.op(json!({"op": "send", "input": {"text": "second"}}));
+    let aborted = core.until("turn_end");
+    assert_eq!(aborted["stopReason"], "aborted");
+    assert!(
+        started.elapsed() < Duration::from_millis(600),
+        "abort should cancel retry backoff promptly, took {:?}",
+        started.elapsed()
+    );
+    let next = core.until("turn_end");
+    assert_ne!(next["stopReason"], "aborted");
+    let ctx = core.context();
+    assert!(
+        ctx.iter().any(|m| {
+            m["role"] == "assistant"
+                && m["content"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|p| p["text"] == "after-abort"))
+        }),
+        "queued send should complete after abort: {ctx:?}"
+    );
+    core.stop();
+    let (count, bodies) = srv.finish();
+    assert_eq!(
+        count, 2,
+        "aborted request must not retry; only the queued send runs a second request"
+    );
+    assert!(
+        serde_json::to_string(&bodies[1])
+            .unwrap()
+            .contains("second"),
+        "second request should carry the queued send"
+    );
 }

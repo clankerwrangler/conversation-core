@@ -1093,7 +1093,9 @@ impl Core {
                 }
                 Streamed::Retry(reason) if attempt < MAX_ATTEMPTS => {
                     emit(json!({"ev": "retry", "attempt": attempt + 1, "error": reason}));
-                    std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
+                    if !self.wait_retry(Duration::from_secs(1 << (attempt - 1)))? {
+                        return Ok(End::Aborted);
+                    }
                 }
                 Streamed::Retry(reason) => {
                     let end = failure_end(&reason, None);
@@ -1104,6 +1106,34 @@ impl Core {
             }
         }
         Ok(End::Failed)
+    }
+
+    /// Wait out retry backoff while still handling mid-turn ops (including `abort`) and stdin EOF.
+    /// If stdin closes while built-ins are still running, never start another retry: keep waiting
+    /// until running built-ins finish saving their results, then stop cleanly.
+    fn wait_retry(&mut self, duration: Duration) -> Result<bool> {
+        let deadline = Instant::now() + duration;
+        loop {
+            let until = (!self.closed).then_some(deadline);
+            match self.recv_until(until)? {
+                None => {
+                    if self.closed {
+                        continue;
+                    }
+                    return Ok(true);
+                }
+                Some(Msg::Op(value)) => {
+                    if self.during_turn(value)? {
+                        self.abort(None)?;
+                        return Ok(false);
+                    }
+                }
+                Some(Msg::Piece(..) | Msg::Builtin(..)) => {}
+                Some(Msg::Closed) => {
+                    return Err(Error::Format("stdin closed during retry backoff".into()));
+                }
+            }
+        }
     }
 
     /// A reply that failed before anything was saved: saved empty with its error
