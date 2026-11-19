@@ -87,13 +87,44 @@ pub fn lock_writer(dir: &Path) -> Result<WriterLock> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl FileStamp {
+    fn from_metadata(meta: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TailCache {
+    chunk: u32,
+    last: u64,
+    stamp: FileStamp,
+}
+
 pub struct Session {
     dir: PathBuf,
+    tail: std::sync::Mutex<Option<TailCache>>,
 }
 
 struct Chunk {
     number: u32,
     records: Vec<Value>,
+    complete_tail: bool,
 }
 
 impl Session {
@@ -106,11 +137,13 @@ impl Session {
         write_new(&dir.join("state.json"), "{}")?;
         let session = Session {
             dir: dir.to_path_buf(),
+            tail: std::sync::Mutex::new(None),
         };
-        session.append_line(
+        let (stamp, written) = session.append_line(
             &session.log_path(1, None),
             &serde_json::json!({"n": 1, "k": "chunk", "chunk": 1, "prev": null}),
         )?;
+        session.note_chunk_append(1, 1, stamp, written);
         // meta.json last: a folder without it is not a session yet.
         write_new(
             &dir.join("meta.json"),
@@ -144,7 +177,7 @@ impl Session {
     }
 
     fn append_record(&self, kind: &str, message: &Value, extra: Value) -> Result<u64> {
-        let (chunk, last) = self.tail()?;
+        let (chunk, last) = self.tail_for_append()?;
         self.write_record(chunk, last + 1, &now_iso(), kind, message, extra)?;
         Ok(last + 1)
     }
@@ -162,8 +195,17 @@ impl Session {
     ) -> Result<()> {
         let mut sides: Vec<(&'static str, Value)> = Vec::new();
         let stored = self.split(chunk, n, message, &mut sides)?;
+        // Group side-file lines per file so each side file is opened and synced at most once per record.
+        let mut side_groups: Vec<(&'static str, Vec<&Value>)> = Vec::new();
         for (file, line) in &sides {
-            self.append_line(&self.log_path(chunk, Some(file)), line)?;
+            if let Some((_, lines)) = side_groups.iter_mut().find(|(f, _)| f == file) {
+                lines.push(line);
+            } else {
+                side_groups.push((*file, vec![line]));
+            }
+        }
+        for (file, lines) in side_groups {
+            self.append_lines(&self.log_path(chunk, Some(file)), &lines)?;
         }
         let mut record = serde_json::json!({"n": n, "t": t, "k": kind, "m": stored});
         if let (Value::Object(r), Value::Object(e)) = (&mut record, extra) {
@@ -173,12 +215,14 @@ impl Session {
                 }
             }
         }
-        self.append_line(&self.log_path(chunk, None), &record)
+        let (stamp, written) = self.append_line(&self.log_path(chunk, None), &record)?;
+        self.note_chunk_append(chunk, n, stamp, written);
+        Ok(())
     }
 
     /// A record the model never sees (`app` bookkeeping, `settings`): `{n, t, k, ...fields}`.
     pub fn append_entry(&self, kind: &str, fields: Value) -> Result<u64> {
-        let (chunk, last) = self.tail()?;
+        let (chunk, last) = self.tail_for_append()?;
         self.write_entry(chunk, last + 1, &now_iso(), kind, fields)?;
         Ok(last + 1)
     }
@@ -200,7 +244,9 @@ impl Session {
                 }
             }
         }
-        self.append_line(&self.log_path(chunk, None), &record)
+        let (stamp, written) = self.append_line(&self.log_path(chunk, None), &record)?;
+        self.note_chunk_append(chunk, n, stamp, written);
+        Ok(())
     }
 
     /// The current chunk and the highest record number in it.
@@ -558,20 +604,91 @@ impl Session {
         Ok(open)
     }
 
-    /// The current chunk and the highest sequence number in it.
-    fn tail(&self) -> Result<(u32, u64)> {
+    fn update_tail_cache(&self, chunk: u32, last: u64, stamp: FileStamp) {
+        *self.tail.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(TailCache { chunk, last, stamp });
+    }
+
+    fn note_chunk_append(&self, chunk: u32, n: u64, stamp: FileStamp, written: u64) {
+        let mut guard = self.tail.lock().unwrap_or_else(|e| e.into_inner());
+        match *guard {
+            Some(cached)
+                if cached.chunk == chunk
+                    && cached.stamp.dev == stamp.dev
+                    && cached.stamp.ino == stamp.ino
+                    && cached.stamp.len + written == stamp.len =>
+            {
+                *guard = Some(TailCache {
+                    chunk,
+                    last: cached.last.max(n),
+                    stamp,
+                });
+            }
+            None if stamp.len == written => {
+                *guard = Some(TailCache {
+                    chunk,
+                    last: n,
+                    stamp,
+                });
+            }
+            _ => {
+                *guard = None;
+            }
+        }
+    }
+
+    fn tail_inner(&self, require_complete: bool) -> Result<(u32, u64)> {
+        if let Some(cached) = *self.tail.lock().unwrap_or_else(|e| e.into_inner()) {
+            let path = self.log_path(cached.chunk, None);
+            let next = self.log_path(cached.chunk + 1, None);
+            if !next.exists()
+                && let Ok(meta) = fs::metadata(&path)
+                && FileStamp::from_metadata(&meta) == cached.stamp
+            {
+                return Ok((cached.chunk, cached.last));
+            }
+        }
         let chunk = *self
             .chunk_numbers()?
             .last()
             .ok_or_else(|| Error::Format("no chunk".into()))?;
-        let last = self
-            .load_chunk(chunk)?
+        let path = self.log_path(chunk, None);
+        let before = fs::metadata(&path).map_err(|e| Error::Io(path.clone(), e))?;
+        let loaded = self.load_chunk(chunk)?;
+        let last = loaded
             .records
             .iter()
             .filter_map(|r| r.get("n").and_then(Value::as_u64))
             .max()
             .unwrap_or(0);
+        if !loaded.complete_tail {
+            *self.tail.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            if require_complete {
+                return Err(Error::Format(format!(
+                    "chunk {chunk} ends with an incomplete record"
+                )));
+            }
+            return Ok((chunk, last));
+        }
+        if let Ok(after) = fs::metadata(&path) {
+            let stamp = FileStamp::from_metadata(&after);
+            if stamp == FileStamp::from_metadata(&before) {
+                self.update_tail_cache(chunk, last, stamp);
+            } else {
+                *self.tail.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
         Ok((chunk, last))
+    }
+
+    /// The current chunk and the highest sequence number in it.
+    fn tail(&self) -> Result<(u32, u64)> {
+        self.tail_inner(false)
+    }
+
+    /// Tail position for appending: refuses to append onto an incomplete trailing record.
+    fn tail_for_append(&self) -> Result<(u32, u64)> {
+        self.tail_inner(true)
     }
 
     /// Write a checkpoint: the complete model context as of the last record.
@@ -593,7 +710,7 @@ impl Session {
                 "checkpoint refers to stored data that is gone: {file}"
             )));
         }
-        let (chunk, through) = self.tail()?;
+        let (chunk, through) = self.tail_for_append()?;
         let id = format!("{chunk:06}-{}", through + 1);
         let content = serde_json::json!({"id": id, "through": through, "messages": messages});
         self.write_durably(
@@ -601,7 +718,8 @@ impl Session {
             &serde_json::to_string(&content)?,
         )?;
         let marker = serde_json::json!({"n": through + 1, "t": t, "k": "checkpoint", "id": id, "through": through});
-        self.append_line(&self.log_path(chunk, None), &marker)?;
+        let (stamp, written) = self.append_line(&self.log_path(chunk, None), &marker)?;
+        self.note_chunk_append(chunk, through + 1, stamp, written);
         self.prune()?;
         self.seal()?;
         Ok(id)
@@ -671,9 +789,13 @@ impl Session {
         };
         let first =
             serde_json::json!({"n": last + 1, "k": "chunk", "chunk": chunk + 1, "prev": chunk});
-        file.write_all(format!("{first}\n").as_bytes())
+        let line = format!("{first}\n");
+        file.write_all(line.as_bytes())
             .and_then(|_| file.sync_data())
-            .map_err(|e| Error::Io(path, e))
+            .map_err(|e| Error::Io(path.clone(), e))?;
+        let meta = file.metadata().map_err(|e| Error::Io(path, e))?;
+        self.update_tail_cache(chunk + 1, last + 1, FileStamp::from_metadata(&meta));
+        Ok(())
     }
 
     fn checkpoint_path(&self, id: &str) -> PathBuf {
@@ -833,19 +955,31 @@ impl Session {
         self.dir.join("log").join(name)
     }
 
-    /// Append one JSON line and sync it to disk.
-    fn append_line(&self, path: &Path, value: &Value) -> Result<()> {
+    /// Append one or more JSON lines and sync them to disk.
+    fn append_lines(&self, path: &Path, values: &[&Value]) -> Result<(FileStamp, u64)> {
         use std::io::Write;
+        let mut buf = String::new();
+        for value in values {
+            buf.push_str(&serde_json::to_string(value)?);
+            buf.push('\n');
+        }
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .map_err(|e| Error::Io(path.to_path_buf(), e))?;
-        let mut line = serde_json::to_string(value)?;
-        line.push('\n');
-        file.write_all(line.as_bytes())
+        file.write_all(buf.as_bytes())
             .and_then(|_| file.sync_data())
-            .map_err(|e| Error::Io(path.to_path_buf(), e))
+            .map_err(|e| Error::Io(path.to_path_buf(), e))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| Error::Io(path.to_path_buf(), e))?;
+        Ok((FileStamp::from_metadata(&meta), buf.len() as u64))
+    }
+
+    /// Append one JSON line and sync it to disk.
+    fn append_line(&self, path: &Path, value: &Value) -> Result<(FileStamp, u64)> {
+        self.append_lines(path, &[value])
     }
 
     pub fn open(dir: &Path) -> Result<Session> {
@@ -854,6 +988,7 @@ impl Session {
         match value.get("format").and_then(Value::as_u64) {
             Some(1) => Ok(Session {
                 dir: dir.to_path_buf(),
+                tail: std::sync::Mutex::new(None),
             }),
             other => Err(Error::Format(format!("unsupported format {other:?}"))),
         }
@@ -1246,11 +1381,10 @@ impl Session {
     fn load_chunk(&self, number: u32) -> Result<Chunk> {
         let path = self.dir.join("log").join(format!("{number:06}.jsonl"));
         let mut text = read(&path)?;
+        let complete_tail = text.is_empty() || text.ends_with('\n');
         // Another process (a history reader) may see a line still being written: every
         // complete record ends with a newline, so an unterminated tail is not read yet.
-        if !text.ends_with('\n')
-            && let Some(end) = text.rfind('\n')
-        {
+        if !complete_tail && let Some(end) = text.rfind('\n') {
             text.truncate(end + 1);
         }
         let records = text
@@ -1258,7 +1392,11 @@ impl Session {
             .filter(|line| !line.trim().is_empty())
             .map(serde_json::from_str)
             .collect::<std::result::Result<Vec<Value>, _>>()?;
-        Ok(Chunk { number, records })
+        Ok(Chunk {
+            number,
+            records,
+            complete_tail,
+        })
     }
 
     fn checkpoint_messages(&self, id: &str) -> Result<Vec<Value>> {
@@ -2370,5 +2508,86 @@ mod tests {
         let dir = session(&[]);
         fs::write(dir.join("meta.json"), r#"{"format":2}"#).unwrap();
         assert!(Session::open(&dir).is_err());
+    }
+
+    #[test]
+    fn tail_cache_tracks_appends_checkpoints_and_external_writers() {
+        let (dir, s1) = fresh();
+        let s2 = Session::open(&dir).unwrap();
+        assert_eq!(s1.position().unwrap(), (1, 1));
+        assert_eq!(s1.append("user", &text("a")).unwrap(), 2);
+        assert_eq!(s1.append("user", &text("b")).unwrap(), 3);
+        assert_eq!(s1.position().unwrap(), (1, 3));
+        // External write on a second handle invalidates s1's cached stamp.
+        assert_eq!(s2.append("user", &text("c")).unwrap(), 4);
+        assert_eq!(s1.position().unwrap(), (1, 4));
+        // Checkpoint via s1 advances the cache to chunk 2.
+        s1.checkpoint(&[text("cp1")]).unwrap();
+        assert_eq!(s1.position().unwrap(), (2, 6));
+        assert_eq!(s1.append("user", &text("d")).unwrap(), 7);
+        assert_eq!(s1.position().unwrap(), (2, 7));
+        // Checkpoint via s2 seals chunk 2 -> chunk 3; s1 detects the new chunk.
+        s2.checkpoint(&[text("cp2")]).unwrap();
+        assert_eq!(s1.position().unwrap(), (3, 9));
+        assert_eq!(s1.append("user", &text("e")).unwrap(), 10);
+        assert_eq!(s1.context().unwrap(), vec![text("cp2"), text("e")]);
+    }
+
+    #[test]
+    fn grouped_side_writes_preserve_multiple_payload_and_reasoning_refs() {
+        let (_dir, s) = fresh();
+        let assistant = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "t1", "thinkingSignature": "sig-1"},
+                {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "echo 1"}},
+                {"type": "thinking", "thinking": "t2", "thinkingSignature": "sig-2"},
+                {"type": "toolCall", "id": "c2", "name": "bash", "arguments": {"command": "echo 2"}},
+                {"type": "toolCall", "id": "c3", "name": "read", "arguments": {"path": "a.txt"}}
+            ]
+        });
+        let tool = json!({
+            "role": "toolResult",
+            "toolCallId": "c1",
+            "content": [{"type": "text", "text": "output-1"}],
+            "details": {"exitCode": 0, "summary": "ok"}
+        });
+        s.append("assistant", &assistant).unwrap();
+        s.append("tool", &tool).unwrap();
+        assert_eq!(s.context().unwrap(), vec![assistant, tool]);
+    }
+
+    #[test]
+    fn interrupted_tail_is_never_cached_or_used_as_append_base() {
+        use std::io::Write;
+        let (dir, s) = fresh();
+        assert_eq!(s.append("user", &text("before-crash")).unwrap(), 2);
+        // Simulate an interrupted write leaving an unterminated trailing fragment.
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("log/000001.jsonl"))
+                .unwrap();
+            f.write_all(br#"{"n":3,"k":"#).unwrap();
+        }
+        // Readers ignore the unterminated suffix without warming the tail cache.
+        assert_eq!(s.position().unwrap(), (1, 2));
+        // Appending must refuse to glue onto the incomplete trailing line.
+        assert!(s.append("user", &text("after-crash")).is_err());
+        assert!(s.append_entry("app", json!({"ns": "x"})).is_err());
+        assert!(s.checkpoint(&[text("cp")]).is_err());
+        // Warm and fresh handles agree on the uncorrupted committed prefix.
+        assert_eq!(s.position().unwrap(), (1, 2));
+        assert_eq!(Session::open(&dir).unwrap().position().unwrap(), (1, 2));
+        // If a malformed terminated line is externally written, warm and fresh handles both reject it.
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("log/000001.jsonl"))
+                .unwrap();
+            f.write_all(b"corrupt}\n").unwrap();
+        }
+        assert!(s.position().is_err());
+        assert!(Session::open(&dir).unwrap().position().is_err());
     }
 }
