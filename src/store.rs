@@ -15,7 +15,7 @@
 
 use base64::Engine;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -306,26 +306,20 @@ impl Session {
     /// Records numbered `from..=to` across chunks, references named by file. With `resolve`,
     /// bulky parts are read back; one whose stored data is gone stays a reference and the
     /// record gets `"expired": true`.
+    #[cfg(test)]
     pub fn history(&self, from: u64, to: u64, resolve: bool) -> Result<Vec<Value>> {
+        if from > to {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
-        let mut resolver = Resolver {
-            dir: self.dir.clone(),
-            files: HashMap::new(),
-            expired: false,
-            lenient: true,
-        };
         // Only the chunks that hold the range are read; a chunk's first line says where it starts.
         let numbers = self.chunk_numbers()?;
-        let firsts = numbers
-            .iter()
-            .map(|&c| self.chunk_first(c))
-            .collect::<Result<Vec<u64>>>()?;
-        for (index, &number) in numbers.iter().enumerate() {
-            let next = firsts.get(index + 1).copied();
-            if next.is_some_and(|next| next <= from) {
-                continue;
-            }
-            if firsts[index] > to {
+        if numbers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = self.start_chunk_index(&numbers, from)?;
+        for &number in &numbers[start..] {
+            if self.chunk_first(number)? > to {
                 break;
             }
             let chunk = self.load_chunk(number)?;
@@ -340,26 +334,104 @@ impl Session {
                 if n < from || n > to {
                     continue;
                 }
-                let mut r = qualify(number, record);
-                if resolve && let Some(m) = r.get("m").cloned() {
-                    resolver.expired = false;
-                    match resolver.resolve(&m) {
-                        // Only the kept part (images meant for the user) is left.
-                        Ok(full) if resolver.expired => {
-                            r["m"] = full;
-                            r["expired"] = Value::Bool(true);
-                        }
-                        Ok(full) => r["m"] = full,
-                        Err(_) => r["expired"] = Value::Bool(true),
-                    }
-                }
-                out.push(r);
+                out.push(qualify(number, record));
             }
             if last >= to {
                 break;
             }
         }
+        if resolve {
+            self.resolve_history_records(&mut out);
+        }
         Ok(out)
+    }
+
+    /// Records needed to build complete entries for `from..=to`: every record in `from..=to`,
+    /// plus only the later `assistant-more` parts of replies that opened within `from..=to`
+    /// and were not yet closed by `to`. Stops reading once past `to` with no open replies.
+    fn history_for_entries(&self, from: u64, to: u64, resolve: bool) -> Result<Vec<Value>> {
+        if from > to {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut open_replies: HashSet<u64> = HashSet::new();
+        let numbers = self.chunk_numbers()?;
+        if numbers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = self.start_chunk_index(&numbers, from)?;
+        'chunks: for &number in &numbers[start..] {
+            if open_replies.is_empty() && self.chunk_first(number)? > to {
+                break;
+            }
+            let chunk = self.load_chunk(number)?;
+            let last = chunk
+                .records
+                .last()
+                .and_then(|r| r.get("n"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            for record in &chunk.records {
+                let n = record.get("n").and_then(Value::as_u64).unwrap_or(0);
+                if n < from {
+                    continue;
+                }
+                let kind = record.get("k").and_then(Value::as_str);
+                if n <= to {
+                    if kind == Some("assistant") && record.get("open") == Some(&Value::Bool(true)) {
+                        open_replies.insert(n);
+                    } else if kind == Some("assistant-more")
+                        && record.get("end").is_some()
+                        && let Some(reply) = record.get("reply").and_then(Value::as_u64)
+                    {
+                        open_replies.remove(&reply);
+                    }
+                    out.push(qualify(number, record));
+                } else {
+                    if open_replies.is_empty() {
+                        break 'chunks;
+                    }
+                    if kind == Some("assistant-more")
+                        && let Some(reply) = record.get("reply").and_then(Value::as_u64)
+                        && open_replies.contains(&reply)
+                    {
+                        if record.get("end").is_some() {
+                            open_replies.remove(&reply);
+                        }
+                        out.push(qualify(number, record));
+                        if open_replies.is_empty() {
+                            break 'chunks;
+                        }
+                    }
+                }
+            }
+            if last >= to && open_replies.is_empty() {
+                break;
+            }
+        }
+        if resolve {
+            self.resolve_history_records(&mut out);
+        }
+        Ok(out)
+    }
+
+    fn resolve_history_records(&self, records: &mut [Value]) {
+        let mut resolver = Resolver::new(self.dir.clone(), true);
+        resolver.prefetch(records);
+        for r in records {
+            if let Some(m) = r.get("m").cloned() {
+                resolver.expired = false;
+                match resolver.resolve(&m) {
+                    // Only the kept part (images meant for the user) is left.
+                    Ok(full) if resolver.expired => {
+                        r["m"] = full;
+                        r["expired"] = Value::Bool(true);
+                    }
+                    Ok(full) => r["m"] = full,
+                    Err(_) => r["expired"] = Value::Bool(true),
+                }
+            }
+        }
     }
 
     /// Where the current chunk begins: history starts here unless older records are asked for.
@@ -369,6 +441,21 @@ impl Session {
             .last()
             .ok_or_else(|| Error::Format("no chunk".into()))?;
         self.chunk_first(last)
+    }
+
+    /// Index of the last chunk whose opening record is `<= from`, found via binary search.
+    fn start_chunk_index(&self, numbers: &[u32], from: u64) -> Result<usize> {
+        let mut lo = 0usize;
+        let mut hi = numbers.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.chunk_first(numbers[mid])? <= from {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo.saturating_sub(1))
     }
 
     /// The number of a chunk's first record (its opening `chunk` record), from its first line.
@@ -389,7 +476,7 @@ impl Session {
 
     /// History as handed out (see entries.rs): complete entries for records `from..=to`.
     pub fn entries(&self, from: u64, to: u64) -> Result<Vec<Value>> {
-        let records = self.history(from, u64::MAX, true)?;
+        let records = self.history_for_entries(from, to, true)?;
         Ok(crate::entries::entries(&records, to))
     }
 
@@ -446,7 +533,7 @@ impl Session {
             }
             Value::Object(out)
         };
-        let records = self.history(from, u64::MAX, false)?;
+        let records = self.history_for_entries(from, to, false)?;
         let entries = crate::entries::entries(&records, to);
         let mut selected = Vec::new();
         // Each payload file is read once; only requested detail values are retained.
@@ -585,23 +672,24 @@ impl Session {
 
     /// Replies opened but never closed (a crash mid-reply), oldest first.
     pub fn unfinished_replies(&self) -> Result<Vec<u64>> {
-        let mut open: Vec<u64> = Vec::new();
+        let mut open: BTreeSet<u64> = BTreeSet::new();
         for number in self.chunk_numbers()? {
             for record in self.load_chunk(number)?.records {
                 let n = record.get("n").and_then(Value::as_u64).unwrap_or(0);
                 match record.get("k").and_then(Value::as_str) {
                     Some("assistant") if record.get("open") == Some(&Value::Bool(true)) => {
-                        open.push(n)
+                        open.insert(n);
                     }
                     Some("assistant-more") if record.get("end").is_some() => {
-                        let reply = record.get("reply").and_then(Value::as_u64);
-                        open.retain(|o| Some(*o) != reply);
+                        if let Some(reply) = record.get("reply").and_then(Value::as_u64) {
+                            open.remove(&reply);
+                        }
                     }
                     _ => {}
                 }
             }
         }
-        Ok(open)
+        Ok(open.into_iter().collect())
     }
 
     fn update_tail_cache(&self, chunk: u32, last: u64, stamp: FileStamp) {
@@ -1003,12 +1091,8 @@ impl Session {
     /// Replace references (`{"$ref":{"file","key"}}`, image `"$img": path`) with stored data.
     /// References may only name side files and images inside this session's log.
     pub fn resolve(&self, messages: &[Value]) -> Result<Vec<Value>> {
-        let mut resolver = Resolver {
-            dir: self.dir.clone(),
-            files: HashMap::new(),
-            expired: false,
-            lenient: false,
-        };
+        let mut resolver = Resolver::new(self.dir.clone(), false);
+        resolver.prefetch(messages);
         messages.iter().map(|m| resolver.resolve(m)).collect()
     }
 
@@ -1641,10 +1725,69 @@ fn image_path(path: &str) -> bool {
         && sha.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Resolves references against side files, loading each file once.
+/// Fast path for lines written by `write_record`: `{"key":"<plain-key>",...}`.
+/// Returns None if the line does not start with an unescaped `"key"` field so callers
+/// fall back to full JSON parsing.
+fn fast_json_key(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("{\"key\":\"")?;
+    let end = rest.find('"')?;
+    let key = &rest[..end];
+    (!key.contains('\\')).then_some(key)
+}
+
+/// Collect every valid `(file, key)` side-file reference inside `value`.
+fn collect_side_refs(value: &Value, wanted: &mut HashMap<String, HashSet<String>>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(reference) = map.get("$ref")
+                && let (Some(file), Some(key)) = (
+                    reference.get("file").and_then(Value::as_str),
+                    reference.get("key").and_then(Value::as_str),
+                )
+                && side_file_path(file)
+            {
+                wanted
+                    .entry(file.to_string())
+                    .or_default()
+                    .insert(key.to_string());
+                if let Some(keep) = map.get("keep") {
+                    collect_side_refs(keep, wanted);
+                }
+                return;
+            }
+            for inner in map.values() {
+                collect_side_refs(inner, wanted);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_side_refs(item, wanted);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct SideFileLoad {
+    values: HashMap<String, Value>,
+    key_errors: HashMap<String, String>,
+    file_error: Option<String>,
+}
+
+/// Resolves references against side files, streaming each file and parsing only needed keys.
+/// Any IO or parse failure is scoped to the affected key or side file so unrelated entries
+/// and `keep` fallbacks remain intact.
 struct Resolver {
     dir: PathBuf,
     files: HashMap<String, HashMap<String, Value>>,
+    /// Side files fully loaded into `files`.
+    loaded_full: HashSet<String>,
+    /// Keys already scanned for in a side file via `prefetch` (so misses do not rescan).
+    prefetched: HashMap<String, HashSet<String>>,
+    /// Per-key parse failures recorded during streaming reads.
+    key_errors: HashMap<String, HashMap<String, String>>,
+    /// File-level IO or unattributed parse failures recorded during streaming reads.
+    file_errors: HashMap<String, String>,
     /// Set when a reference's stored data was gone (its kept part, if any, stands in).
     expired: bool,
     /// History reads: a reference whose data is gone stays a reference instead of failing
@@ -1658,50 +1801,210 @@ fn side_file_chunk(file: &str) -> Option<u32> {
 }
 
 impl Resolver {
+    fn new(dir: PathBuf, lenient: bool) -> Self {
+        Self {
+            dir,
+            files: HashMap::new(),
+            loaded_full: HashSet::new(),
+            prefetched: HashMap::new(),
+            key_errors: HashMap::new(),
+            file_errors: HashMap::new(),
+            expired: false,
+            lenient,
+        }
+    }
+
+    /// Stream each referenced side file once and parse only the keys needed by `values`.
+    /// Errors stay scoped to `lookup` rather than failing the whole batch.
+    fn prefetch(&mut self, values: &[Value]) {
+        let mut wanted: HashMap<String, HashSet<String>> = HashMap::new();
+        for value in values {
+            collect_side_refs(value, &mut wanted);
+        }
+        for (file, keys) in wanted {
+            if self.loaded_full.contains(&file) {
+                continue;
+            }
+            let loaded = self.load_side_file(&file, Some(&keys));
+            self.record_load(&file, loaded, Some(keys));
+        }
+    }
+
+    fn record_load(
+        &mut self,
+        file: &str,
+        loaded: SideFileLoad,
+        prefetched_keys: Option<HashSet<String>>,
+    ) {
+        let values = self.files.entry(file.to_string()).or_default();
+        for (k, v) in loaded.values {
+            values.insert(k, v);
+        }
+        if !loaded.key_errors.is_empty() {
+            let errs = self.key_errors.entry(file.to_string()).or_default();
+            for (k, err) in loaded.key_errors {
+                values.remove(&k);
+                errs.insert(k, err);
+            }
+        }
+        if let Some(err) = loaded.file_error {
+            self.file_errors.insert(file.to_string(), err);
+        }
+        match prefetched_keys {
+            Some(keys) => {
+                self.prefetched
+                    .entry(file.to_string())
+                    .or_default()
+                    .extend(keys);
+            }
+            None => {
+                self.loaded_full.insert(file.to_string());
+            }
+        }
+    }
+
+    fn stream_lines(
+        handle: fs::File,
+        path: &Path,
+        skip_header: bool,
+        require_whole: bool,
+        filter: Option<&HashSet<String>>,
+    ) -> SideFileLoad {
+        use std::io::BufRead;
+        let mut out = SideFileLoad {
+            values: HashMap::new(),
+            key_errors: HashMap::new(),
+            file_error: None,
+        };
+        let mut reader = std::io::BufReader::new(handle);
+        let mut line = String::new();
+        if skip_header {
+            if let Err(e) = reader.read_line(&mut line) {
+                out.file_error = Some(Error::Io(path.to_path_buf(), e).to_string());
+                return out;
+            }
+            line.clear();
+        }
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        let fast_key = fast_json_key(trimmed);
+                        let skip =
+                            filter.is_some_and(|keys| fast_key.is_some_and(|k| !keys.contains(k)));
+                        if !skip {
+                            match serde_json::from_str::<Value>(trimmed) {
+                                Ok(entry) => {
+                                    let whole_ok = !require_whole
+                                        || entry.get("whole") == Some(&Value::Bool(true));
+                                    if whole_ok
+                                        && let (Some(k), Some(v)) = (
+                                            entry.get("key").and_then(Value::as_str),
+                                            entry.get("v"),
+                                        )
+                                        && filter.is_none_or(|keys| keys.contains(k))
+                                    {
+                                        out.key_errors.remove(k);
+                                        out.values.insert(k.to_string(), v.clone());
+                                    }
+                                }
+                                Err(err) => {
+                                    if let Some(k) = fast_key {
+                                        out.values.remove(k);
+                                        out.key_errors.insert(k.to_string(), err.to_string());
+                                    } else if out.file_error.is_none() {
+                                        out.file_error = Some(err.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    line.clear();
+                }
+                Err(e) => {
+                    out.file_error = Some(Error::Io(path.to_path_buf(), e).to_string());
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn load_side_file(&self, file: &str, filter: Option<&HashSet<String>>) -> SideFileLoad {
+        let path = self.dir.join(file);
+        match fs::File::open(&path) {
+            Ok(handle) => Self::stream_lines(handle, &path, false, false, filter),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A cleanup deleted the payload file: what it kept whole (tool-call
+                // arguments) reads as before.
+                if let Some(kept) = kept_file_for(file) {
+                    let kept = self.dir.join(kept);
+                    match fs::File::open(&kept) {
+                        Ok(handle) => Self::stream_lines(handle, &kept, true, true, filter),
+                        Err(ke) if ke.kind() == std::io::ErrorKind::NotFound => SideFileLoad {
+                            values: HashMap::new(),
+                            key_errors: HashMap::new(),
+                            file_error: None,
+                        },
+                        Err(ke) => SideFileLoad {
+                            values: HashMap::new(),
+                            key_errors: HashMap::new(),
+                            file_error: Some(Error::Io(kept, ke).to_string()),
+                        },
+                    }
+                } else {
+                    SideFileLoad {
+                        values: HashMap::new(),
+                        key_errors: HashMap::new(),
+                        file_error: None,
+                    }
+                }
+            }
+            Err(e) => SideFileLoad {
+                values: HashMap::new(),
+                key_errors: HashMap::new(),
+                file_error: Some(Error::Io(path, e).to_string()),
+            },
+        }
+    }
+
     fn lookup(&mut self, file: &str, key: &str) -> Result<Value> {
         if !side_file_path(file) {
             return Err(Error::Format(format!(
                 "reference to {file}: not a side file of this session"
             )));
         }
-        if !self.files.contains_key(file) {
-            let path = self.dir.join(file);
-            let mut map = HashMap::new();
-            if path.exists() {
-                for line in read(&path)?.lines().filter(|l| !l.trim().is_empty()) {
-                    let entry: Value = serde_json::from_str(line)?;
-                    if let (Some(k), Some(v)) =
-                        (entry.get("key").and_then(Value::as_str), entry.get("v"))
-                    {
-                        map.insert(k.to_string(), v.clone());
-                    }
-                }
-            } else if let Some(kept) = kept_file_for(file) {
-                // A cleanup deleted the payload file: what it kept whole (tool-call
-                // arguments) reads as before.
-                let kept = self.dir.join(kept);
-                if kept.exists() {
-                    for line in read(&kept)?
-                        .lines()
-                        .skip(1)
-                        .filter(|l| !l.trim().is_empty())
-                    {
-                        let entry: Value = serde_json::from_str(line)?;
-                        if entry.get("whole") == Some(&Value::Bool(true))
-                            && let (Some(k), Some(v)) =
-                                (entry.get("key").and_then(Value::as_str), entry.get("v"))
-                        {
-                            map.insert(k.to_string(), v.clone());
-                        }
-                    }
-                }
-            }
-            self.files.insert(file.to_string(), map);
+        if let Some(value) = self.files.get(file).and_then(|m| m.get(key)) {
+            return Ok(value.clone());
         }
-        self.files[file]
-            .get(key)
-            .cloned()
-            .ok_or_else(|| Error::Format(format!("{file} has no {key}")))
+        if let Some(err) = self.key_errors.get(file).and_then(|m| m.get(key)) {
+            return Err(Error::Format(format!("{file} {key}: {err}")));
+        }
+        if let Some(err) = self.file_errors.get(file) {
+            return Err(Error::Format(format!("{file}: {err}")));
+        }
+        if self.loaded_full.contains(file)
+            || self
+                .prefetched
+                .get(file)
+                .is_some_and(|keys| keys.contains(key))
+        {
+            return Err(Error::Format(format!("{file} has no {key}")));
+        }
+        let loaded = self.load_side_file(file, None);
+        self.record_load(file, loaded, None);
+        if let Some(value) = self.files.get(file).and_then(|m| m.get(key)) {
+            return Ok(value.clone());
+        }
+        if let Some(err) = self.key_errors.get(file).and_then(|m| m.get(key)) {
+            return Err(Error::Format(format!("{file} {key}: {err}")));
+        }
+        if let Some(err) = self.file_errors.get(file) {
+            return Err(Error::Format(format!("{file}: {err}")));
+        }
+        Err(Error::Format(format!("{file} has no {key}")))
     }
 
     fn image(&self, path: &str) -> Result<String> {
@@ -2589,5 +2892,188 @@ mod tests {
         }
         assert!(s.position().is_err());
         assert!(Session::open(&dir).unwrap().position().is_err());
+    }
+
+    #[test]
+    fn entries_stops_reading_once_past_to_and_all_open_replies_are_closed() {
+        let (dir, s) = fresh();
+        let u = s.append("user", &text("first")).unwrap();
+        let open = s
+            .append_open_reply(&json!({
+                "role": "assistant",
+                "content": [{"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "ls"}}]
+            }))
+            .unwrap();
+        let _tool = s
+            .append(
+                "tool",
+                &json!({"role": "toolResult", "toolCallId": "c1", "content": [{"type": "text", "text": "ok"}]}),
+            )
+            .unwrap();
+        let _close = s
+            .append_more(
+                open,
+                &[json!({"type": "text", "text": "done"})],
+                Some(&json!({"stopReason": "stop", "usage": {}})),
+            )
+            .unwrap();
+        s.checkpoint(&[text("summary")]).unwrap();
+        s.append("user", &text("later chunk")).unwrap();
+        // Corrupt chunk 2's body (keeping its header line): a bounded read of chunk 1 must never load chunk 2.
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("log/000002.jsonl"))
+                .unwrap();
+            writeln!(f, "not-json").unwrap();
+        }
+        let single = s.entries(u, u).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0]["id"], json!(u.to_string()));
+        // Range ending at `open` still follows its closing `assistant-more` in chunk 1, without touching chunk 2.
+        let with_open = s.entries(u, open).unwrap();
+        assert_eq!(with_open.len(), 2);
+        assert_eq!(with_open[1]["message"]["stopReason"], json!("stop"));
+    }
+
+    #[test]
+    fn resolver_prefetch_skips_unreferenced_side_file_lines() {
+        use std::io::Write;
+        let (dir, s) = fresh();
+        let first = s
+            .append(
+                "tool",
+                &json!({"role": "toolResult", "toolCallId": "c1", "content": [{"type": "text", "text": "needed"}]}),
+            )
+            .unwrap();
+        let _second = s
+            .append(
+                "tool",
+                &json!({"role": "toolResult", "toolCallId": "c2", "content": [{"type": "text", "text": "other"}]}),
+            )
+            .unwrap();
+        // Append an unreferenced malformed line with a distinct key: prefetch skips parsing it.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("log/000001.payload.jsonl"))
+            .unwrap();
+        writeln!(f, r#"{{"key":"999.0","v":NOT_JSON}}"#).unwrap();
+        let got = s.entries(first, first).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["message"]["content"][0]["text"], json!("needed"));
+    }
+
+    #[test]
+    fn malformed_referenced_payload_stays_scoped_and_preserves_kept_fallback() {
+        let (dir, s) = fresh();
+        let shown_image =
+            json!({"type": "image", "data": "U0hPV04=", "mimeType": "image/png", "name": "a.png"});
+        let e1 = s
+            .append(
+                "tool",
+                &json!({
+                    "role": "toolResult",
+                    "toolCallId": "c1",
+                    "content": [{"type": "text", "text": "entry-1-ok"}]
+                }),
+            )
+            .unwrap();
+        let _e2 = s
+            .append(
+                "tool",
+                &json!({
+                    "role": "toolResult",
+                    "toolCallId": "c2",
+                    "toolName": "ipython",
+                    "content": [{"type": "text", "text": "[Image shown to the user: a.png]"}],
+                    "details": {"ok": true, "shownImages": [shown_image.clone()]}
+                }),
+            )
+            .unwrap();
+        let e3 = s
+            .append(
+                "tool",
+                &json!({
+                    "role": "toolResult",
+                    "toolCallId": "c3",
+                    "content": [{"type": "text", "text": "entry-3-ok"}]
+                }),
+            )
+            .unwrap();
+
+        // Corrupt only e2's details payload line in 000001.payload.jsonl; leave e1 and e3 intact.
+        let refs = s.context_refs().unwrap();
+        let details_key = refs[1]["details"]["$ref"]["key"].as_str().unwrap();
+        let payload_path = dir.join("log/000001.payload.jsonl");
+        let original = fs::read_to_string(&payload_path).unwrap();
+        let prefix = format!(r#"{{"key":"{details_key}","#);
+        let corrupted: String = original
+            .lines()
+            .map(|line| {
+                if line.starts_with(&prefix) {
+                    format!(r#"{{"key":"{details_key}","v":CORRUPT_JSON}}"#)
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert!(corrupted.contains("CORRUPT_JSON"));
+        fs::write(&payload_path, corrupted).unwrap();
+
+        // History entries page succeeds: e1 and e3 resolve cleanly, while e2 is marked expired and preserves its kept user image.
+        let page = s.entries(e1, e3).unwrap();
+        assert_eq!(page.len(), 3);
+        assert_eq!(
+            page[0]["message"]["content"][0]["text"],
+            json!("entry-1-ok")
+        );
+        assert!(page[0].get("expired").is_none());
+        assert_eq!(page[1]["expired"], json!(true));
+        assert_eq!(
+            page[1]["message"]["details"],
+            json!({"shownImages": [shown_image.clone()]})
+        );
+        assert_eq!(
+            page[2]["message"]["content"][0]["text"],
+            json!("entry-3-ok")
+        );
+        assert!(page[2].get("expired").is_none());
+
+        // Strict Session::resolve() also preserves the `keep` fallback when the referenced payload is malformed.
+        let resolved = s.resolve(std::slice::from_ref(&refs[1])).unwrap();
+        assert_eq!(
+            resolved[0]["details"],
+            json!({"shownImages": [shown_image.clone()]})
+        );
+
+        // Strict Session::resolve() still errors when a malformed reference has no `keep`.
+        let unkept_msg = json!({
+            "role": "toolResult",
+            "toolCallId": "c2",
+            "content": {"$ref": {"file": "log/000001.payload.jsonl", "key": details_key}}
+        });
+        assert!(s.resolve(&[unkept_msg]).is_err());
+
+        // Replacing the side file with a directory (unreadable IO error) stays scoped in entries() and resolve(keep).
+        fs::remove_file(&payload_path).unwrap();
+        fs::create_dir(&payload_path).unwrap();
+        let page_io = s.entries(e1, e3).unwrap();
+        assert_eq!(page_io.len(), 3);
+        assert_eq!(page_io[1]["expired"], json!(true));
+        assert_eq!(
+            page_io[1]["message"]["details"],
+            json!({"shownImages": [shown_image.clone()]})
+        );
+        // Only the `details` ref carries `keep`, so resolving that ref still succeeds under IO failure.
+        let kept_only = json!({"details": refs[1]["details"]});
+        let resolved_io = s.resolve(&[kept_only]).unwrap();
+        assert_eq!(
+            resolved_io[0]["details"],
+            json!({"shownImages": [shown_image]})
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }
