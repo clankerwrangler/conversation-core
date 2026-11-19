@@ -860,8 +860,8 @@ impl Core {
 
     /// One request: prepare, stream, save. Retries from scratch only while nothing was saved.
     fn request(&mut self) -> Result<End> {
-        context_file::publish(&self.session)?;
-        let (refs, from_checkpoint) = self.session.context_parts()?;
+        let (refs, from_checkpoint, through) = self.session.context_parts_with_seq()?;
+        context_file::publish_refs(&self.session, &refs, through)?;
         let context = self.session.resolve(&refs)?;
         // This snapshot contains all results saved so far. Later results must wake
         // a further request, even if they arrive while this one is preparing.

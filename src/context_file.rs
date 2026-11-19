@@ -58,21 +58,40 @@ fn parse(text: &str) -> std::result::Result<Vec<Value>, String> {
         .collect()
 }
 
-/// Write the current context to the file: readable text inline, tool data, reasoning
-/// and images as references to their stored data.
-pub fn publish(session: &Session) -> Result<()> {
-    let text = render(&session.context_refs()?)?;
-    let through = session.last_seq()?;
+/// Publish an already-loaded context snapshot (`refs`, `through`) to `context.jsonl`.
+/// Skips rewriting `state.json` and/or `context.jsonl` when they already match on disk.
+pub fn publish_refs(session: &Session, refs: &[Value], through: u64) -> Result<()> {
+    let text = render(refs)?;
+    let digest = sha(&text);
     let mut state = session.read_state()?;
     let previous = state
         .get("contextFile")
         .and_then(|f| f.get("current"))
         .cloned()
         .unwrap_or(Value::Null);
-    state["contextFile"] =
-        json!({"current": {"sha256": sha(&text), "through": through}, "previous": previous});
-    session.write_state(&state)?;
-    session.write_file(FILE, &text)
+    let same_meta = previous.get("sha256").and_then(Value::as_str) == Some(digest.as_str())
+        && previous.get("through").and_then(Value::as_u64) == Some(through);
+    let existing_matches = session.read_file(FILE)?.as_deref() == Some(text.as_str());
+    if same_meta && existing_matches {
+        return Ok(());
+    }
+    if !same_meta {
+        state["contextFile"] =
+            json!({"current": {"sha256": digest, "through": through}, "previous": previous});
+        session.write_state(&state)?;
+    }
+    if !existing_matches {
+        session.write_file(FILE, &text)?;
+    }
+    Ok(())
+}
+
+/// Write the current context to the file: readable text inline, tool data, reasoning
+/// and images as references to their stored data.
+#[cfg(test)]
+pub fn publish(session: &Session) -> Result<()> {
+    let (refs, _, through) = session.context_parts_with_seq()?;
+    publish_refs(session, &refs, through)
 }
 
 /// At a request boundary: take an edited file as the new context.
@@ -255,5 +274,41 @@ mod tests {
             Outcome::Unchanged,
             "only files the core published are compared"
         );
+    }
+
+    #[test]
+    fn republishing_unchanged_context_skips_rewrites() {
+        use std::os::unix::fs::MetadataExt;
+        let s = fresh();
+        s.append("user", &text("a")).unwrap();
+        publish(&s).unwrap();
+        let state_ino = std::fs::metadata(s.dir().join("state.json")).unwrap().ino();
+        let ctx_ino = std::fs::metadata(s.dir().join(FILE)).unwrap().ino();
+        // Exact same context and sequence: neither file is rewritten.
+        publish(&s).unwrap();
+        assert_eq!(
+            std::fs::metadata(s.dir().join("state.json")).unwrap().ino(),
+            state_ino
+        );
+        assert_eq!(
+            std::fs::metadata(s.dir().join(FILE)).unwrap().ino(),
+            ctx_ino
+        );
+        // Non-model record advances `through` without changing context text: state updates, context file is untouched.
+        s.append_entry("app", json!({"ns": "note", "data": {"x": 1}}))
+            .unwrap();
+        publish(&s).unwrap();
+        assert_eq!(
+            std::fs::metadata(s.dir().join(FILE)).unwrap().ino(),
+            ctx_ino
+        );
+        assert_eq!(
+            s.read_state()
+                .unwrap()
+                .pointer("/contextFile/current/through")
+                .and_then(Value::as_u64),
+            Some(s.last_seq().unwrap())
+        );
+        assert_eq!(accept(&s).unwrap(), Outcome::Unchanged);
     }
 }

@@ -1076,8 +1076,9 @@ impl Session {
         &self.dir
     }
 
-    /// `context_refs`, and how many of its messages come from the latest checkpoint.
-    pub fn context_parts(&self) -> Result<(Vec<Value>, usize)> {
+    /// `context_refs`, how many of its messages come from the latest checkpoint,
+    /// and the highest sequence number in the current chunk — read in one pass.
+    pub fn context_parts_with_seq(&self) -> Result<(Vec<Value>, usize, u64)> {
         let numbers = self.chunk_numbers()?;
         let mut tail: Vec<Chunk> = Vec::new();
         let mut marker: Option<(String, u64)> = None;
@@ -1090,12 +1091,28 @@ impl Session {
             }
         }
         tail.reverse();
+        let last_seq = tail
+            .last()
+            .and_then(|chunk| {
+                chunk
+                    .records
+                    .iter()
+                    .filter_map(|r| r.get("n").and_then(Value::as_u64))
+                    .max()
+            })
+            .unwrap_or(0);
         let (mut messages, after) = match &marker {
             Some((id, through)) => (self.checkpoint_messages(id)?, *through),
             None => (Vec::new(), 0),
         };
         let from_checkpoint = messages.len();
         messages.extend(self.model_messages(&tail, after)?);
+        Ok((messages, from_checkpoint, last_seq))
+    }
+
+    /// `context_refs`, and how many of its messages come from the latest checkpoint.
+    pub fn context_parts(&self) -> Result<(Vec<Value>, usize)> {
+        let (messages, from_checkpoint, _) = self.context_parts_with_seq()?;
         Ok((messages, from_checkpoint))
     }
 
@@ -1176,6 +1193,7 @@ impl Session {
     }
 
     /// The highest record number so far.
+    #[cfg(test)]
     pub fn last_seq(&self) -> Result<u64> {
         Ok(self.tail()?.1)
     }
