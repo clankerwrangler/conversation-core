@@ -57,9 +57,11 @@ export class Core extends EventEmitter {
   // ---- turns ----
 
   /** Start a turn with a user message (text, or `{ content }` blocks). */
-  send(input) { const id = this.#id(); this.#turnStarted(id); this.#write({ op: "send", id, input: userInput(input) }); }
+  send(input) { const id = this.#id(); this.#turnStarted(id); this.#write({ op: "send", id, input: userInput(input) }); return id; }
   /** Add a user message to the running turn at its next safe point (or start one when idle). */
-  steer(input) { const id = this.#id(); this.#turnStarted(id); this.#write({ op: "steer", id, input: userInput(input) }); }
+  steer(input) { const id = this.#id(); this.#turnStarted(id); this.#write({ op: "steer", id, input: userInput(input) }); return id; }
+  /** True once a `settled` covering op `id` (returned by send or steer) has been seen. */
+  covered(id, through) { return sequence(through) >= sequence(id); }
   /** Stop the running turn; unfinished tool calls are cancelled. */
   abort() { for (const run of this.#tools.values()) run.controller.abort(); this.#write({ op: "abort", id: this.#id() }); }
   /** Resolves once the core has settled after every turn-starting op sent so far. */
@@ -67,9 +69,10 @@ export class Core extends EventEmitter {
   get busy() { return this.#turn !== null; }
 
   /** A runner-added message the model sees. Wakes the model unless `wake: false`. */
-  addContext(message, { wake, deliver } = {}) {
+  /** `onAdded(event)` runs when the core has saved the message, before any later core event. */
+  addContext(message, { wake, deliver, onAdded } = {}) {
     return this.#request("add_context", { message, ...(wake === false ? { wake } : {}), ...(deliver ? { deliver } : {}) },
-      (id) => { if (wake !== false) this.#turnStarted(id); })
+      (id) => { if (wake !== false) this.#turnStarted(id); }, onAdded)
       .then((event) => event.n);
   }
 
@@ -140,10 +143,10 @@ export class Core extends EventEmitter {
   #id() { return `js${++this.#next}`; }
   #write(op) { this.#child.stdin.write(`${JSON.stringify(op)}\n`); }
 
-  #request(op, fields, beforeWrite) {
+  #request(op, fields, beforeWrite, onReply) {
     const id = this.#id();
     return new Promise((resolve, reject) => {
-      this.#pending.set(id, { op, resolve, reject });
+      this.#pending.set(id, { op, resolve, reject, onReply });
       beforeWrite?.(id);
       this.#write({ op, id, ...stripUndefined(fields) });
     });
@@ -186,6 +189,8 @@ export class Core extends EventEmitter {
     const waiter = this.#pending.get(id);
     if (!waiter) return false;
     this.#pending.delete(id);
+    // Synchronously, in core order: a resolved promise only continues after later events.
+    try { waiter.onReply?.(event); } catch (error) { this.emit("handler_error", { op: waiter.op, error }); }
     waiter.resolve(event);
     return true;
   }

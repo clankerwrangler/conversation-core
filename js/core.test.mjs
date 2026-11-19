@@ -135,6 +135,30 @@ test("addContext wakes the model unless wake is false", async (t) => {
   await core.close(); p.close();
 });
 
+test("onAdded runs when the message is saved, before the turn it wakes is seen", async (t) => {
+  const p = await provider([[text("seen"), done]]);
+  const core = start(p.base, {}, t, p);
+  const order = [];
+  core.on("event", (event) => { if (["turn_start", "settled"].includes(event.ev)) order.push(event.ev); });
+  const n = await core.addContext({ customType: "family", content: "a message" }, { onAdded: (event) => order.push(`added ${event.n}`) });
+  await core.idle();
+  assert.deepEqual(order, [`added ${n}`, "turn_start", "settled"]);
+  await core.close(); p.close();
+});
+
+test("a settle says which sent inputs it covers", async (t) => {
+  const p = await provider([[text("one"), done]]);
+  const core = start(p.base, {}, t, p);
+  const settles = [];
+  core.on("settled", (event) => settles.push(event.through));
+  const id = core.send("hi");
+  assert.equal(core.covered(id, null), false);
+  await core.idle();
+  assert.equal(core.covered(id, settles.at(-1)), true);
+  assert.equal(core.covered(`js${Number(id.slice(2)) + 1}`, settles.at(-1)), false, "a later op is not covered");
+  await core.close(); p.close();
+});
+
 test("a failing prepare handler aborts the turn instead of hanging it", async (t) => {
   const p = await provider([]);
   const core = start(p.base, { prepare: async () => { throw new Error("no prompt"); } }, t, p);
