@@ -39,7 +39,8 @@ fn text_and_image_chars(content: &Value) -> usize {
 /// Estimate tokens for one message: chars / 4, rounded up.
 pub fn estimate_tokens(message: &Value) -> u64 {
     let chars = match message.get("role").and_then(Value::as_str) {
-        Some("user" | "toolResult") => {
+        // A system note (the context usage line) is sent like user text, so it counts like it.
+        Some("user" | "toolResult" | "system") => {
             text_and_image_chars(message.get("content").unwrap_or(&Value::Null))
         }
         Some("assistant") => message
@@ -281,6 +282,15 @@ mod tests {
         let e = estimate(&msgs, 2);
         assert_eq!((e.measured, e.total), (None, 100 + 1 + 7_000));
         assert_eq!(usage_line(&e, None), "Context: about 7k tokens (estimated)");
+    }
+
+    #[test]
+    fn the_system_usage_line_counts_toward_the_window() {
+        let line = text_message("system", &"x".repeat(400));
+        assert_eq!(estimate_tokens(&line), 100);
+        // A request at the window's edge without the line is over it with the line.
+        let msgs = vec![user(&"a".repeat(4_000)), line];
+        assert_eq!(estimate(&msgs, 0).total, 1_100);
     }
 
     #[test]

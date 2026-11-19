@@ -641,6 +641,16 @@ pub fn messages(model: &Value, c: &Compat, instructions: &str, context: &[Value]
                 }
                 continue;
             }
+            // A core note (the context usage line) goes in the instruction role, not as the user.
+            "system" => {
+                let note: Vec<&str> = m["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|b| b.get("text").and_then(Value::as_str))
+                    .collect();
+                out.push(json!({"role": role, "content": note.join("\n")}));
+            }
             _ => {}
         }
         last_role = kind;
@@ -1229,6 +1239,20 @@ mod tests {
                 json!({"role": "assistant", "content": "ok", "tool_calls": [{"id": "c1_fc_1", "type": "function", "function": {"name": "ls", "arguments": "{\"a\":1}"}}]}),
                 json!({"role": "tool", "content": "No result provided", "tool_call_id": "c1_fc_1"}),
             ]
+        );
+    }
+
+    #[test]
+    fn a_core_note_goes_in_the_instruction_role() {
+        let model = json!({"provider": "openrouter", "api": API, "id": "z", "input": ["text"]});
+        let ctx = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "hi"}]}),
+            json!({"role": "system", "content": [{"type": "text", "text": "Context: about 1k tokens (estimated)"}]}),
+        ];
+        let out = messages(&model, &compat(&model), "sys", &ctx);
+        assert_eq!(
+            out.last().unwrap(),
+            &json!({"role": "system", "content": "Context: about 1k tokens (estimated)"})
         );
     }
 

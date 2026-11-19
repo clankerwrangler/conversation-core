@@ -96,6 +96,8 @@ pub fn input(target: &Target, messages: &[Value]) -> Result<Vec<Value>> {
     for msg in messages {
         match msg.get("role").and_then(Value::as_str) {
             Some("user") => out.push(json!({"role": "user", "content": input_content(msg.get("content").unwrap_or(&Value::Null))?})),
+            // A core note (the context usage line); the request picks its instruction role.
+            Some("system") => out.push(json!({"role": "system", "content": input_content(msg.get("content").unwrap_or(&Value::Null))?})),
             Some("toolResult") => {
                 let call = msg.get("toolCallId").and_then(Value::as_str).unwrap_or("");
                 let call_id = match identities.get(call) {

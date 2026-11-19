@@ -836,7 +836,7 @@ impl Core {
         window: Option<u64>,
     ) -> Option<Vec<Value>> {
         let mut estimate = budget::estimate(&context, trusted_from);
-        let line = budget::text_message("user", &budget::usage_line(&estimate, window));
+        let line = budget::text_message("system", &budget::usage_line(&estimate, window));
         estimate.total += budget::estimate_tokens(&line);
         let Some(window) = window else {
             if self.warned.insert(model.to_string()) {

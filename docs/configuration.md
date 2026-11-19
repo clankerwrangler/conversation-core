@@ -34,8 +34,9 @@ The runner only has to name a model (`provider` and `id`); the core fills in its
   repository has the model definitions in the Pi-compatible format.
 
 The `models` op (`{"op": "models", "provider"?}`) lists them. Every request ends with a context
-usage line ("Context: about 91k of 500k tokens (84k measured + ~7k new)"),
-which is never saved. If the next request is over the window, the overflow
+usage line ("Context: about 91k of 500k tokens (84k measured + ~7k new)"), sent in the
+instruction role (developer or system, as for the instructions; a tagged user message for
+Grok, whose proxy refuses both) so the model does not take it for the user. It is never saved. If the next request is over the window, the overflow
 guard sets tool results aside (oldest first), then tool-call arguments and
 images, and if it still does not fit it sends nothing and reports
 `context_too_large`. For a model missing from the file the core reports

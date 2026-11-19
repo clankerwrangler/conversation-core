@@ -279,12 +279,19 @@ fn endpoint(api: &str, base: &str) -> String {
 
 pub fn body(req: &Request, messages: &[Value]) -> Result<Value> {
     let mut input = responses::input(&req.target, messages)?;
-    if req.target.api != "openai-codex-responses" && !req.instructions.is_empty() {
-        let role = if req.developer_role {
-            "developer"
-        } else {
-            "system"
-        };
+    let codex = req.target.api == "openai-codex-responses";
+    let role = if codex || req.developer_role {
+        "developer"
+    } else {
+        "system"
+    };
+    // Core notes take the same instruction role as the instructions.
+    for item in &mut input {
+        if item.get("role").and_then(Value::as_str) == Some("system") {
+            item["role"] = json!(role);
+        }
+    }
+    if !codex && !req.instructions.is_empty() {
         input.insert(0, json!({"role": role, "content": req.instructions}));
     }
     let mut body = json!({

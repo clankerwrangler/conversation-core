@@ -205,14 +205,21 @@ pub fn sanitize(body: &mut Value, model: &Value, session_id: &str) {
             if item.get("content").and_then(Value::as_str) == Some("") {
                 continue;
             }
-            // The proxy refuses system and developer messages: they join the instructions.
+            // The proxy refuses system and developer messages. Leading ones join the
+            // instructions; a later one (a core note such as the context usage line) stays in
+            // place, so the cached prefix is unchanged, as a user message tagged [system].
             if matches!(
                 item.get("role").and_then(Value::as_str),
                 Some("developer" | "system")
             ) {
                 let text = text_of(item.get("content").unwrap_or(&Value::Null));
                 if !text.trim().is_empty() {
-                    instructions.push(text.trim().to_string());
+                    if input.is_empty() {
+                        instructions.push(text.trim().to_string());
+                    } else {
+                        let note = format!("[system] {}", text.trim());
+                        input.push(json!({"role": "user", "content": [{"type": "input_text", "text": note}]}));
+                    }
                 }
                 continue;
             }
@@ -369,6 +376,24 @@ mod tests {
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert!(body.get("tool_choice").is_none());
         assert_eq!(body["prompt_cache_key"], "s1");
+    }
+
+    #[test]
+    fn a_later_core_note_stays_in_place_as_a_tagged_user_message() {
+        let model = json!({"id": "grok-4.6", "reasoning": true});
+        let mut body = json!({"model": "grok-4.6", "input": [
+            {"role": "developer", "content": "Be brief."},
+            {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"role": "developer", "content": [{"type": "input_text", "text": "Context: about 1k tokens (estimated)"}]}]});
+        sanitize(&mut body, &model, "s1");
+        assert_eq!(
+            body["instructions"], "Be brief.",
+            "the instructions, and so the cached prefix, are unchanged"
+        );
+        assert_eq!(
+            body["input"][1],
+            json!({"role": "user", "content": [{"type": "input_text", "text": "[system] Context: about 1k tokens (estimated)"}]})
+        );
     }
 
     #[test]

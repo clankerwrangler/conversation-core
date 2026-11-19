@@ -1041,6 +1041,15 @@ fn every_request_ends_with_the_context_usage_line_which_is_never_saved() {
         last_input_text(&bodies[1]),
         "Context: about 0k of 272k tokens (0k measured + ~0k new)"
     );
+    // It is a core note in the instruction role, so the model never takes it for the user.
+    for body in &bodies {
+        let last = body["input"].as_array().unwrap().last().unwrap();
+        assert_ne!(last["role"], "user", "the usage line is not a user message");
+        assert!(matches!(
+            last["role"].as_str(),
+            Some("developer" | "system")
+        ));
+    }
     let ctx = core.context();
     assert!(
         ctx.iter()
