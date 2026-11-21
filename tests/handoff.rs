@@ -63,41 +63,25 @@ fn server(replies: Vec<Vec<Step>>) -> (String, std::thread::JoinHandle<Vec<Value
 }
 
 fn read_request(stream: &mut TcpStream) -> Value {
-    read_request_with_auth(stream).0
-}
-
-fn read_request_with_auth(stream: &mut TcpStream) -> (Value, Option<String>) {
-    let (body, auth) = read_http_request(stream);
-    let body = if body.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&body).unwrap()
-    };
-    (body, auth)
-}
-
-fn read_http_request(stream: &mut TcpStream) -> (Vec<u8>, Option<String>) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut length = 0;
-    let mut auth = None;
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         if line == "\r\n" || line.is_empty() {
             break;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                length = value.trim().parse().unwrap();
-            }
-            if name.eq_ignore_ascii_case("authorization") {
-                auth = Some(value.trim().to_string());
-            }
+        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = v.trim().parse().unwrap();
         }
+    }
+    if length == 0 {
+        // A request without a body (a WebSocket upgrade the server does not accept).
+        return Value::Null;
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
-    (body, auth)
+    serde_json::from_slice(&body).unwrap()
 }
 
 /// A fake Codex WebSocket server: each request frame is answered with the next reply on
@@ -205,7 +189,6 @@ struct Core {
     extra: Value,
     /// Return `provider_response` events instead of skipping them.
     show_responses: bool,
-    respond_credentials: bool,
     /// Return `reasoning_delta` events instead of skipping them.
     show_reasoning: bool,
     /// The prepare_request events answered so far.
@@ -223,21 +206,9 @@ impl Core {
 
     /// Started in folder `cwd` (where its tools work and its AGENTS files are found).
     fn start_in(dir: &Path, base: &str, flags: &[&str], tools: Value, cwd: &Path) -> Core {
-        Core::start_with_env(dir, base, flags, tools, cwd, &[])
-    }
-
-    fn start_with_env(
-        dir: &Path,
-        base: &str,
-        flags: &[&str],
-        tools: Value,
-        cwd: &Path,
-        env: &[(&str, &str)],
-    ) -> Core {
         let mut child = Command::new(env!("CARGO_BIN_EXE_core"))
             .args(["run", dir.to_str().unwrap()])
             .args(flags)
-            .envs(env.iter().copied())
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -260,7 +231,6 @@ impl Core {
             tools,
             extra: json!({}),
             show_responses: false,
-            respond_credentials: true,
             show_reasoning: false,
             prepares: Vec::new(),
         }
@@ -303,7 +273,7 @@ impl Core {
                     self.op(prepared);
                     self.prepares.push(ev);
                 }
-                Some("need_credentials") if self.respond_credentials => self.op(
+                Some("need_credentials") => self.op(
                     json!({"op": "credentials", "id": ev["id"], "token": "t", "accountId": "acct"}),
                 ),
                 Some("provider_response") if self.show_responses => return ev,
@@ -2074,18 +2044,6 @@ struct CountedServer {
 
 impl CountedServer {
     fn start(replies: Vec<Vec<Step>>) -> Self {
-        Self::start_with_auth(replies, None)
-    }
-
-    fn start_with_auth(replies: Vec<Vec<Step>>, expected: Option<&'static str>) -> Self {
-        Self::start_gated(replies, expected, None)
-    }
-
-    fn start_gated(
-        replies: Vec<Vec<Step>>,
-        expected: Option<&'static str>,
-        mut first_reply: Option<Receiver<()>>,
-    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -2102,20 +2060,11 @@ impl CountedServer {
                     Ok((mut stream, _)) => {
                         stream.set_nonblocking(false).unwrap();
                         reqs.fetch_add(1, Ordering::SeqCst);
-                        let (body, auth) = read_request_with_auth(&mut stream);
-                        bodies.push(body);
+                        bodies.push(read_request(&mut stream));
                         let reply = replies
                             .next()
                             .unwrap_or_else(|| vec![text("unexpected-retry"), done()]);
-                        let gate = first_reply.take();
                         writers.push(std::thread::spawn(move || {
-                            if let Some(gate) = gate {
-                                gate.recv_timeout(Duration::from_secs(5)).unwrap();
-                            }
-                            if expected.is_some_and(|expected| auth.as_deref() != Some(expected)) {
-                                let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
-                                return;
-                            }
                             if let Some(Step::Status(code, body)) = reply.first() {
                                 let _ = stream.write_all(
                                     format!(
@@ -2251,537 +2200,4 @@ fn abort_during_retry_backoff_cancels_retry_and_runs_queued_send() {
             .contains("second"),
         "second request should carry the queued send"
     );
-}
-
-fn configured_core(primary: &str, local: &str, window: u64, enabled: bool) -> Core {
-    routed_core(
-        primary,
-        local,
-        window,
-        enabled.then_some("test"),
-        json!({}),
-        &[],
-    )
-}
-
-fn routed_core(
-    primary: &str,
-    local: &str,
-    window: u64,
-    fallback_for: Option<&str>,
-    mut credentials: Value,
-    env: &[(&str, &str)],
-) -> Core {
-    let d = dir();
-    std::fs::create_dir_all(&d).unwrap();
-    let models = d.join("models-test.json");
-    let auth = d.join("auth-test.json");
-    let mut config = json!({"models": {"local-model": {"provider": "local",
-        "api": "openai-completions", "baseUrl": local, "contextWindow": window, "maxTokens": 256,
-        "input": ["text"], "reasoning": false}}});
-    if let Some(primary) = fallback_for {
-        config["fallback"] = json!({primary: "local-model"});
-    }
-    std::fs::write(&models, config.to_string()).unwrap();
-    credentials["local"] = json!({"type":"api_key", "key":"fixture-local-key"});
-    std::fs::write(&auth, credentials.to_string()).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
-    }
-    let mut core = Core::start_with_env(
-        &d,
-        primary,
-        &[
-            "--models",
-            models.to_str().unwrap(),
-            "--auth",
-            auth.to_str().unwrap(),
-        ],
-        json!([]),
-        &std::env::current_dir().unwrap(),
-        env,
-    );
-    core.extra = json!({"basePrompt": false, "instructions": "fixture instructions",
-        "model": {"contextWindow": 100_000}});
-    core
-}
-
-fn chat_text(text: &str) -> Step {
-    Step::Event(json!({"choices": [{"delta": {"content": text}, "finish_reason": "stop"}]}))
-}
-
-fn unavailable() -> Step {
-    Step::Status(503, "fixture unavailable".into())
-}
-
-#[test]
-fn failover_uses_local_capabilities_and_credentials_then_recovers_primary_next_turn() {
-    let online = CountedServer::start(vec![
-        vec![
-            item_done(
-                json!({"type": "reasoning", "id": "rs_prior", "encrypted_content": "private-primary-signature", "summary": [{"type": "summary_text", "text": "private-primary-thinking"}]}),
-            ),
-            text("healthy"),
-            done(),
-        ],
-        vec![unavailable()],
-        vec![text("recovered"), done()],
-    ]);
-    let local = CountedServer::start_with_auth(
-        vec![vec![chat_text("offline")]],
-        Some("Bearer fixture-local-key"),
-    );
-    let mut core = configured_core(&online.base, &local.base, 8192, true);
-    core.op(json!({"op": "set_model", "id": "picked", "provider": "test", "model": "m"}));
-    assert_eq!(
-        core.until("model_set")["model"],
-        json!({"provider":"test", "id":"m"})
-    );
-    core.op(json!({"op": "send", "input": {"text": "normal"}}));
-    assert_eq!(core.until("message_end")["model"], "m");
-    assert_eq!(core.until("turn_end")["stopReason"], "stop");
-    core.op(json!({"op": "send", "input": {"text": "during outage"}}));
-    let switch = core.until("retry");
-    assert_eq!(switch["fallback"], true);
-    assert_eq!(switch["fromModel"], "m");
-    assert_eq!(switch["provider"], "local");
-    assert_eq!(switch["error"], "provider_http_503");
-    let reply = core.until("message_end");
-    assert_eq!(reply["model"], "local-model");
-    assert_eq!(reply["contextUsage"]["contextWindow"], 8192);
-    assert_eq!(core.until("turn_end")["stopReason"], "stop");
-    core.op(json!({"op": "send", "input": {"text": "new turn"}}));
-    assert_eq!(core.until("message_end")["model"], "m");
-    assert_eq!(core.until("turn_end")["stopReason"], "stop");
-    let ctx = core.context();
-    assert_eq!(
-        roles(&ctx),
-        [
-            "user",
-            "assistant",
-            "user",
-            "assistant",
-            "user",
-            "assistant"
-        ]
-    );
-    assert_eq!(ctx[3]["provider"], "local");
-    assert_eq!(ctx[3]["model"], "local-model");
-    assert_eq!(
-        core.prepares.len(),
-        3,
-        "the replacement reused the same logical request"
-    );
-    assert_eq!(
-        core.prepares[2]["selected"]["model"],
-        json!({"provider":"test", "id":"m"})
-    );
-    core.stop();
-    let (count, bodies) = local.finish();
-    assert_eq!(count, 1);
-    assert_eq!(bodies[0]["model"], "local-model");
-    assert_eq!(bodies[0]["messages"][0]["content"], "fixture instructions");
-    let raw = bodies[0].to_string();
-    assert!(raw.contains("healthy") && raw.contains("during outage"));
-    assert!(
-        !raw.contains("private-primary-signature") && !raw.contains("private-primary-thinking")
-    );
-    let (count, bodies) = online.finish();
-    assert_eq!(count, 3);
-    assert_eq!(bodies[2]["model"], "m");
-    assert!(bodies[2].to_string().contains("offline"));
-}
-
-#[test]
-fn failover_after_a_refused_connection() {
-    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
-    let refused = format!("http://{}", socket.local_addr().unwrap());
-    drop(socket);
-    let local = CountedServer::start(vec![vec![chat_text("offline")]]);
-    let mut core = configured_core(&refused, &local.base, 8192, true);
-    core.op(json!({"op": "send", "input": {"text":"go"}}));
-    assert_eq!(core.until("retry")["error"], "provider_request_failed");
-    assert_eq!(core.until("message_end")["model"], "local-model");
-    assert_eq!(core.until("turn_end")["stopReason"], "stop");
-    core.stop();
-    assert_eq!(local.finish().0, 1);
-}
-
-#[test]
-fn failover_does_not_replay_dropped_text_or_reasoning_or_an_ambiguous_disconnect() {
-    let prefix = [
-        Some(Step::Event(
-            json!({"type": "response.output_text.delta", "delta": "partial"}),
-        )),
-        Some(Step::Event(
-            json!({"type": "response.reasoning_summary_text.delta", "delta": "partial"}),
-        )),
-        None,
-    ];
-    for delta in prefix {
-        let mut reply: Vec<Step> = delta.into_iter().collect();
-        reply.push(Step::Drop);
-        let online = CountedServer::start(vec![reply]);
-        let local = CountedServer::start(vec![]);
-        let mut core = configured_core(&online.base, &local.base, 8192, true);
-        core.op(json!({"op": "send", "input": {"text":"go"}}));
-        assert_eq!(core.until("error")["error"], "provider_stream_incomplete");
-        assert_eq!(core.until("turn_end")["stopReason"], "error");
-        core.stop();
-        assert_eq!(online.finish().0, 1);
-        assert_eq!(local.finish().0, 0);
-    }
-}
-
-#[test]
-fn failover_does_not_replay_a_tool_dispatch_or_switch_after_a_prior_tool_in_the_turn() {
-    for follow_up in [false, true] {
-        let replies = if follow_up {
-            vec![vec![call("c1", json!({})), done()], vec![unavailable()]]
-        } else {
-            vec![vec![call("c1", json!({})), Step::Drop]]
-        };
-        let online = CountedServer::start(replies);
-        let local = CountedServer::start(vec![]);
-        let mut core = configured_core(&online.base, &local.base, 8192, true);
-        core.op(json!({"op": "send", "input": {"text":"go"}}));
-        let call = core.until("tool_call");
-        core.result(call["call"].as_str().unwrap(), "one result");
-        assert_eq!(core.until("turn_end")["stopReason"], "error");
-        let ctx = core.context();
-        assert_eq!(ctx.iter().filter(|m| m["role"] == "toolResult").count(), 1);
-        core.stop();
-        assert_eq!(online.finish().0, if follow_up { 2 } else { 1 });
-        assert_eq!(local.finish().0, 0);
-    }
-}
-
-#[test]
-fn failover_does_not_dispatch_after_abort_and_the_queued_send_still_works() {
-    let (release, gate) = channel();
-    let online = CountedServer::start_gated(
-        vec![vec![unavailable()], vec![text("after-abort"), done()]],
-        None,
-        Some(gate),
-    );
-    let local = CountedServer::start(vec![]);
-    let mut core = configured_core(&online.base, &local.base, 8192, true);
-    core.op(json!({"op": "send", "input": {"text":"first"}}));
-    // Let the first request reach the provider, while it is still holding the 503.
-    let prep = core.events.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(prep["ev"], "turn_start");
-    let prep = core.events.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(prep["ev"], "prepare_request");
-    core.op(json!({"op": "prepared", "id": prep["id"], "basePrompt": false,
-        "model": {"api": "openai-responses", "provider": "test", "id": "m", "baseUrl": &online.base}}));
-    let auth = core.events.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(auth["ev"], "need_credentials");
-    core.op(json!({"op": "credentials", "id": auth["id"], "token": "fixture-primary-key"}));
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while online.requests.load(Ordering::SeqCst) == 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "primary request was not dispatched"
-        );
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    core.op(json!({"op": "abort"}));
-    core.op(json!({"op": "send", "input": {"text":"queued"}}));
-    assert_eq!(core.until("turn_end")["stopReason"], "aborted");
-    release.send(()).unwrap();
-    assert_eq!(core.until("message_end")["model"], "m");
-    assert_eq!(core.until("turn_end")["stopReason"], "stop");
-    core.stop();
-    assert_eq!(online.finish().0, 2);
-    assert_eq!(local.finish().0, 0);
-}
-
-#[test]
-fn without_failover_routing_the_primary_retries_as_before() {
-    let online = CountedServer::start(vec![vec![unavailable()], vec![text("retried"), done()]]);
-    let local = CountedServer::start(vec![]);
-    let mut core = configured_core(&online.base, &local.base, 8192, false);
-    core.op(json!({"op": "send", "input": {"text":"go"}}));
-    assert_eq!(core.until("retry")["error"], "provider_http_503");
-    assert_eq!(core.until("message_end")["model"], "m");
-    assert_eq!(core.until("turn_end")["stopReason"], "stop");
-    core.stop();
-    assert_eq!(online.finish().0, 2);
-    assert_eq!(local.finish().0, 0);
-}
-
-#[test]
-fn failover_refuses_to_send_a_request_that_exceeds_the_local_window() {
-    let online = CountedServer::start(vec![vec![unavailable()]]);
-    let local = CountedServer::start(vec![]);
-    let mut core = configured_core(&online.base, &local.base, 8192, true);
-    let content = "this user input must not be truncated ".repeat(900);
-    core.op(json!({"op": "send", "input": {"text": &content}}));
-    let too_large = core.until("context_too_large");
-    assert_eq!(too_large["model"], "local-model");
-    assert_eq!(too_large["window"], 8192);
-    assert_eq!(core.until("turn_end")["stopReason"], "error");
-    let ctx = core.context();
-    assert_eq!(ctx[0]["content"][0]["text"], content);
-    core.stop();
-    assert_eq!(online.finish().0, 1);
-    assert_eq!(local.finish().0, 0);
-}
-
-#[test]
-fn failover_is_not_retried_when_the_local_endpoint_is_also_unavailable() {
-    let online = CountedServer::start(vec![vec![unavailable()]]);
-    let local = CountedServer::start(vec![vec![unavailable()]]);
-    let mut core = configured_core(&online.base, &local.base, 8192, true);
-    core.op(json!({"op": "send", "input": {"text":"go"}}));
-    assert_eq!(core.until("retry")["fallback"], true);
-    assert_eq!(core.until("error")["error"], "provider_http_503");
-    assert_eq!(core.until("turn_end")["stopReason"], "error");
-    assert_eq!(core.context()[1]["provider"], "local");
-    core.stop();
-    assert_eq!(online.finish().0, 1);
-    assert_eq!(local.finish().0, 1);
-}
-
-#[test]
-fn failover_skips_sign_in_rate_limits_and_reviewed_requests() {
-    for (status, review) in [(401, false), (429, false), (503, true)] {
-        let online = CountedServer::start(vec![vec![Step::Status(status, String::new())]]);
-        let local = CountedServer::start(vec![]);
-        let mut core = configured_core(&online.base, &local.base, 8192, true);
-        if review {
-            core.extra["reviewRequest"] = json!("body");
-        }
-        core.op(json!({"op": "send", "input": {"text":"go"}}));
-        if review {
-            let req = core.until("review_request");
-            core.op(json!({"op": "review_request", "id": req["id"]}));
-        }
-        assert_eq!(
-            core.until("error")["error"],
-            format!("provider_http_{status}")
-        );
-        assert_eq!(core.until("turn_end")["stopReason"], "error");
-        core.stop();
-        assert_eq!(online.finish().0, 1);
-        assert_eq!(local.finish().0, 0);
-    }
-}
-
-#[test]
-fn failover_tool_result_continues_on_local_route_until_the_turn_ends() {
-    let online = CountedServer::start(vec![vec![unavailable()], vec![text("online"), done()]]);
-    let tool_chunk = Step::Event(json!({"choices": [{"delta": {"tool_calls": [{"index": 0,
-        "id": "tool_c1", "function": {"name": "test_tool", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}]}));
-    let local = CountedServer::start(vec![vec![tool_chunk], vec![chat_text("local done")]]);
-    let mut core = configured_core(&online.base, &local.base, 8192, true);
-    core.tools = json!([{"type":"function", "name":"test_tool", "parameters":{"type":"object"}}]);
-    core.op(json!({"op": "send", "input": {"text":"go"}}));
-    let call = core.until("tool_call");
-    assert_eq!(call["provider"], "local");
-    assert_eq!(call["name"], "test_tool");
-    core.result(call["call"].as_str().unwrap(), "tool output only once");
-    assert_eq!(core.until("turn_end")["stopReason"], "stop");
-    core.op(json!({"op": "send", "input": {"text":"new turn"}}));
-    assert_eq!(core.until("message_end")["model"], "m");
-    assert_eq!(core.until("turn_end")["stopReason"], "stop");
-    core.stop();
-    let (count, sent) = local.finish();
-    assert_eq!(count, 2);
-    assert!(sent[1].to_string().contains("tool output only once"));
-    let (count, sent) = online.finish();
-    assert_eq!(count, 2);
-    assert!(sent[1].to_string().contains("local done"));
-}
-
-fn renewing_core(
-    primary: &str,
-    local: &str,
-    issuer: &str,
-    expires: u64,
-    refresh: &str,
-    enabled: bool,
-) -> Core {
-    let mut core = routed_core(
-        primary,
-        local,
-        8192,
-        enabled.then_some("openai-codex"),
-        json!({
-            "openai-codex": {"type":"oauth", "access":"fixture-online-access", "refresh":refresh,
-                "expires":expires, "accountId":"fixture-account"}
-        }),
-        &[
-            ("CONVERSATION_CORE_CODEX_AUTH", issuer),
-            ("NO_PROXY", "*"),
-            ("no_proxy", "*"),
-        ],
-    );
-    core.extra["model"]["provider"] = json!("openai-codex");
-    core.respond_credentials = false;
-    core
-}
-
-#[test]
-fn refused_renewal_can_use_fallback_even_after_the_access_token_expires() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let refused = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-    let primary = CountedServer::start(vec![]);
-    let local = CountedServer::start_with_auth(
-        vec![vec![chat_text("offline")]],
-        Some("Bearer fixture-local-key"),
-    );
-    let mut core = renewing_core(
-        &primary.base,
-        &local.base,
-        &refused,
-        0,
-        "fixture-refresh",
-        true,
-    );
-    let auth_file = core.dir.join("auth-test.json");
-    let auth_before = std::fs::read(&auth_file).unwrap();
-    core.op(json!({"op":"send", "input":{"text":"go"}}));
-    let switch = core.next();
-    assert_eq!(switch["ev"], "retry");
-    assert_eq!(switch["error"], "renewal_unavailable");
-    assert_eq!(switch["fromProvider"], "openai-codex");
-    assert_eq!(core.until("message_end")["provider"], "local");
-    assert_eq!(core.until("turn_end")["stopReason"], "stop");
-    assert_eq!(std::fs::read(&auth_file).unwrap(), auth_before);
-    core.stop();
-    assert_eq!(primary.finish().0, 0);
-    let (count, bodies) = local.finish();
-    assert_eq!(count, 1);
-    assert!(!bodies[0].to_string().contains("fixture-refresh"));
-    assert!(!bodies[0].to_string().contains("fixture-online-access"));
-}
-
-#[test]
-fn renewal_rejection_or_cutoff_after_the_post_does_not_switch_providers() {
-    for status in [Some(401), Some(503), None] {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let issuer = format!("http://{}", listener.local_addr().unwrap());
-        let renewal = std::thread::spawn(move || {
-            let (mut connection, _) = listener.accept().unwrap();
-            let (post, _) = read_http_request(&mut connection);
-            let post = String::from_utf8(post).unwrap();
-            assert!(post.contains("grant_type=refresh_token"));
-            if let Some(status) = status {
-                write!(
-                    connection,
-                    "HTTP/1.1 {status} Failure\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                )
-                .unwrap();
-            }
-            // Without a response the client knows it sent the POST, but not its outcome.
-        });
-        let primary = CountedServer::start(vec![]);
-        let local = CountedServer::start(vec![]);
-        let mut core = renewing_core(
-            &primary.base,
-            &local.base,
-            &issuer,
-            0,
-            "fixture-refresh",
-            true,
-        );
-        core.op(json!({"op":"send", "input":{"text":"go"}}));
-        let error = core.next();
-        assert_eq!(error["ev"], "sign_in_needed");
-        assert_eq!(
-            error["error"],
-            match status {
-                Some(401) => "sign_in_again",
-                Some(503) => "renewal_http_503",
-                _ => "sign_in_unreachable",
-            }
-        );
-        assert_eq!(core.next()["ev"], "need_credentials");
-        core.op(json!({"op":"abort"}));
-        assert_eq!(core.until("turn_end")["stopReason"], "aborted");
-        core.stop();
-        renewal.join().unwrap();
-        assert_eq!(primary.finish().0, 0);
-        assert_eq!(local.finish().0, 0);
-    }
-}
-
-#[test]
-fn renewal_outage_does_not_switch_on_review_or_without_opt_in_or_with_no_refresh_token() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let refused = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-    for (enabled, review, refresh) in [
-        (true, true, "fixture-refresh"),
-        (false, false, "fixture-refresh"),
-        (true, false, ""),
-    ] {
-        let primary = CountedServer::start(vec![]);
-        let local = CountedServer::start(vec![]);
-        let mut core = renewing_core(&primary.base, &local.base, &refused, 0, refresh, enabled);
-        if review {
-            core.extra["reviewRequest"] = json!("body");
-        }
-        core.op(json!({"op":"send", "input":{"text":"go"}}));
-        let error = core.next();
-        assert_eq!(error["ev"], "sign_in_needed");
-        assert_eq!(
-            error["error"],
-            if refresh.is_empty() {
-                "sign_in_again"
-            } else {
-                "sign_in_unreachable"
-            }
-        );
-        assert_eq!(core.next()["ev"], "need_credentials");
-        core.op(json!({"op":"abort"}));
-        assert_eq!(core.until("turn_end")["stopReason"], "aborted");
-        core.stop();
-        assert_eq!(primary.finish().0, 0);
-        assert_eq!(local.finish().0, 0);
-    }
-}
-
-#[test]
-fn renewal_outage_cannot_switch_after_a_tool_was_dispatched_in_the_turn() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let refused = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-    let primary = CountedServer::start(vec![vec![call("c1", json!({})), done()]]);
-    let local = CountedServer::start(vec![]);
-    let mut core = renewing_core(
-        &primary.base,
-        &local.base,
-        &refused,
-        0,
-        "fixture-refresh",
-        true,
-    );
-    // Start on the fixture provider; the runner names the OAuth provider on the next
-    // request in the same turn. The earlier dispatch seals that turn even across models.
-    core.extra["model"]["provider"] = json!("test");
-    core.respond_credentials = true;
-    core.op(json!({"op":"send", "input":{"text":"go"}}));
-    let call = core.until("tool_call");
-    core.extra["model"]["provider"] = json!("openai-codex");
-    core.respond_credentials = false;
-    core.result(call["call"].as_str().unwrap(), "saved result");
-    assert_eq!(core.until("sign_in_needed")["error"], "sign_in_unreachable");
-    assert_eq!(core.next()["ev"], "need_credentials");
-    core.op(json!({"op":"abort"}));
-    assert_eq!(core.until("turn_end")["stopReason"], "aborted");
-    assert_eq!(
-        core.context()
-            .iter()
-            .filter(|m| m["role"] == "toolResult")
-            .count(),
-        1
-    );
-    core.stop();
-    assert_eq!(primary.finish().0, 1);
-    assert_eq!(local.finish().0, 0);
 }

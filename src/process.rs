@@ -9,9 +9,7 @@
 //! streaming. Results (`tool_result`) are saved whenever they arrive. The next request
 //! waits for every normal call; async calls do not block it. A dropped connection is
 //! retried from scratch only when nothing of the reply was saved; otherwise the saved
-//! part stays, a cut-off note is added and the conversation continues. With automatic
-//! fallback enabled, only a proven outage can switch providers, before any reply content
-//! or tool dispatch; ambiguous failures end the turn. Abort cancels
+//! part stays, a cut-off note is added and the conversation continues. Abort cancels
 //! every unfinished call. On open, a saved call without a result gets an interrupted
 //! result; nothing is re-run.
 //!
@@ -75,38 +73,6 @@ enum End {
     },
     Aborted,
     Failed,
-}
-
-#[derive(Default)]
-struct Turn {
-    /// Once a reply has exposed content or dispatched a call, never replay this turn.
-    exposed: bool,
-    /// Once an opted-in route was used, keep its no-replay rule throughout the turn.
-    conservative: bool,
-    /// The automatic route, kept only until the turn ends.
-    fallback: Option<Value>,
-}
-
-struct RequestSetup<'a> {
-    id: &'a str,
-    prepared: &'a Value,
-    instructions: &'a str,
-    tools: &'a [Value],
-    refs: Option<&'a [Value]>,
-    trusted_from: usize,
-    review: Option<&'a Value>,
-}
-
-struct Outage {
-    provider: String,
-    model: String,
-    reason: String,
-    attempt: u32,
-}
-
-enum Dispatch {
-    End(End),
-    Outage(Outage),
 }
 
 struct Core {
@@ -440,10 +406,7 @@ impl Core {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                match credentials_or_notify(
-                    &provider,
-                    auth::credentials(&self.auth_path, &provider),
-                ) {
+                match self.stored_credentials(&provider) {
                     Some(credentials) => self.complete_with(op.clone(), credentials),
                     None => {
                         self.completions.insert(key.clone(), op.clone());
@@ -506,6 +469,18 @@ impl Core {
             _ => return Ok(false),
         }
         Ok(true)
+    }
+
+    /// The core's stored sign-in for a provider, renewed if about to expire. None when it
+    /// holds none (or renewal failed, reported as `sign_in_needed`): the runner is asked.
+    fn stored_credentials(&self, provider: &str) -> Option<Value> {
+        match auth::credentials(&self.auth_path, provider) {
+            Ok(found) => found,
+            Err(error) => {
+                emit(json!({"ev": "sign_in_needed", "provider": provider, "error": error}));
+                None
+            }
+        }
     }
 
     fn complete_with(&self, mut request: Value, credentials: Value) {
@@ -757,9 +732,8 @@ impl Core {
         if let Some(user) = user {
             self.session.append("user", &user)?;
         }
-        let mut turn = Turn::default();
         loop {
-            match self.request(&mut turn)? {
+            match self.request()? {
                 End::Aborted => return Ok(false),
                 End::Failed => {
                     emit(json!({"ev": "turn_end", "stopReason": "error"}));
@@ -884,8 +858,8 @@ impl Core {
         }
     }
 
-    /// One logical request: capture its context and ask the runner once, even if the route changes.
-    fn request(&mut self, turn: &mut Turn) -> Result<End> {
+    /// One request: prepare, stream, save. Retries from scratch only while nothing was saved.
+    fn request(&mut self) -> Result<End> {
         let (refs, from_checkpoint, through) = self.session.context_parts_with_seq()?;
         context_file::publish_refs(&self.session, &refs, through)?;
         let context = self.session.resolve(&refs)?;
@@ -916,6 +890,38 @@ impl Core {
             .get("model")
             .cloned()
             .ok_or_else(|| Error::Format("prepared needs model".into()))?;
+        let provider_name = named
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // The core's own sign-in first (renewed when about to expire); the runner otherwise.
+        let credentials = match self.stored_credentials(&provider_name) {
+            Some(c) => c,
+            None => {
+                emit(json!({"ev": "need_credentials", "id": id, "provider": provider_name}));
+                let Some(c) = self.answer("credentials", &id)? else {
+                    self.abort(None)?;
+                    return Ok(End::Aborted);
+                };
+                c
+            }
+        };
+        let token = credentials
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Format("credentials need token".into()))?;
+        // The runner names the model; its details come from the catalog (OpenRouter's own
+        // list, or the models file), under whatever the runner set itself.
+        let model = catalog::resolve(&self.models, &self.catalog_dir, &named, Some(token));
+        let field = |key: &str| {
+            model
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let (api, model_id, base_url) = (field("api"), field("id"), field("baseUrl"));
         // Built-ins first, then the runner's tools; a runner tool replaces a built-in of its name.
         let mut runner_tools = prepared
             .get("tools")
@@ -977,121 +983,7 @@ impl Core {
                 &sections,
             )
         };
-        let review = prepared
-            .get("reviewRequest")
-            .filter(|r| **r == Value::Bool(true) || r.as_str() == Some("body"));
-        let setup = RequestSetup {
-            id: &id,
-            prepared: &prepared,
-            instructions: &instructions,
-            tools: &request_tools,
-            refs: refs.as_deref(),
-            trusted_from,
-            review,
-        };
-        let primary = named.get("provider").and_then(Value::as_str).unwrap_or("");
-        turn.conservative |= self.models.fallback(primary).is_some();
-        let mut alternative = if turn.exposed || turn.fallback.is_some() || review.is_some() {
-            None
-        } else {
-            self.models.fallback(primary).cloned()
-        };
-        let mut current = turn.fallback.clone().unwrap_or(named);
-        let mut context = Some(context);
-        let mut outage = None;
-        loop {
-            let sending = if alternative.is_some() {
-                context.as_ref().expect("request context").clone()
-            } else {
-                context.take().expect("request context")
-            };
-            match self.dispatch(
-                turn,
-                &setup,
-                &current,
-                sending,
-                alternative.is_some(),
-                outage.as_ref(),
-            )? {
-                Dispatch::End(end) => return Ok(end),
-                Dispatch::Outage(failure) => {
-                    current = alternative.take().expect("candidate for failover");
-                    turn.fallback = Some(current.clone());
-                    outage = Some(failure);
-                }
-            }
-        }
-    }
-
-    fn dispatch(
-        &mut self,
-        turn: &mut Turn,
-        setup: &RequestSetup<'_>,
-        named: &Value,
-        context: Vec<Value>,
-        can_switch: bool,
-        switched_from: Option<&Outage>,
-    ) -> Result<Dispatch> {
-        let local = turn.fallback.is_some();
-        let RequestSetup {
-            id,
-            prepared,
-            instructions,
-            tools,
-            refs,
-            trusted_from,
-            review,
-        } = *setup;
         let reasoning = prepared.get("reasoning").and_then(Value::as_str);
-        let service_tier = (!local)
-            .then(|| prepared.get("serviceTier").and_then(Value::as_str))
-            .flatten();
-        let provider_name = named
-            .get("provider")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let stored = auth::credentials(&self.auth_path, &provider_name);
-        if can_switch && matches!(stored, Err(auth::CredentialError::RenewalUnavailable)) {
-            return Ok(Dispatch::Outage(Outage {
-                provider: provider_name,
-                model: named["id"].as_str().unwrap_or("").to_string(),
-                reason: "renewal_unavailable".into(),
-                attempt: 0,
-            }));
-        }
-        let credentials = match credentials_or_notify(&provider_name, stored) {
-            Some(c) => c,
-            // Local credentials cannot come from the primary or an endpoint override.
-            None if local => json!({"token": ""}),
-            None => {
-                emit(json!({"ev": "need_credentials", "id": id, "provider": provider_name}));
-                let Some(c) = self.answer("credentials", id)? else {
-                    self.abort(None)?;
-                    return Ok(Dispatch::End(End::Aborted));
-                };
-                c
-            }
-        };
-        let token = credentials
-            .get("token")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::Format("credentials need token".into()))?;
-        let model = if local {
-            // The fallback model and endpoint come from the operator's models file, not
-            // the primary prepared model, its credentials, or a discovered catalog.
-            named.clone()
-        } else {
-            catalog::resolve(&self.models, &self.catalog_dir, named, Some(token))
-        };
-        let field = |key: &str| {
-            model
-                .get(key)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        };
-        let (api, model_id, base_url) = (field("api"), field("id"), field("baseUrl"));
         self.tool_env = vec![
             ("PI_SESSION_ID".into(), self.session_id.clone()),
             ("PI_PROVIDER".into(), provider_name.clone()),
@@ -1111,20 +1003,20 @@ impl Core {
         let reasoning_setting =
             crate::models::reasoning(&model, self.models.get(&model_id), reasoning);
         let req = Request {
-            target,
-            // The credentials may name another endpoint (an account on its own proxy).
-            base_url: if local {
-                &base_url
-            } else {
-                credentials
-                    .get("baseUrl")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&base_url)
+            target: Target {
+                api: &api,
+                provider: &provider_name,
+                model: &model_id,
             },
-            instructions,
+            // The credentials may name another endpoint (an account on its own proxy).
+            base_url: credentials
+                .get("baseUrl")
+                .and_then(Value::as_str)
+                .unwrap_or(base_url.as_str()),
+            instructions: &instructions,
             reasoning: &reasoning_setting,
-            service_tier,
-            tools,
+            service_tier: prepared.get("serviceTier").and_then(Value::as_str),
+            tools: &request_tools,
             session_id: &session_id,
             token,
             account_id: credentials.get("accountId").and_then(Value::as_str),
@@ -1147,77 +1039,36 @@ impl Core {
             .and_then(Value::as_u64)
             .filter(|w| *w > 0)
             .or_else(|| self.models.window(&model_id));
-        let sent = if local {
-            // A different tokenizer cannot use the online provider's measurements.
-            // Check the rendered request below, including instructions and tool definitions.
-            let mut sent = context;
-            let estimate = budget::estimate(&sent, sent.len());
-            sent.push(budget::text_message(
-                "system",
-                &budget::usage_line(&estimate, window),
-            ));
-            sent
-        } else {
-            let Some(sent) = self.budget(context, refs, trusted_from, &model_id, window) else {
-                return Ok(Dispatch::End(End::Failed));
-            };
-            sent
+        let Some(context) = self.budget(context, refs.as_deref(), trusted_from, &model_id, window)
+        else {
+            return Ok(End::Failed);
         };
-        let mut ready = provider::prepare(&req, &sent)?;
-        ready.no_replay = turn.conservative;
-        ready.loopback = local;
-        if local {
-            let window = window.expect("fallback has a known context window");
-            // The JSON includes request framing; add room for the server's prompt template and
-            // the model's completion. This is an estimate, not the local model's tokenizer.
-            let tokens = ready.body_bytes().div_ceil(3)
-                + 256
-                + model["maxTokens"].as_u64().expect("fallback output limit");
-            if tokens > window {
-                emit(
-                    json!({"ev": "context_too_large", "tokens": tokens, "window": window,
-                "provider": provider_name, "model": model_id}),
-                );
-                return Ok(Dispatch::End(End::Failed));
-            }
-        }
+        let mut ready = provider::prepare(&req, &context)?;
         // `"transport": "sse"` keeps a Codex request on plain HTTP.
         if prepared.get("transport").and_then(Value::as_str) == Some("sse") {
             ready.transport = provider::Transport::Sse;
         }
         // The runner may review and change the exact request (body and headers) before it is sent.
-        if let Some(review) = review {
-            if local {
-                emit(json!({"ev": "error", "error": "fallback_request_review_unsupported"}));
-                return Ok(Dispatch::End(End::Failed));
-            }
+        let review = prepared.get("reviewRequest");
+        if review == Some(&Value::Bool(true)) || review.and_then(Value::as_str) == Some("body") {
             let mut request = ready.view();
-            if review.as_str() == Some("body") {
+            if review.and_then(Value::as_str) == Some("body") {
                 let request = request.as_object_mut().expect("request is an object");
                 request.remove("headers");
                 request.remove("url");
             }
             emit(json!({"ev": "review_request", "id": id, "request": request}));
-            let Some(reviewed) = self.answer("review_request", id)? else {
+            let Some(reviewed) = self.answer("review_request", &id)? else {
                 self.abort(None)?;
-                return Ok(Dispatch::End(End::Aborted));
+                return Ok(End::Aborted);
             };
             ready.replace(reviewed.get("body"), reviewed.get("headers"))?;
         }
-        let pricing = Pricing::new(&model, self.models.get(&model_id), service_tier);
-        if local {
-            // Drain any abort or EOF queued while the replacement request was being built.
-            if !self.wait_retry(Duration::ZERO)? {
-                return Ok(Dispatch::End(End::Aborted));
-            }
-            if let Some(outage) = switched_from {
-                emit(
-                    json!({"ev": "retry", "attempt": outage.attempt + 1, "error": outage.reason, "fallback": true,
-                "fromProvider": outage.provider, "fromModel": outage.model,
-                "provider": provider_name, "model": model_id}),
-                );
-            }
-        }
+        let pricing = Pricing::new(
+            &model,
+            self.models.get(&model_id),
+            prepared.get("serviceTier").and_then(Value::as_str),
+        );
         for attempt in 1..=MAX_ATTEMPTS {
             self.attempts += 1;
             let tag = self.attempts;
@@ -1225,22 +1076,12 @@ impl Core {
             provider::spawn(ready.clone(), move |piece| {
                 let _ = tx.send(Msg::Piece(tag, piece));
             });
-            match self.stream(tag, &req.target, &pricing, window, turn)? {
-                Streamed::Ended(end) => return Ok(Dispatch::End(end)),
-                Streamed::Unavailable(reason) if can_switch => {
-                    return Ok(Dispatch::Outage(Outage {
-                        provider: provider_name,
-                        model: model_id,
-                        reason,
-                        attempt,
-                    }));
-                }
+            match self.stream(tag, &target, &pricing, window)? {
+                Streamed::Ended(end) => return Ok(end),
                 // The model's reasoning cannot be switched off: send again without the
                 // setting (the model's own default), and remember it for this model.
                 Streamed::Retry(reason)
-                    if !local
-                        && reason == provider::REASONING_MANDATORY
-                        && attempt < MAX_ATTEMPTS =>
+                    if reason == provider::REASONING_MANDATORY && attempt < MAX_ATTEMPTS =>
                 {
                     catalog::learn_reasoning_mandatory(
                         &self.catalog_dir,
@@ -1248,26 +1089,23 @@ impl Core {
                         &model_id,
                     );
                     ready.without("reasoning");
-                    if turn.conservative && !self.wait_retry(Duration::ZERO)? {
-                        return Ok(Dispatch::End(End::Aborted));
-                    }
                     emit(json!({"ev": "retry", "attempt": attempt + 1, "error": reason}));
                 }
-                Streamed::Retry(reason) if !local && attempt < MAX_ATTEMPTS => {
+                Streamed::Retry(reason) if attempt < MAX_ATTEMPTS => {
                     emit(json!({"ev": "retry", "attempt": attempt + 1, "error": reason}));
                     if !self.wait_retry(Duration::from_secs(1 << (attempt - 1)))? {
-                        return Ok(Dispatch::End(End::Aborted));
+                        return Ok(End::Aborted);
                     }
                 }
-                Streamed::Unavailable(reason) | Streamed::Retry(reason) => {
+                Streamed::Retry(reason) => {
                     let end = failure_end(&reason, None);
-                    let n = self.save_failed_reply(&req.target, &end)?;
-                    emit(error_event(&end, n, &req.target));
-                    return Ok(Dispatch::End(End::Failed));
+                    let n = self.save_failed_reply(&target, &end)?;
+                    emit(error_event(&end, n));
+                    return Ok(End::Failed);
                 }
             }
         }
-        Ok(Dispatch::End(End::Failed))
+        Ok(End::Failed)
     }
 
     /// Wait out retry backoff while still handling mid-turn ops (including `abort`) and stdin EOF.
@@ -1318,7 +1156,6 @@ impl Core {
         target: &Target,
         pricing: &Pricing,
         window: Option<u64>,
-        turn: &mut Turn,
     ) -> Result<Streamed> {
         let mut message = provider::empty_reply(target);
         let mut unsaved: Vec<Value> = Vec::new();
@@ -1351,8 +1188,7 @@ impl Core {
             };
             match piece {
                 Piece::Response(response) => {
-                    let mut ev = json!({"ev": "provider_response", "attempt": tag,
-                        "provider": target.provider, "model": target.model});
+                    let mut ev = json!({"ev": "provider_response"});
                     if let (Value::Object(e), Value::Object(r)) = (&mut ev, response) {
                         e.extend(r);
                     }
@@ -1364,26 +1200,19 @@ impl Core {
                 // `item`: the provider's id for the text item (Responses), which the saved
                 // text keeps in its signature, so a runner can name the live text as saved.
                 Piece::Text(delta, item) => {
-                    turn.exposed = true;
                     if text_items.insert(item.clone()) {
                         text_starts.push_back(provider::now_ms());
                     }
-                    let mut ev = json!({"ev": "text_delta", "attempt": tag, "delta": delta,
-                        "provider": target.provider, "model": target.model});
+                    let mut ev = json!({"ev": "text_delta", "attempt": tag, "delta": delta});
                     if let Some(item) = item {
                         ev["item"] = Value::String(item);
                     }
                     emit(ev)
                 }
                 Piece::Reasoning(delta) => {
-                    turn.exposed = true;
-                    emit(
-                        json!({"ev": "reasoning_delta", "attempt": tag, "delta": delta,
-                        "provider": target.provider, "model": target.model}),
-                    )
+                    emit(json!({"ev": "reasoning_delta", "attempt": tag, "delta": delta}))
                 }
                 Piece::Block(mut block) => {
-                    turn.exposed = true;
                     let is_call = block.get("type").and_then(Value::as_str) == Some("toolCall");
                     let call_id = is_call.then(|| {
                         block
@@ -1439,8 +1268,7 @@ impl Core {
                         );
                         let builtin = self.active.contains(&name);
                         emit(
-                            json!({"ev": "tool_call", "call": id, "name": name, "arguments": block.get("arguments"), "async": is_async, "builtin": builtin,
-                                "provider": target.provider, "model": target.model}),
+                            json!({"ev": "tool_call", "call": id, "name": name, "arguments": block.get("arguments"), "async": is_async, "builtin": builtin}),
                         );
                         if builtin {
                             let arguments =
@@ -1454,7 +1282,6 @@ impl Core {
                     incomplete,
                     service_tier,
                 } => {
-                    turn.exposed = true;
                     pricing.apply(&mut usage, service_tier.as_deref());
                     let stop = if has_calls {
                         "toolUse"
@@ -1480,39 +1307,29 @@ impl Core {
                     let context = json!({"tokens": tokens, "contextWindow": window,
                         "percent": window.zip(tokens).map(|(w, t)| t as f64 / w as f64 * 100.0)});
                     emit(
-                        json!({"ev": "message_end", "attempt": tag, "n": n, "stopReason": stop, "usage": usage, "contextUsage": context,
-                            "provider": target.provider, "model": target.model}),
+                        json!({"ev": "message_end", "attempt": tag, "n": n, "stopReason": stop, "usage": usage, "contextUsage": context}),
                     );
                     return Ok(Streamed::Ended(End::Reply { calls: has_calls }));
                 }
-                Piece::Failed(Failure::Unavailable(reason))
-                    if turn.conservative && !turn.exposed =>
-                {
-                    return Ok(Streamed::Unavailable(reason));
-                }
-                Piece::Failed(Failure::Retryable(reason) | Failure::Unavailable(reason))
-                    if open.is_none()
-                        && (!turn.conservative
-                            || (!turn.exposed && reason == provider::REASONING_MANDATORY)) =>
-                {
+                Piece::Failed(Failure::Retryable(reason)) if open.is_none() => {
                     return Ok(Streamed::Retry(reason));
                 }
                 Piece::Failed(failure) => {
                     let (reason, fatal) = match failure {
-                        Failure::Retryable(r) | Failure::Unavailable(r) => (r, turn.conservative),
+                        Failure::Retryable(r) => (r, false),
                         Failure::Fatal(r) => (r, true),
                     };
                     let end = failure_end(&reason, provider_error.as_ref());
                     let Some(reply) = open else {
                         // Nothing was saved: the failed reply is saved empty.
                         let n = self.save_failed_reply(target, &end)?;
-                        emit(error_event(&end, n, target));
+                        emit(error_event(&end, n));
                         return Ok(Streamed::Ended(End::Failed));
                     };
                     // Something was saved: keep it, let the started calls finish.
                     let n = self.session.append_more(reply, &unsaved, Some(&end))?;
                     if fatal {
-                        emit(error_event(&end, n, target));
+                        emit(error_event(&end, n));
                         if !self.wait_for_normal_calls()? {
                             return Ok(Streamed::Ended(End::Aborted));
                         }
@@ -1530,7 +1347,6 @@ impl Core {
 enum Streamed {
     Ended(End),
     Retry(String),
-    Unavailable(String),
 }
 
 /// An injected message wakes the model unless it says `"wake": false`.
@@ -1594,27 +1410,12 @@ fn failure_end(code: &str, provider_error: Option<&Value>) -> Value {
 }
 
 /// The `error` event for a saved failed reply `n`.
-fn error_event(end: &Value, n: u64, target: &Target) -> Value {
-    let mut ev = json!({"ev": "error", "n": n, "error": end["errorMessage"],
-        "provider": target.provider, "model": target.model});
+fn error_event(end: &Value, n: u64) -> Value {
+    let mut ev = json!({"ev": "error", "n": n, "error": end["errorMessage"]});
     if let Some(e) = end.get("providerError") {
         ev["providerError"] = e.clone();
     }
     ev
-}
-
-/// Report a sign-in failure when the request cannot switch providers.
-fn credentials_or_notify(
-    provider: &str,
-    result: std::result::Result<Option<Value>, auth::CredentialError>,
-) -> Option<Value> {
-    match result {
-        Ok(found) => found,
-        Err(error) => {
-            emit(json!({"ev": "sign_in_needed", "provider": provider, "error": error.code()}));
-            None
-        }
-    }
 }
 
 /// Delivered after the current turn rather than at its next safe point.
@@ -1721,9 +1522,7 @@ fn start_completion(
                     emit(json!({"ev": "completed", "id": id, "message": message}));
                     return;
                 }
-                Piece::Failed(
-                    Failure::Unavailable(e) | Failure::Retryable(e) | Failure::Fatal(e),
-                ) => {
+                Piece::Failed(Failure::Retryable(e) | Failure::Fatal(e)) => {
                     emit(json!({"ev": "completed", "id": id, "error": e}));
                     return;
                 }

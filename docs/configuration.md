@@ -42,51 +42,6 @@ images, and if it still does not fit it sends nothing and reports
 `context_too_large`. For a model missing from the file the core reports
 `window_unknown` once, and the guard cannot protect its requests.
 
-## Automatic local fallback
-
-To allow automatic fallback during a provider outage, add a `fallback` map to the models
-file. Each key is a primary provider and each value is a model key in the same file. For
-example, merge these entries into your existing file:
-
-```json
-{
-  "fallback": {"openai-codex": "local-model"},
-  "models": {
-    "local-model": {
-      "provider": "local",
-      "api": "openai-completions",
-      "baseUrl": "http://127.0.0.1:8000/v1",
-      "input": ["text"],
-      "contextWindow": 8192,
-      "maxTokens": 1024
-    }
-  }
-}
-```
-
-The target must use a different provider, a literal loopback address, and a known context
-window. It connects directly, without HTTP proxies or redirects. To authenticate, keep the
-local endpoint's API key in `auth.json` under the local provider. The core does not send
-primary credentials or reuse primary endpoint settings on this route. The model's output
-limit defaults to 1024 tokens and must be smaller than its context window.
-
-The core switches once, on a refused connection, an unreachable network or host, a DNS
-lookup failure, a DNS or connection setup timeout, or HTTP 502, 503, or 504. A stored OAuth
-sign-in can also switch if a renewal could not connect before sending its request. An
-expired access token alone, a missing refresh token, a refused renewal, or a renewal
-whose request may have been sent does not trigger fallback. The core does not
-switch on an ambiguous stream failure, sign-in or rate-limit error, or a runner-reviewed
-request. A turn with this route enabled does not replay after any reply content or tool
-dispatch. Follow-up requests within a successful fallback turn keep its route; the next
-turn starts with the selected model as usual. Without a `fallback` entry for the selected
-provider, the core follows its usual retry behavior.
-
-The core renders history using the local model's compatibility settings, leaving out
-other models' private reasoning. It estimates the rendered request separately, allowing
-space for the prompt template and output. If it does not fit, the core reports
-`context_too_large` without sending or truncating the request. Shorten the context or
-start a new conversation.
-
 ## Sign-in
 
 The core signs in, stores credentials, and renews them using the providers' flows.

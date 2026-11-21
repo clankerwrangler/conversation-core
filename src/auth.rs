@@ -20,10 +20,6 @@ use base64::Engine;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const CODEX: &str = "openai-codex";
@@ -146,15 +142,12 @@ pub fn status(path: &Path) -> Value {
     )
 }
 
-fn auth_config() -> ureq::config::Config {
+fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(TIMEOUT))
         .build()
-}
-
-fn agent() -> ureq::Agent {
-    auth_config().into()
+        .into()
 }
 
 /// POST and read JSON back: (status, body).
@@ -163,23 +156,15 @@ fn post(
     form: Option<&[(&str, &str)]>,
     body: Option<&Value>,
 ) -> Result<(u16, Value), String> {
-    post_with(agent(), url, form, body).map_err(|_| "sign_in_unreachable".to_string())
-}
-
-fn post_with(
-    agent: ureq::Agent,
-    url: &str,
-    form: Option<&[(&str, &str)]>,
-    body: Option<&Value>,
-) -> Result<(u16, Value), ureq::Error> {
-    let call = agent.post(url).header("accept", "application/json");
+    let call = agent().post(url).header("accept", "application/json");
     let mut response = match (form, body) {
         (Some(form), _) => call.send_form(form.iter().copied()),
         (None, Some(body)) => call
             .header("content-type", "application/json")
             .send(body.to_string().as_str()),
         (None, None) => call.send_empty(),
-    }?;
+    }
+    .map_err(|_| "sign_in_unreachable".to_string())?;
     let status = response.status().as_u16();
     let text = response.body_mut().read_to_string().unwrap_or_default();
     Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
@@ -266,68 +251,13 @@ fn grok_endpoints() -> Result<(String, String, Option<String>), String> {
     ))
 }
 
-#[derive(Debug)]
-pub enum CredentialError {
-    /// The renewal transport never became available to send the OAuth POST.
-    RenewalUnavailable,
-    Other(String),
-}
-
-impl CredentialError {
-    /// Preserve the diagnostic used when the caller cannot switch providers.
-    pub fn code(&self) -> &str {
-        match self {
-            Self::RenewalUnavailable => "sign_in_unreachable",
-            Self::Other(code) => code,
-        }
-    }
-}
-
-impl From<String> for CredentialError {
-    fn from(code: String) -> Self {
-        Self::Other(code)
-    }
-}
-
-/// A renewal gets a fresh agent. Once any transport has been handed to the HTTP client,
-/// a subsequent error cannot establish that the POST was unsent (including on a redirect).
-fn renewal_agent() -> (ureq::Agent, Arc<AtomicBool>) {
-    use ureq::unversioned::{
-        resolver::DefaultResolver,
-        transport::{ConnectionDetails, Connector, DefaultConnector, Transport},
-    };
-
-    #[derive(Debug)]
-    struct MarkConnected(Arc<AtomicBool>);
-    impl<T: Transport> Connector<T> for MarkConnected {
-        type Out = T;
-        fn connect(
-            &self,
-            _: &ConnectionDetails,
-            chained: Option<T>,
-        ) -> Result<Option<T>, ureq::Error> {
-            if chained.is_some() {
-                self.0.store(true, Ordering::Relaxed);
-            }
-            Ok(chained)
-        }
-    }
-
-    let connected = Arc::new(AtomicBool::new(false));
-    let connector = DefaultConnector::default().chain(MarkConnected(connected.clone()));
-    (
-        ureq::Agent::with_parts(auth_config(), connector, DefaultResolver::default()),
-        connected,
-    )
-}
-
 /// Renew one provider's credentials (under the lock: see the module notes).
-fn renew(provider: &str, c: &Value) -> Result<Value, CredentialError> {
+fn renew(provider: &str, c: &Value) -> Result<Value, String> {
     let refresh = c
         .get("refresh")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| CredentialError::Other("sign_in_again".into()))?;
+        .ok_or("sign_in_again")?;
     let (url, client) = match provider {
         CODEX => (codex_token_url(), CODEX_CLIENT_ID),
         GROK => (
@@ -339,9 +269,7 @@ fn renew(provider: &str, c: &Value) -> Result<Value, CredentialError> {
         ),
         _ => return Ok(c.clone()),
     };
-    let (agent, connected) = renewal_agent();
-    let (status, body) = post_with(
-        agent,
+    let (status, body) = post(
         &url,
         Some(&[
             ("grant_type", "refresh_token"),
@@ -349,25 +277,14 @@ fn renew(provider: &str, c: &Value) -> Result<Value, CredentialError> {
             ("refresh_token", refresh),
         ]),
         None,
-    )
-    .map_err(|err| {
-        if !connected.load(Ordering::Relaxed)
-            && (crate::provider::connect_unavailable(&err)
-                || matches!(err, ureq::Error::Timeout(ureq::Timeout::Global)))
-        {
-            CredentialError::RenewalUnavailable
-        } else {
-            CredentialError::Other("sign_in_unreachable".into())
-        }
-    })?;
+    )?;
     if status != 200 {
         // A refused refresh token cannot be fixed by trying again: sign in again.
         return Err(if matches!(status, 400 | 401 | 403) {
             "sign_in_again".into()
         } else {
             format!("renewal_http_{status}")
-        }
-        .into());
+        });
     }
     let mut renewed = credential_from(provider, &body, &url)?;
     if renewed["refresh"] == "" {
@@ -385,12 +302,12 @@ fn expiring(c: &Value) -> bool {
 
 /// What a request needs for a provider, renewing first when the token is about to expire:
 /// None when the core holds nothing for it (the runner is asked instead).
-pub fn credentials(path: &Path, provider: &str) -> Result<Option<Value>, CredentialError> {
+pub fn credentials(path: &Path, provider: &str) -> Result<Option<Value>, String> {
     let Some(stored) = read(path).get(provider).cloned() else {
         return Ok(None);
     };
     let current = if expiring(&stored) {
-        locked(path, || -> Result<Value, CredentialError> {
+        locked(path, || -> Result<Value, String> {
             // Another session may have renewed while this one waited for the lock.
             let mut all = read(path);
             let latest = all.get(provider).cloned().unwrap_or(stored.clone());
