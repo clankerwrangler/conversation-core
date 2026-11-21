@@ -440,7 +440,10 @@ impl Core {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                match self.stored_credentials(&provider) {
+                match credentials_or_notify(
+                    &provider,
+                    auth::credentials(&self.auth_path, &provider),
+                ) {
                     Some(credentials) => self.complete_with(op.clone(), credentials),
                     None => {
                         self.completions.insert(key.clone(), op.clone());
@@ -503,18 +506,6 @@ impl Core {
             _ => return Ok(false),
         }
         Ok(true)
-    }
-
-    /// The core's stored sign-in for a provider, renewed if about to expire. None when it
-    /// holds none (or renewal failed, reported as `sign_in_needed`): the runner is asked.
-    fn stored_credentials(&self, provider: &str) -> Option<Value> {
-        match auth::credentials(&self.auth_path, provider) {
-            Ok(found) => found,
-            Err(error) => {
-                emit(json!({"ev": "sign_in_needed", "provider": provider, "error": error}));
-                None
-            }
-        }
     }
 
     fn complete_with(&self, mut request: Value, credentials: Value) {
@@ -1060,7 +1051,16 @@ impl Core {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let credentials = match self.stored_credentials(&provider_name) {
+        let stored = auth::credentials(&self.auth_path, &provider_name);
+        if can_switch && matches!(stored, Err(auth::CredentialError::RenewalUnavailable)) {
+            return Ok(Dispatch::Outage(Outage {
+                provider: provider_name,
+                model: named["id"].as_str().unwrap_or("").to_string(),
+                reason: "renewal_unavailable".into(),
+                attempt: 0,
+            }));
+        }
+        let credentials = match credentials_or_notify(&provider_name, stored) {
             Some(c) => c,
             // Local credentials cannot come from the primary or an endpoint override.
             None if local => json!({"token": ""}),
@@ -1601,6 +1601,20 @@ fn error_event(end: &Value, n: u64, target: &Target) -> Value {
         ev["providerError"] = e.clone();
     }
     ev
+}
+
+/// Report a sign-in failure when the request cannot switch providers.
+fn credentials_or_notify(
+    provider: &str,
+    result: std::result::Result<Option<Value>, auth::CredentialError>,
+) -> Option<Value> {
+    match result {
+        Ok(found) => found,
+        Err(error) => {
+            emit(json!({"ev": "sign_in_needed", "provider": provider, "error": error.code()}));
+            None
+        }
+    }
 }
 
 /// Delivered after the current turn rather than at its next safe point.

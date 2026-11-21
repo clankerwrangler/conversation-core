@@ -679,6 +679,20 @@ mod websocket {
     }
 }
 
+/// Errors consistent with an unavailable network or endpoint during connection setup.
+pub fn connect_unavailable(err: &ureq::Error) -> bool {
+    use std::io::ErrorKind::{ConnectionRefused, HostUnreachable, NetworkUnreachable};
+    match err {
+        ureq::Error::HostNotFound
+        | ureq::Error::Timeout(ureq::Timeout::Connect | ureq::Timeout::Resolve) => true,
+        ureq::Error::Io(err) => matches!(
+            err.kind(),
+            ConnectionRefused | HostUnreachable | NetworkUnreachable
+        ),
+        _ => false,
+    }
+}
+
 fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure> {
     let mut config = ureq::Agent::config_builder().http_status_as_error(false);
     if p.no_replay {
@@ -694,22 +708,11 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
         call = call.header(name.as_str(), value);
     }
     let mut response = call.send(p.body.as_str()).map_err(|err| {
-        use std::io::ErrorKind::{ConnectionRefused, HostUnreachable, NetworkUnreachable};
         let reason = "provider_request_failed".into();
-        match err {
-            ureq::Error::HostNotFound
-            | ureq::Error::Timeout(ureq::Timeout::Connect | ureq::Timeout::Resolve) => {
-                Failure::Unavailable(reason)
-            }
-            ureq::Error::Io(err)
-                if matches!(
-                    err.kind(),
-                    ConnectionRefused | HostUnreachable | NetworkUnreachable
-                ) =>
-            {
-                Failure::Unavailable(reason)
-            }
-            _ => Failure::Retryable(reason),
+        if connect_unavailable(&err) {
+            Failure::Unavailable(reason)
+        } else {
+            Failure::Retryable(reason)
         }
     })?;
     let status = response.status().as_u16();

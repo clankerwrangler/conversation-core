@@ -71,7 +71,10 @@ primary credentials or reuse primary endpoint settings on this route. The model'
 limit defaults to 1024 tokens and must be smaller than its context window.
 
 The core switches once, on a refused connection, an unreachable network or host, a DNS
-lookup failure, a DNS or connection setup timeout, or HTTP 502, 503, or 504. It does not
+lookup failure, a DNS or connection setup timeout, or HTTP 502, 503, or 504. A stored OAuth
+sign-in can also switch if a renewal could not connect before sending its request. An
+expired access token alone, a missing refresh token, a refused renewal, or a renewal
+whose request may have been sent does not trigger fallback. The core does not
 switch on an ambiguous stream failure, sign-in or rate-limit error, or a runner-reviewed
 request. A turn with this route enabled does not replay after any reply content or tool
 dispatch. Follow-up requests within a successful fallback turn keep its route; the next

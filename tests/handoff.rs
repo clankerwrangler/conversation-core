@@ -67,6 +67,16 @@ fn read_request(stream: &mut TcpStream) -> Value {
 }
 
 fn read_request_with_auth(stream: &mut TcpStream) -> (Value, Option<String>) {
+    let (body, auth) = read_http_request(stream);
+    let body = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap()
+    };
+    (body, auth)
+}
+
+fn read_http_request(stream: &mut TcpStream) -> (Vec<u8>, Option<String>) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut length = 0;
     let mut auth = None;
@@ -85,13 +95,9 @@ fn read_request_with_auth(stream: &mut TcpStream) -> (Value, Option<String>) {
             }
         }
     }
-    if length == 0 {
-        // A request without a body (a WebSocket upgrade the server does not accept).
-        return (Value::Null, auth);
-    }
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
-    (serde_json::from_slice(&body).unwrap(), auth)
+    (body, auth)
 }
 
 /// A fake Codex WebSocket server: each request frame is answered with the next reply on
@@ -199,6 +205,7 @@ struct Core {
     extra: Value,
     /// Return `provider_response` events instead of skipping them.
     show_responses: bool,
+    respond_credentials: bool,
     /// Return `reasoning_delta` events instead of skipping them.
     show_reasoning: bool,
     /// The prepare_request events answered so far.
@@ -216,9 +223,21 @@ impl Core {
 
     /// Started in folder `cwd` (where its tools work and its AGENTS files are found).
     fn start_in(dir: &Path, base: &str, flags: &[&str], tools: Value, cwd: &Path) -> Core {
+        Core::start_with_env(dir, base, flags, tools, cwd, &[])
+    }
+
+    fn start_with_env(
+        dir: &Path,
+        base: &str,
+        flags: &[&str],
+        tools: Value,
+        cwd: &Path,
+        env: &[(&str, &str)],
+    ) -> Core {
         let mut child = Command::new(env!("CARGO_BIN_EXE_core"))
             .args(["run", dir.to_str().unwrap()])
             .args(flags)
+            .envs(env.iter().copied())
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -241,6 +260,7 @@ impl Core {
             tools,
             extra: json!({}),
             show_responses: false,
+            respond_credentials: true,
             show_reasoning: false,
             prepares: Vec::new(),
         }
@@ -283,7 +303,7 @@ impl Core {
                     self.op(prepared);
                     self.prepares.push(ev);
                 }
-                Some("need_credentials") => self.op(
+                Some("need_credentials") if self.respond_credentials => self.op(
                     json!({"op": "credentials", "id": ev["id"], "token": "t", "accountId": "acct"}),
                 ),
                 Some("provider_response") if self.show_responses => return ev,
@@ -2234,6 +2254,24 @@ fn abort_during_retry_backoff_cancels_retry_and_runs_queued_send() {
 }
 
 fn configured_core(primary: &str, local: &str, window: u64, enabled: bool) -> Core {
+    routed_core(
+        primary,
+        local,
+        window,
+        enabled.then_some("test"),
+        json!({}),
+        &[],
+    )
+}
+
+fn routed_core(
+    primary: &str,
+    local: &str,
+    window: u64,
+    fallback_for: Option<&str>,
+    mut credentials: Value,
+    env: &[(&str, &str)],
+) -> Core {
     let d = dir();
     std::fs::create_dir_all(&d).unwrap();
     let models = d.join("models-test.json");
@@ -2241,21 +2279,18 @@ fn configured_core(primary: &str, local: &str, window: u64, enabled: bool) -> Co
     let mut config = json!({"models": {"local-model": {"provider": "local",
         "api": "openai-completions", "baseUrl": local, "contextWindow": window, "maxTokens": 256,
         "input": ["text"], "reasoning": false}}});
-    if enabled {
-        config["fallback"] = json!({"test": "local-model"});
+    if let Some(primary) = fallback_for {
+        config["fallback"] = json!({primary: "local-model"});
     }
     std::fs::write(&models, config.to_string()).unwrap();
-    std::fs::write(
-        &auth,
-        r#"{"local":{"type":"api_key","key":"fixture-local-key"}}"#,
-    )
-    .unwrap();
+    credentials["local"] = json!({"type":"api_key", "key":"fixture-local-key"});
+    std::fs::write(&auth, credentials.to_string()).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let mut core = Core::start_with(
+    let mut core = Core::start_with_env(
         &d,
         primary,
         &[
@@ -2265,6 +2300,8 @@ fn configured_core(primary: &str, local: &str, window: u64, enabled: bool) -> Co
             auth.to_str().unwrap(),
         ],
         json!([]),
+        &std::env::current_dir().unwrap(),
+        env,
     );
     core.extra = json!({"basePrompt": false, "instructions": "fixture instructions",
         "model": {"contextWindow": 100_000}});
@@ -2557,4 +2594,194 @@ fn failover_tool_result_continues_on_local_route_until_the_turn_ends() {
     let (count, sent) = online.finish();
     assert_eq!(count, 2);
     assert!(sent[1].to_string().contains("local done"));
+}
+
+fn renewing_core(
+    primary: &str,
+    local: &str,
+    issuer: &str,
+    expires: u64,
+    refresh: &str,
+    enabled: bool,
+) -> Core {
+    let mut core = routed_core(
+        primary,
+        local,
+        8192,
+        enabled.then_some("openai-codex"),
+        json!({
+            "openai-codex": {"type":"oauth", "access":"fixture-online-access", "refresh":refresh,
+                "expires":expires, "accountId":"fixture-account"}
+        }),
+        &[
+            ("CONVERSATION_CORE_CODEX_AUTH", issuer),
+            ("NO_PROXY", "*"),
+            ("no_proxy", "*"),
+        ],
+    );
+    core.extra["model"]["provider"] = json!("openai-codex");
+    core.respond_credentials = false;
+    core
+}
+
+#[test]
+fn refused_renewal_can_use_fallback_even_after_the_access_token_expires() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let primary = CountedServer::start(vec![]);
+    let local = CountedServer::start_with_auth(
+        vec![vec![chat_text("offline")]],
+        Some("Bearer fixture-local-key"),
+    );
+    let mut core = renewing_core(
+        &primary.base,
+        &local.base,
+        &refused,
+        0,
+        "fixture-refresh",
+        true,
+    );
+    let auth_file = core.dir.join("auth-test.json");
+    let auth_before = std::fs::read(&auth_file).unwrap();
+    core.op(json!({"op":"send", "input":{"text":"go"}}));
+    let switch = core.next();
+    assert_eq!(switch["ev"], "retry");
+    assert_eq!(switch["error"], "renewal_unavailable");
+    assert_eq!(switch["fromProvider"], "openai-codex");
+    assert_eq!(core.until("message_end")["provider"], "local");
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+    assert_eq!(std::fs::read(&auth_file).unwrap(), auth_before);
+    core.stop();
+    assert_eq!(primary.finish().0, 0);
+    let (count, bodies) = local.finish();
+    assert_eq!(count, 1);
+    assert!(!bodies[0].to_string().contains("fixture-refresh"));
+    assert!(!bodies[0].to_string().contains("fixture-online-access"));
+}
+
+#[test]
+fn renewal_rejection_or_cutoff_after_the_post_does_not_switch_providers() {
+    for status in [Some(401), Some(503), None] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let renewal = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let (post, _) = read_http_request(&mut connection);
+            let post = String::from_utf8(post).unwrap();
+            assert!(post.contains("grant_type=refresh_token"));
+            if let Some(status) = status {
+                write!(
+                    connection,
+                    "HTTP/1.1 {status} Failure\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+            // Without a response the client knows it sent the POST, but not its outcome.
+        });
+        let primary = CountedServer::start(vec![]);
+        let local = CountedServer::start(vec![]);
+        let mut core = renewing_core(
+            &primary.base,
+            &local.base,
+            &issuer,
+            0,
+            "fixture-refresh",
+            true,
+        );
+        core.op(json!({"op":"send", "input":{"text":"go"}}));
+        let error = core.next();
+        assert_eq!(error["ev"], "sign_in_needed");
+        assert_eq!(
+            error["error"],
+            match status {
+                Some(401) => "sign_in_again",
+                Some(503) => "renewal_http_503",
+                _ => "sign_in_unreachable",
+            }
+        );
+        assert_eq!(core.next()["ev"], "need_credentials");
+        core.op(json!({"op":"abort"}));
+        assert_eq!(core.until("turn_end")["stopReason"], "aborted");
+        core.stop();
+        renewal.join().unwrap();
+        assert_eq!(primary.finish().0, 0);
+        assert_eq!(local.finish().0, 0);
+    }
+}
+
+#[test]
+fn renewal_outage_does_not_switch_on_review_or_without_opt_in_or_with_no_refresh_token() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    for (enabled, review, refresh) in [
+        (true, true, "fixture-refresh"),
+        (false, false, "fixture-refresh"),
+        (true, false, ""),
+    ] {
+        let primary = CountedServer::start(vec![]);
+        let local = CountedServer::start(vec![]);
+        let mut core = renewing_core(&primary.base, &local.base, &refused, 0, refresh, enabled);
+        if review {
+            core.extra["reviewRequest"] = json!("body");
+        }
+        core.op(json!({"op":"send", "input":{"text":"go"}}));
+        let error = core.next();
+        assert_eq!(error["ev"], "sign_in_needed");
+        assert_eq!(
+            error["error"],
+            if refresh.is_empty() {
+                "sign_in_again"
+            } else {
+                "sign_in_unreachable"
+            }
+        );
+        assert_eq!(core.next()["ev"], "need_credentials");
+        core.op(json!({"op":"abort"}));
+        assert_eq!(core.until("turn_end")["stopReason"], "aborted");
+        core.stop();
+        assert_eq!(primary.finish().0, 0);
+        assert_eq!(local.finish().0, 0);
+    }
+}
+
+#[test]
+fn renewal_outage_cannot_switch_after_a_tool_was_dispatched_in_the_turn() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let primary = CountedServer::start(vec![vec![call("c1", json!({})), done()]]);
+    let local = CountedServer::start(vec![]);
+    let mut core = renewing_core(
+        &primary.base,
+        &local.base,
+        &refused,
+        0,
+        "fixture-refresh",
+        true,
+    );
+    // Start on the fixture provider; the runner names the OAuth provider on the next
+    // request in the same turn. The earlier dispatch seals that turn even across models.
+    core.extra["model"]["provider"] = json!("test");
+    core.respond_credentials = true;
+    core.op(json!({"op":"send", "input":{"text":"go"}}));
+    let call = core.until("tool_call");
+    core.extra["model"]["provider"] = json!("openai-codex");
+    core.respond_credentials = false;
+    core.result(call["call"].as_str().unwrap(), "saved result");
+    assert_eq!(core.until("sign_in_needed")["error"], "sign_in_unreachable");
+    assert_eq!(core.next()["ev"], "need_credentials");
+    core.op(json!({"op":"abort"}));
+    assert_eq!(core.until("turn_end")["stopReason"], "aborted");
+    assert_eq!(
+        core.context()
+            .iter()
+            .filter(|m| m["role"] == "toolResult")
+            .count(),
+        1
+    );
+    core.stop();
+    assert_eq!(primary.finish().0, 1);
+    assert_eq!(local.finish().0, 0);
 }
