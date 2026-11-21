@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 #[derive(Default)]
 pub struct Models {
     models: serde_json::Map<String, Value>,
+    fallback: std::collections::HashMap<String, Value>,
 }
 
 pub fn default_path() -> Option<PathBuf> {
@@ -34,12 +35,58 @@ impl Models {
 
     pub fn parse(text: &str) -> Result<Models, String> {
         let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        match value.get("models") {
-            Some(Value::Object(models)) => Ok(Models {
-                models: models.clone(),
-            }),
-            _ => Err("expected {\"models\": {...}}".into()),
+        let Some(models) = value.get("models").and_then(Value::as_object) else {
+            return Err("expected {\"models\": {...}}".into());
+        };
+        let mut fallback = std::collections::HashMap::new();
+        if let Some(routes) = value.get("fallback") {
+            let routes = routes
+                .as_object()
+                .ok_or("expected fallback provider-to-model map")?;
+            for (provider, target) in routes {
+                let id = target
+                    .as_str()
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or("fallback target must be a model key")?;
+                let model = models
+                    .get(id)
+                    .filter(|m| m.is_object())
+                    .cloned()
+                    .ok_or("fallback target must be defined in models")?;
+                let target_provider = model.get("provider").and_then(Value::as_str);
+                if provider.trim().is_empty()
+                    || target_provider.is_none_or(|p| p.trim().is_empty() || p == provider)
+                    || model.get("id").is_some_and(|model_id| model_id != id)
+                    || model["api"] != crate::completions::API
+                    || !model["baseUrl"].as_str().is_some_and(loopback_url)
+                    || !model["contextWindow"].as_u64().is_some_and(|w| w > 0)
+                {
+                    return Err("fallback needs a distinct provider and a local Chat Completions model with a known context window".into());
+                }
+                let mut model = model;
+                model["id"] = Value::String(id.into());
+                if model.get("maxTokens").is_none() {
+                    model["maxTokens"] = Value::from(1024);
+                }
+                if !model["maxTokens"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0 && n < model["contextWindow"].as_u64().unwrap())
+                {
+                    return Err(
+                        "fallback maxTokens must be positive and smaller than contextWindow".into(),
+                    );
+                }
+                fallback.insert(provider.clone(), model);
+            }
         }
+        Ok(Models {
+            models: models.clone(),
+            fallback,
+        })
+    }
+
+    pub fn fallback(&self, primary_provider: &str) -> Option<&Value> {
+        self.fallback.get(primary_provider)
     }
 
     /// Everything the file says about a model.
@@ -66,6 +113,18 @@ impl Models {
             .as_u64()
             .filter(|w| *w > 0)
     }
+}
+
+fn loopback_url(url: &str) -> bool {
+    url.parse::<ureq::http::Uri>().is_ok_and(|uri| {
+        matches!(uri.scheme_str(), Some("http" | "https"))
+            && uri.query().is_none()
+            && uri.host().is_some_and(|host| {
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                host.parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+            })
+    })
 }
 
 /// What a reply cost, using the model's `cost` rates (dollars per

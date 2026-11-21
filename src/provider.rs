@@ -179,6 +179,8 @@ pub fn provider_error(raw: &Value, code: Option<&Value>) -> Value {
 pub enum Failure {
     /// Connection trouble or a temporary server error: the request may be retried.
     Retryable(String),
+    /// An endpoint that explicitly declined service or could not be reached before connecting.
+    Unavailable(String),
     Fatal(String),
 }
 
@@ -211,11 +213,19 @@ pub struct Prepared {
     headers: Vec<(String, String)>,
     body: String,
     pub transport: Transport,
+    /// Prevent replay on uncertain WebSocket failures on a failover-enabled turn.
+    pub no_replay: bool,
+    /// Send an automatic fallback directly to its configured loopback endpoint.
+    pub loopback: bool,
     /// A Chat Completions request: Some(whether the reply must end with a finish_reason).
     chat: Option<bool>,
 }
 
 impl Prepared {
+    pub fn body_bytes(&self) -> u64 {
+        self.body.len() as u64
+    }
+
     /// The exact request, for the runner to review before sending.
     pub fn view(&self) -> Value {
         let headers: serde_json::Map<String, Value> = self
@@ -346,6 +356,8 @@ pub fn prepare(req: &Request, messages: &[Value]) -> Result<Prepared> {
             headers,
             body: body.to_string(),
             transport: Transport::Sse,
+            no_replay: false,
+            loopback: false,
             chat: Some(completions::compat(req.model).supports_finish_reason),
         });
     }
@@ -388,6 +400,8 @@ pub fn prepare(req: &Request, messages: &[Value]) -> Result<Prepared> {
         } else {
             Transport::Sse
         },
+        no_replay: false,
+        loopback: false,
         chat: None,
     })
 }
@@ -646,10 +660,11 @@ mod websocket {
                 }
                 Outcome::Unused(failure) => {
                     let _ = open.socket.close(None);
-                    if !was_kept
-                        && !REJECTED
-                            .iter()
-                            .any(|c| matches!(&failure, Failure::Retryable(r) if r == c))
+                    if p.no_replay
+                        || (!was_kept
+                            && !REJECTED
+                                .iter()
+                                .any(|c| matches!(&failure, Failure::Retryable(r) if r == c)))
                     {
                         return Err(failure);
                     }
@@ -665,17 +680,38 @@ mod websocket {
 }
 
 fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .into();
+    let mut config = ureq::Agent::config_builder().http_status_as_error(false);
+    if p.no_replay {
+        let timeout = Some(std::time::Duration::from_secs(15));
+        config = config.timeout_resolve(timeout).timeout_connect(timeout);
+    }
+    if p.loopback {
+        config = config.proxy(None).max_redirects(0);
+    }
+    let agent: ureq::Agent = config.build().into();
     let mut call = agent.post(&p.url);
     for (name, value) in &p.headers {
         call = call.header(name.as_str(), value);
     }
-    let mut response = call
-        .send(p.body.as_str())
-        .map_err(|_| Failure::Retryable("provider_request_failed".into()))?;
+    let mut response = call.send(p.body.as_str()).map_err(|err| {
+        use std::io::ErrorKind::{ConnectionRefused, HostUnreachable, NetworkUnreachable};
+        let reason = "provider_request_failed".into();
+        match err {
+            ureq::Error::HostNotFound
+            | ureq::Error::Timeout(ureq::Timeout::Connect | ureq::Timeout::Resolve) => {
+                Failure::Unavailable(reason)
+            }
+            ureq::Error::Io(err)
+                if matches!(
+                    err.kind(),
+                    ConnectionRefused | HostUnreachable | NetworkUnreachable
+                ) =>
+            {
+                Failure::Unavailable(reason)
+            }
+            _ => Failure::Retryable(reason),
+        }
+    })?;
     let status = response.status().as_u16();
     let headers: serde_json::Map<String, Value> = response
         .headers()
@@ -691,6 +727,9 @@ fn run(p: &Prepared, report: &impl Fn(Piece)) -> std::result::Result<(), Failure
     ));
     let reader = response.body_mut().as_reader();
     if status != 200 {
+        if matches!(status, 502..=504) {
+            return Err(Failure::Unavailable(format!("provider_http_{status}")));
+        }
         // Only the status is reported: an error body can echo the request. It is read only
         // to recognise a refusal the core can correct by itself.
         let mut body = String::new();

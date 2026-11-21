@@ -160,3 +160,34 @@ fn authentication_defaults_require_an_absolute_data_or_home_directory() {
     assert!(out.status.success());
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn mapped_specifications_name_existing_source_files() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for entry in std::fs::read_dir(root.join("specification")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|x| x.to_str()) != Some("tla") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let Some((_, after_header)) = text.split_once("\\* Sources:\n") else {
+            assert_ne!(
+                path.file_name().unwrap(),
+                "CoreProviderFailover.tla",
+                "missing failover source mapping"
+            );
+            continue; // Older models without a source mapping.
+        };
+        let sources: Vec<_> = after_header
+            .lines()
+            .map_while(|line| line.strip_prefix("\\*   "))
+            .collect();
+        assert!(!sources.is_empty(), "empty source mapping: {path:?}");
+        for source in sources {
+            assert!(
+                root.join(source).is_file(),
+                "{path:?} names missing source {source}"
+            );
+        }
+    }
+}

@@ -68,7 +68,8 @@ Modeled in `specification/ReaperReferences.tla`.
   and/or `headers`, or neither to keep them.
   Use `reviewRequest: "body"` to review only the body, without sending the URL or headers to the runner.
 - `streamStallMs`: give up an attempt after this long without a sign of life
-  (default 10 minutes, as in the harness); it is retried like a dropped connection.
+  (default 10 minutes, as in the harness). A stall is retried like a dropped connection
+  only when automatic fallback is not enabled for the turn.
 
 - Default headers include content type, accept, authorization, and `session_id`
   (Codex: `session-id`, `originator`, `chatgpt-account-id`, taken from `credentials.accountId`
@@ -80,10 +81,14 @@ Modeled in `specification/ReaperReferences.tla`.
   harness sends them), with plain HTTP when no socket can be opened; `"sse"` keeps them on
   HTTP. Every request carries the whole context (no `previous_response_id`), so the usage
   line stays once per request. A socket closes after 5 idle minutes, after 55 minutes, or
-  on any trouble; a rejected or stale socket is replaced once without a retry.
+  on any trouble. When automatic fallback is disabled, a rejected or stale socket is
+  replaced once.
 
-Each attempt reports `provider_response` with the status and headers (101 and
-`"transport": "websocket"` when a socket is opened; none when a kept one is reused).
+`provider_response` carries the status and headers (101 and `"transport": "websocket"`
+when a socket is opened; none when a kept one is reused). `provider_response`, reply
+stream events, `tool_call`, and errors for saved replies carry the actual `provider`
+and `model`. An automatic switch emits `retry` with `fallback: true`, `fromProvider`,
+`fromModel`, and the replacement `provider` and `model`. It does not emit `model_set`.
 
 ## What a runner can do besides turns
 
