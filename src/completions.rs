@@ -724,9 +724,10 @@ fn estimate(messages: &[Value]) -> u64 {
         }
         latest = latest.max(time);
     }
+    let estimated: u64 = messages.iter().map(tokens_of).sum();
     match last {
-        Some((t, i)) => t + messages[i + 1..].iter().map(tokens_of).sum::<u64>(),
-        None => messages.iter().map(tokens_of).sum(),
+        Some((t, i)) => (t + messages[i + 1..].iter().map(tokens_of).sum::<u64>()).max(estimated),
+        None => estimated,
     }
 }
 
@@ -1239,6 +1240,19 @@ mod tests {
                 json!({"role": "assistant", "content": "ok", "tool_calls": [{"id": "c1_fc_1", "type": "function", "function": {"name": "ls", "arguments": "{\"a\":1}"}}]}),
                 json!({"role": "tool", "content": "No result provided", "tool_call_id": "c1_fc_1"}),
             ]
+        );
+    }
+
+    #[test]
+    fn output_limit_does_not_undercount_restored_messages_behind_small_usage() {
+        let ctx = vec![
+            json!({"role": "toolResult", "toolCallId": "c1", "content": [{"type": "text", "text": "x".repeat(14_000)}]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}], "timestamp": 10.0, "stopReason": "stop", "usage": {"totalTokens": 200}}),
+            json!({"role": "user", "content": [{"type": "text", "text": "next"}], "timestamp": 20.0}),
+        ];
+        assert!(
+            estimate(&ctx) >= 4_000,
+            "small historical usage must not hide a restored 14k-char result"
         );
     }
 

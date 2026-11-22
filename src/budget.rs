@@ -1,8 +1,8 @@
 //! The context budget: token estimates, the context usage line, and the overflow guard.
 //!
-//! The estimate uses the provider's exact count for the last
-//! reply (`usage.totalTokens`) plus chars/4 for every message after it. A count from before
-//! the latest checkpoint is not trusted (the context it measured was replaced).
+//! The estimate uses the provider's count for the exact reply whose request covered
+//! the canonical prefix, plus chars/4 for later messages. Without a proved reply it
+//! estimates the full context, rather than reusing some earlier usage count.
 //!
 //! The overflow guard changes only the request about to be sent, never the saved context:
 //! 1. tool results are set aside, oldest first, each replaced by a note naming the tool, the
@@ -97,11 +97,9 @@ pub struct Estimate {
     pub new: u64,
 }
 
-/// Estimate the context; usage is trusted only on messages at `trusted_from` or later.
-pub fn estimate(messages: &[Value], trusted_from: usize) -> Estimate {
-    let last = (trusted_from..messages.len())
-        .rev()
-        .find_map(|i| usage_tokens(&messages[i]).map(|u| (i, u)));
+/// Estimate the context. An absent or unusable anchor never falls back to older usage.
+pub fn estimate(messages: &[Value], trusted_reply: Option<usize>) -> Estimate {
+    let last = trusted_reply.and_then(|i| messages.get(i).and_then(usage_tokens).map(|u| (i, u)));
     match last {
         Some((i, measured)) => {
             let new: u64 = messages[i + 1..].iter().map(estimate_tokens).sum();
@@ -142,6 +140,7 @@ pub fn text_message(role: &str, text: &str) -> Value {
 
 pub enum Guarded {
     Fits(Vec<Value>),
+    Shortened(Vec<Value>),
     TooLarge { tokens: u64 },
 }
 
@@ -178,11 +177,14 @@ pub fn guard(
     if total <= window {
         return Guarded::Fits(messages);
     }
+    // Keep a chars/4 floor for the messages still present so subtracting an estimated
+    // older tool result from a tighter provider measurement never undercounts the rest.
+    let mut estimated: u64 = messages.iter().map(estimate_tokens).sum();
     let reference = |i: usize| refs.and_then(|r| r.get(i));
     // 1. Set tool results aside, oldest first.
     for i in 0..messages.len() {
         if total <= window {
-            return Guarded::Fits(messages);
+            return Guarded::Shortened(messages);
         }
         if messages[i].get("role").and_then(Value::as_str) != Some("toolResult") {
             continue;
@@ -198,10 +200,12 @@ pub fn guard(
             k(before)
         );
         messages[i]["content"] = json!([{"type": "text", "text": note}]);
-        total = total.saturating_sub(before) + estimate_tokens(&messages[i]);
+        let after = estimate_tokens(&messages[i]);
+        estimated = estimated.saturating_sub(before) + after;
+        total = (total.saturating_sub(before) + after).max(estimated);
     }
     if total <= window {
-        return Guarded::Fits(messages);
+        return Guarded::Shortened(messages);
     }
     // 2. Replace tool-call arguments and images with references to their stored data.
     for (i, message) in messages.iter_mut().enumerate() {
@@ -227,7 +231,9 @@ pub fn guard(
                 _ => {}
             }
         }
-        total = total.saturating_sub(before) + estimate_tokens(message);
+        let after = estimate_tokens(message);
+        estimated = estimated.saturating_sub(before) + after;
+        total = (total.saturating_sub(before) + after).max(estimated);
     }
     let note = text_message(
         "user",
@@ -236,10 +242,12 @@ pub fn guard(
             dir.join("context.jsonl").display()
         ),
     );
-    total += estimate_tokens(&note);
+    let note_tokens = estimate_tokens(&note);
+    estimated += note_tokens;
+    total = (total + note_tokens).max(estimated);
     messages.push(note);
     if total <= window {
-        Guarded::Fits(messages)
+        Guarded::Shortened(messages)
     } else {
         Guarded::TooLarge { tokens: total }
     }
@@ -267,7 +275,7 @@ mod tests {
             result("c1", &"b".repeat(28_000)),
         ];
         assert_eq!(
-            estimate(&msgs, 0),
+            estimate(&msgs, Some(1)),
             Estimate {
                 total: 91_000,
                 measured: Some(84_000),
@@ -275,11 +283,11 @@ mod tests {
             }
         );
         assert_eq!(
-            usage_line(&estimate(&msgs, 0), Some(272_000)),
+            usage_line(&estimate(&msgs, Some(1)), Some(272_000)),
             "Context: about 91k of 272k tokens (84k measured + ~7k new)"
         );
-        // A count from before the checkpoint is not trusted.
-        let e = estimate(&msgs, 2);
+        // Missing coverage, including after reopen or a checkpoint, means a full estimate.
+        let e = estimate(&msgs, None);
         assert_eq!((e.measured, e.total), (None, 100 + 1 + 7_000));
         assert_eq!(usage_line(&e, None), "Context: about 7k tokens (estimated)");
     }
@@ -290,12 +298,24 @@ mod tests {
         assert_eq!(estimate_tokens(&line), 100);
         // A request at the window's edge without the line is over it with the line.
         let msgs = vec![user(&"a".repeat(4_000)), line];
-        assert_eq!(estimate(&msgs, 0).total, 1_100);
+        assert_eq!(estimate(&msgs, None).total, 1_100);
+    }
+
+    #[test]
+    fn unusable_anchor_does_not_rebase_to_an_older_measurement() {
+        let msgs = vec![reply("old", 84_000), reply("zero", 0), user("one")];
+        assert_eq!(estimate(&msgs, Some(1)).measured, None);
+        assert_eq!(estimate(&msgs, Some(1)).total, 3);
+        assert_eq!(estimate(&msgs, Some(9)), estimate(&msgs, None));
     }
 
     #[test]
     fn guard_sets_aside_oldest_results_first() {
         let dir = Path::new("/s");
+        assert!(matches!(
+            guard(vec![user("ok")], None, 1, 1500, dir),
+            Guarded::Fits(_)
+        ));
         let msgs = vec![
             user("go"),
             result("c1", &"a".repeat(4000)),
@@ -307,8 +327,8 @@ mod tests {
             json!({"content": {"$ref": {"file": "log/000001.payload.jsonl", "key": "2.0"}}}),
             Value::Null,
         ];
-        let Guarded::Fits(out) = guard(msgs, Some(&refs), total, 1500, dir) else {
-            panic!("should fit")
+        let Guarded::Shortened(out) = guard(msgs, Some(&refs), total, 1500, dir) else {
+            panic!("should shorten to fit")
         };
         let first = out[1]["content"][0]["text"].as_str().unwrap_or("");
         assert_eq!(
@@ -325,6 +345,25 @@ mod tests {
         assert!(matches!(
             guard(msgs, None, total, 1000, dir),
             Guarded::TooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn guard_does_not_underflow_below_remaining_messages_estimate() {
+        let dir = Path::new("/s");
+        // Provider measured a small count for a compressible tool result, then a huge user
+        // message pushes the request over the window. Dropping the tool result cannot make
+        // the remaining 5,000-token user message look like it fits in a 2,000-token window.
+        let msgs = vec![
+            result("c1", &" ".repeat(8_000)),
+            reply("ok", 200),
+            user(&"u".repeat(20_000)),
+        ];
+        let total = estimate(&msgs, Some(1)).total;
+        assert_eq!(total, 5_200);
+        assert!(matches!(
+            guard(msgs, None, total, 2_000, dir),
+            Guarded::TooLarge { tokens } if tokens >= 5_000
         ));
     }
 }

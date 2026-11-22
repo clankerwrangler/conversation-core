@@ -75,6 +75,21 @@ enum End {
     Failed,
 }
 
+/// Runtime proof that one reply's provider usage measured the exact canonical prefix
+/// up to `reply_index` for this target. Reopening a session starts unanchored.
+struct BudgetAnchor {
+    reply_index: usize,
+    provider: String,
+    api: String,
+    model: String,
+}
+
+#[derive(Clone, Copy)]
+struct BudgetPrefix {
+    len: usize,
+    model_writes: u64,
+}
+
 struct Core {
     session: Session,
     session_id: String,
@@ -119,6 +134,7 @@ struct Core {
     unsettled: bool,
     /// An async result was saved after the last request captured its context.
     async_result_pending: bool,
+    budget_anchor: Option<BudgetAnchor>,
 }
 
 /// Where the core keeps what it fetches and what it is signed in with.
@@ -199,6 +215,7 @@ pub fn run(
         seen: Value::Null,
         unsettled: false,
         async_result_pending: false,
+        budget_anchor: None,
     };
     while let Some(msg) = core.next_idle_op() {
         match msg {
@@ -586,6 +603,7 @@ impl Core {
                 .map(|m| emit(json!({"ev": "context", "messages": m}))),
             Some("checkpoint") => match op.get("messages") {
                 Some(Value::Array(m)) => {
+                    self.budget_anchor = None;
                     let session = &self.session;
                     session
                         .with_references_lock(|| session.checkpoint(m))
@@ -764,6 +782,7 @@ impl Core {
         match session.with_references_lock(|| context_file::accept(session))? {
             context_file::Outcome::Unchanged => {}
             context_file::Outcome::Accepted { messages } => {
+                self.budget_anchor = None;
                 emit(json!({"ev": "context_file", "accepted": true, "messages": messages}))
             }
             context_file::Outcome::Rejected(reason) => {
@@ -825,17 +844,18 @@ impl Core {
     }
 
     /// The messages actually sent: the overflow guard applied, then the context usage line at
-    /// the very end (so the cached prompt stays unchanged). Neither is saved. None when the
-    /// request is too large to send (`context_too_large`).
+    /// the very end (so the cached prompt stays unchanged). The flag says whether all of the
+    /// original context was kept unchanged. Neither the guard nor the note is saved. None when
+    /// the request is too large to send (`context_too_large`).
     fn budget(
         &mut self,
         context: Vec<Value>,
         refs: Option<&[Value]>,
-        trusted_from: usize,
+        trusted_reply: Option<usize>,
         model: &str,
         window: Option<u64>,
-    ) -> Option<Vec<Value>> {
-        let mut estimate = budget::estimate(&context, trusted_from);
+    ) -> Option<(Vec<Value>, bool)> {
+        let mut estimate = budget::estimate(&context, trusted_reply);
         let line = budget::text_message("system", &budget::usage_line(&estimate, window));
         estimate.total += budget::estimate_tokens(&line);
         let Some(window) = window else {
@@ -844,12 +864,16 @@ impl Core {
             }
             let mut sent = context;
             sent.push(line);
-            return Some(sent);
+            return Some((sent, true));
         };
         match budget::guard(context, refs, estimate.total, window, self.session.dir()) {
             budget::Guarded::Fits(mut sent) => {
                 sent.push(line);
-                Some(sent)
+                Some((sent, true))
+            }
+            budget::Guarded::Shortened(mut sent) => {
+                sent.push(line);
+                Some((sent, false))
             }
             budget::Guarded::TooLarge { tokens } => {
                 emit(json!({"ev": "context_too_large", "tokens": tokens, "window": window}));
@@ -860,7 +884,11 @@ impl Core {
 
     /// One request: prepare, stream, save. Retries from scratch only while nothing was saved.
     fn request(&mut self) -> Result<End> {
+        // Any attempt without a newly proved reply leaves the next request
+        // estimating from scratch, including on an error or abort.
+        let anchor = self.budget_anchor.take();
         let (refs, from_checkpoint, through) = self.session.context_parts_with_seq()?;
+        let snapshot_writes = self.session.model_writes();
         context_file::publish_refs(&self.session, &refs, through)?;
         let context = self.session.resolve(&refs)?;
         // This snapshot contains all results saved so far. Later results must wake
@@ -1039,10 +1067,25 @@ impl Core {
             .and_then(Value::as_u64)
             .filter(|w| *w > 0)
             .or_else(|| self.models.window(&model_id));
-        let Some(context) = self.budget(context, refs.as_deref(), trusted_from, &model_id, window)
+        let trusted_reply = anchor
+            .filter(|a| {
+                refs.is_some()
+                    && a.reply_index >= trusted_from
+                    && a.provider == target.provider
+                    && a.api == target.api
+                    && a.model == target.model
+            })
+            .map(|a| a.reply_index);
+        let prefix = BudgetPrefix {
+            len: context.len(),
+            model_writes: snapshot_writes,
+        };
+        let Some((context, full)) =
+            self.budget(context, refs.as_deref(), trusted_reply, &model_id, window)
         else {
             return Ok(End::Failed);
         };
+        let mut prefix = (refs.is_some() && full).then_some(prefix);
         let mut ready = provider::prepare(&req, &context)?;
         // `"transport": "sse"` keeps a Codex request on plain HTTP.
         if prepared.get("transport").and_then(Value::as_str) == Some("sse") {
@@ -1062,7 +1105,11 @@ impl Core {
                 self.abort(None)?;
                 return Ok(End::Aborted);
             };
-            ready.replace(reviewed.get("body"), reviewed.get("headers"))?;
+            let body = reviewed.get("body");
+            if body.is_some() {
+                prefix = None;
+            }
+            ready.replace(body, reviewed.get("headers"))?;
         }
         let pricing = Pricing::new(
             &model,
@@ -1076,7 +1123,7 @@ impl Core {
             provider::spawn(ready.clone(), move |piece| {
                 let _ = tx.send(Msg::Piece(tag, piece));
             });
-            match self.stream(tag, &target, &pricing, window)? {
+            match self.stream(tag, &target, &pricing, window, prefix)? {
                 Streamed::Ended(end) => return Ok(end),
                 // The model's reasoning cannot be switched off: send again without the
                 // setting (the model's own default), and remember it for this model.
@@ -1089,6 +1136,7 @@ impl Core {
                         &model_id,
                     );
                     ready.without("reasoning");
+                    prefix = None;
                     emit(json!({"ev": "retry", "attempt": attempt + 1, "error": reason}));
                 }
                 Streamed::Retry(reason) if attempt < MAX_ATTEMPTS => {
@@ -1156,10 +1204,12 @@ impl Core {
         target: &Target,
         pricing: &Pricing,
         window: Option<u64>,
+        prefix: Option<BudgetPrefix>,
     ) -> Result<Streamed> {
         let mut message = provider::empty_reply(target);
         let mut unsaved: Vec<Value> = Vec::new();
         let mut open: Option<u64> = None;
+        let mut open_contiguous = false;
         let mut has_calls = false;
         // The provider's own error, as safe fixed tokens (the harness's nativeProviderError).
         let mut provider_error: Option<Value> = None;
@@ -1239,6 +1289,8 @@ impl Core {
                         // Save the reply so far with this call, then hand the call off.
                         match open {
                             None => {
+                                open_contiguous = prefix
+                                    .is_some_and(|p| self.session.model_writes() == p.model_writes);
                                 message["content"] = Value::Array(std::mem::take(&mut unsaved));
                                 message["stopReason"] = json!("toolUse");
                                 open = Some(self.session.append_open_reply(&message)?);
@@ -1290,20 +1342,38 @@ impl Core {
                     } else {
                         "stop"
                     };
-                    let n = match open {
+                    let (n, contiguous) = match open {
                         Some(reply) => {
                             let end = json!({"usage": usage, "stopReason": stop});
-                            self.session.append_more(reply, &unsaved, Some(&end))?
+                            (
+                                self.session.append_more(reply, &unsaved, Some(&end))?,
+                                open_contiguous,
+                            )
                         }
                         None => {
+                            let contiguous = prefix
+                                .is_some_and(|p| self.session.model_writes() == p.model_writes);
                             message["content"] = Value::Array(unsaved);
                             message["usage"] = usage.clone();
                             message["stopReason"] = json!(stop);
-                            self.session.append("assistant", &message)?
+                            (self.session.append("assistant", &message)?, contiguous)
                         }
                     };
-                    // Right after a reply the context is exactly what the provider counted.
                     let tokens = budget::context_tokens(&usage);
+                    // Only anchor when the provider saw the exact canonical prefix and no
+                    // model-visible record was inserted before this reply's first position.
+                    if contiguous
+                        && tokens.is_some()
+                        && let Some(prefix) = prefix
+                    {
+                        self.budget_anchor = Some(BudgetAnchor {
+                            reply_index: prefix.len,
+                            provider: target.provider.to_owned(),
+                            api: target.api.to_owned(),
+                            model: target.model.to_owned(),
+                        });
+                    }
+                    // Report the provider's count even if it cannot measure our next prefix.
                     let context = json!({"tokens": tokens, "contextWindow": window,
                         "percent": window.zip(tokens).map(|(w, t)| t as f64 / w as f64 * 100.0)});
                     emit(

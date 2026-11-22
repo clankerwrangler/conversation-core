@@ -2201,3 +2201,296 @@ fn abort_during_retry_backoff_cancels_retry_and_runs_queued_send() {
         "second request should carry the queued send"
     );
 }
+
+fn done_tokens(input: u64, output: u64) -> Step {
+    Step::Event(json!({
+        "type": "response.completed",
+        "response": {
+            "usage": {
+                "input_tokens": input,
+                "output_tokens": output,
+                "total_tokens": input + output
+            }
+        }
+    }))
+}
+
+#[test]
+fn shortened_request_usage_is_not_reused_for_restored_history() {
+    let blob = "x".repeat(16_000);
+    let (base, server) = server(vec![
+        // 1: tool call under tight 1500-token window
+        vec![call("c1", json!({})), done_tokens(40, 5)],
+        // 2: guard shortens the 16k-byte result; provider returns small 415-token total
+        vec![text("saw shortened"), done_tokens(410, 5)],
+        // 3: next request under same 1500-token window must count restored result and shorten again
+        vec![text("still shortened"), done_tokens(420, 5)],
+        // 4: roomier 10,000-token window sends full restored result and proves a new anchor
+        vec![text("saw full"), done_tokens(4_150, 50)],
+        // 5: subsequent request under same 10,000-token window reuses the proved 4,200 count
+        vec![text("anchored"), done_tokens(4_220, 10)],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.extra = json!({"model": {"contextWindow": 1_500}});
+
+    core.op(json!({"op": "send", "input": {"text": "run tool"}}));
+    core.until("tool_call");
+    core.result("c1|fc_c1", &blob);
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    core.op(json!({"op": "send", "input": {"text": "continue tight"}}));
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    core.extra = json!({"model": {"contextWindow": 10_000}});
+    core.op(json!({"op": "send", "input": {"text": "continue roomy"}}));
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    core.op(json!({"op": "send", "input": {"text": "after full"}}));
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    // Full saved result must remain intact in canonical history.
+    let ctx = core.context();
+    assert_eq!(
+        ctx[2]["content"][0]["text"].as_str(),
+        Some(blob.as_str()),
+        "saved history must keep the full tool result"
+    );
+    core.stop();
+
+    let bodies = server.join().unwrap();
+    assert_eq!(bodies.len(), 5);
+    let output_of = |body: &Value| -> String {
+        body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .and_then(|i| i["output"].as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    // Request 2 shortened the tool result.
+    assert!(
+        output_of(&bodies[1]).starts_with("[Tool result set aside to fit the context window:"),
+        "request 2 should shorten: {}",
+        output_of(&bodies[1])
+    );
+    // Request 3 must NOT trust the 415-token shortened count; it must estimate ~4k and shorten again.
+    assert_eq!(
+        last_input_text(&bodies[2]),
+        "Context: about 4k of 2k tokens (estimated)"
+    );
+    assert!(
+        output_of(&bodies[2]).starts_with("[Tool result set aside to fit the context window:"),
+        "request 3 must shorten the restored result again: {}",
+        output_of(&bodies[2])
+    );
+    // Request 4 with a roomier window estimates ~4k and sends the full 16k-byte result.
+    assert_eq!(
+        last_input_text(&bodies[3]),
+        "Context: about 4k of 10k tokens (estimated)"
+    );
+    assert_eq!(
+        output_of(&bodies[3]),
+        blob,
+        "roomier window should send the full restored result"
+    );
+    // Request 5 reuses the proved unguarded 4,200-token count from request 4.
+    assert_eq!(
+        last_input_text(&bodies[4]),
+        "Context: about 4k of 10k tokens (4k measured + ~0k new)"
+    );
+}
+
+#[test]
+fn restored_history_declines_to_send_when_it_cannot_fit() {
+    let blob = "x".repeat(16_000);
+    let (base, server) = server(vec![
+        vec![call("c1", json!({})), done_tokens(40, 5)],
+        vec![text("shortened"), done_tokens(410, 5)],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.extra = json!({"model": {"contextWindow": 1_500}});
+
+    core.op(json!({"op": "send", "input": {"text": "run tool"}}));
+    core.until("tool_call");
+    core.result("c1|fc_c1", &blob);
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    // A user message larger than the 1,500-token window cannot be shortened away.
+    // Request 3 must NOT skip the guard based on the prior 415-token shortened count.
+    core.op(json!({"op": "send", "input": {"text": "u".repeat(8_000)}}));
+    let ev = core.until("context_too_large");
+    assert_eq!(ev["window"], 1_500);
+    assert_eq!(core.until("turn_end")["stopReason"], "error");
+    core.stop();
+    assert_eq!(
+        server.join().unwrap().len(),
+        2,
+        "request 3 must be rejected locally without sending"
+    );
+}
+
+#[test]
+fn budget_anchor_survives_bookkeeping_but_clears_on_review_target_checkpoint_and_reopen() {
+    let (base, server) = server(vec![
+        // 1: unguarded reply proves anchor (8000 tokens); mid-stream app record does not break it
+        vec![Step::Pause(80), text("one"), done_tokens(7_990, 10)],
+        // 2: reuses 8k anchor; review_request replaces body so its 9k reply cannot anchor
+        vec![text("two"), done_tokens(8_990, 10)],
+        // 3: unanchored because request 2's body was replaced; proves 6k anchor
+        vec![text("three"), done_tokens(5_990, 10)],
+        // 4: different model id invalidates the 6k anchor; proves 7k anchor on m2
+        vec![text("four"), done_tokens(6_990, 10)],
+        // 5: after checkpoint, anchor is cleared; proves 5k anchor
+        vec![text("five"), done_tokens(4_990, 10)],
+        // 6: after editing context.jsonl, anchor is cleared; proves 5k anchor
+        vec![text("six"), done_tokens(4_990, 10)],
+        // 7: after reopening the session in a new Core process, starts unanchored
+        vec![text("seven"), done_tokens(5_010, 10)],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.extra = json!({"model": {"contextWindow": 20_000}});
+
+    // Request 1 with a mid-stream bookkeeping record.
+    core.op(json!({"op": "send", "input": {"text": "first"}}));
+    core.op(
+        json!({"op": "record", "id": "rec1", "ns": "progress", "data": {"summary": "working"}}),
+    );
+    core.until("recorded");
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    // Request 2 with review_request replacing body.
+    core.extra = json!({"model": {"contextWindow": 20_000}, "reviewRequest": true});
+    core.op(json!({"op": "send", "input": {"text": "second"}}));
+    let review = core.until("review_request");
+    let body = review["request"]["body"].clone();
+    core.op(json!({"op": "review_request", "id": review["id"], "body": body}));
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    // Request 3 without review_request.
+    core.extra = json!({"model": {"contextWindow": 20_000}});
+    core.op(json!({"op": "send", "input": {"text": "third"}}));
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    // Request 4 switches model id.
+    core.extra = json!({"model": {"id": "m2", "contextWindow": 20_000}});
+    core.op(json!({"op": "send", "input": {"text": "fourth"}}));
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    // Request 5 after explicit checkpoint.
+    let ctx = core.context();
+    core.op(json!({"op": "checkpoint", "messages": ctx}));
+    core.until("checkpointed");
+    core.op(json!({"op": "send", "input": {"text": "fifth"}}));
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    // Request 6 after editing context.jsonl (accepted at turn boundary).
+    let edited = json!({"role": "user", "content": [{"type": "text", "text": "edited summary"}]});
+    std::fs::write(d.join("context.jsonl"), format!("{edited}\n")).unwrap();
+    core.op(json!({"op": "send", "input": {"text": "sixth"}}));
+    assert_eq!(core.until("context_file")["accepted"], true);
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    // Close Core without deleting session dir, then reopen in a fresh Core process.
+    drop(core.stdin);
+    let _ = core.child.wait();
+
+    let mut reopened = Core::start(&d, &base);
+    reopened.extra = json!({"model": {"id": "m2", "contextWindow": 20_000}});
+    reopened.op(json!({"op": "send", "input": {"text": "seventh"}}));
+    assert_eq!(reopened.until("turn_end")["stopReason"], "stop");
+    reopened.stop();
+
+    let bodies = server.join().unwrap();
+    assert_eq!(bodies.len(), 7);
+    assert_eq!(
+        last_input_text(&bodies[0]),
+        "Context: about 0k of 20k tokens (estimated)"
+    );
+    assert_eq!(
+        last_input_text(&bodies[1]),
+        "Context: about 8k of 20k tokens (8k measured + ~0k new)",
+        "mid-stream bookkeeping record must not break the proved anchor"
+    );
+    assert_eq!(
+        last_input_text(&bodies[2]),
+        "Context: about 0k of 20k tokens (estimated)",
+        "review_request body replacement must not produce a trusted anchor"
+    );
+    assert_eq!(
+        last_input_text(&bodies[3]),
+        "Context: about 0k of 20k tokens (estimated)",
+        "model change must invalidate the previous target's anchor"
+    );
+    assert_eq!(
+        last_input_text(&bodies[4]),
+        "Context: about 0k of 20k tokens (estimated)",
+        "checkpoint must invalidate the anchor"
+    );
+    assert_eq!(
+        last_input_text(&bodies[5]),
+        "Context: about 0k of 20k tokens (estimated)",
+        "edited context.jsonl must invalidate the anchor"
+    );
+    assert_eq!(
+        last_input_text(&bodies[6]),
+        "Context: about 0k of 20k tokens (estimated)",
+        "reopening a session must start unanchored"
+    );
+}
+
+#[test]
+fn late_async_tool_result_before_reply_prevents_anchoring_over_it() {
+    let blob = "z".repeat(16_000);
+    let (base, server) = server(vec![
+        // 1: start an async tool call (turn continues immediately to request 2)
+        vec![async_call("c1"), done_tokens(40, 5)],
+        // 2: paused at review_request while async result arrives before reply 2 is saved
+        vec![text("working"), done_tokens(195, 5)],
+        // 3: woken by async_result_pending; must count and shorten the 16k-byte result
+        vec![text("saw async"), done_tokens(300, 5)],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.extra = json!({"model": {"contextWindow": 1_500}});
+
+    core.op(json!({"op": "send", "input": {"text": "start bg"}}));
+    let tc = core.until("tool_call");
+    assert_eq!(tc["async"], true);
+    // Pause request 2 right after snapshot capture so the async result lands before reply 2.
+    core.extra = json!({"model": {"contextWindow": 1_500}, "reviewRequest": true});
+    let review = core.until("review_request");
+    core.result("c1|fc_c1", &blob);
+    // FIFO barrier: once 'recorded' arrives, the preceding tool_result is durably saved.
+    core.op(json!({"op": "record", "id": "sync", "ns": "sync", "data": 1}));
+    core.until("recorded");
+    // Approve review_request WITHOUT replacing body so only model_writes contiguity blocks anchoring.
+    core.extra = json!({"model": {"contextWindow": 1_500}});
+    core.op(json!({"op": "review_request", "id": review["id"]}));
+    core.until("settled");
+    core.stop();
+
+    let bodies = server.join().unwrap();
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(
+        last_input_text(&bodies[2]),
+        "Context: about 4k of 2k tokens (estimated)",
+        "reply 2 must not anchor over an async tool result saved before it"
+    );
+    let out = bodies[2]["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call_output")
+        .and_then(|i| i["output"].as_str())
+        .unwrap_or("");
+    assert!(
+        out.starts_with("[Tool result set aside to fit the context window:"),
+        "request 3 must shorten the unseen async result: {out}"
+    );
+}

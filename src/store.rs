@@ -119,6 +119,7 @@ struct TailCache {
 pub struct Session {
     dir: PathBuf,
     tail: std::sync::Mutex<Option<TailCache>>,
+    model_writes: std::sync::atomic::AtomicU64,
 }
 
 struct Chunk {
@@ -138,6 +139,7 @@ impl Session {
         let session = Session {
             dir: dir.to_path_buf(),
             tail: std::sync::Mutex::new(None),
+            model_writes: std::sync::atomic::AtomicU64::new(0),
         };
         let (stamp, written) = session.append_line(
             &session.log_path(1, None),
@@ -217,6 +219,10 @@ impl Session {
         }
         let (stamp, written) = self.append_line(&self.log_path(chunk, None), &record)?;
         self.note_chunk_append(chunk, n, stamp, written);
+        if MODEL_KINDS.contains(&kind) {
+            self.model_writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -808,6 +814,8 @@ impl Session {
         let marker = serde_json::json!({"n": through + 1, "t": t, "k": "checkpoint", "id": id, "through": through});
         let (stamp, written) = self.append_line(&self.log_path(chunk, None), &marker)?;
         self.note_chunk_append(chunk, through + 1, stamp, written);
+        self.model_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.prune()?;
         self.seal()?;
         Ok(id)
@@ -1077,6 +1085,7 @@ impl Session {
             Some(1) => Ok(Session {
                 dir: dir.to_path_buf(),
                 tail: std::sync::Mutex::new(None),
+                model_writes: std::sync::atomic::AtomicU64::new(0),
             }),
             other => Err(Error::Format(format!("unsupported format {other:?}"))),
         }
@@ -1293,6 +1302,12 @@ impl Session {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Count of model-visible message appends and checkpoints written by this handle.
+    /// Bookkeeping (`app`, `settings`) and `assistant-more` continuations do not bump it.
+    pub fn model_writes(&self) -> u64 {
+        self.model_writes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// `context_refs`, how many of its messages come from the latest checkpoint,
@@ -2729,6 +2744,39 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn model_writes_tracks_only_model_visible_mutations() {
+        let (_dir, s) = fresh();
+        assert_eq!(s.model_writes(), 0);
+        s.append_entry("app", json!({"ns": "ui", "data": 1}))
+            .unwrap();
+        s.select(Some(("p", "m")), Some("low")).unwrap();
+        assert_eq!(
+            s.model_writes(),
+            0,
+            "bookkeeping must not bump model_writes"
+        );
+
+        s.append("user", &text("a")).unwrap();
+        assert_eq!(s.model_writes(), 1);
+        let open = s
+            .append_open_reply(&json!({"role": "assistant", "content": []}))
+            .unwrap();
+        assert_eq!(s.model_writes(), 2);
+        s.append_more(open, &[], Some(&json!({"stopReason": "stop"})))
+            .unwrap();
+        assert_eq!(
+            s.model_writes(),
+            2,
+            "assistant-more extends an open reply in place"
+        );
+        s.append_injected(&text("inj"), "runner", true, true, None)
+            .unwrap();
+        assert_eq!(s.model_writes(), 3);
+        s.checkpoint(&[text("summary")]).unwrap();
+        assert_eq!(s.model_writes(), 4);
     }
 
     #[test]
