@@ -1002,14 +1002,15 @@ impl Core {
                 .collect();
             tool_prompts.extend(runner_prompts);
             let skills = prompt::skills(&self.cwd, &self.sources);
-            prompt::build(
+            let built = prompt::build(
                 preamble,
                 &tool_prompts,
                 &files,
                 &skills,
                 &self.cwd,
                 &sections,
-            )
+            );
+            format!("{built}\n\n{}", context_file::note(self.session.dir()))
         };
         let reasoning = prepared.get("reasoning").and_then(Value::as_str);
         self.tool_env = vec![

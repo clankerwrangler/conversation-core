@@ -14,9 +14,10 @@ named sections (`<tools>`, `<rules>`, `<project_context>`, `<skills>`, `<cwd>`):
   lists them as `contextFiles`;
 - the skills in `<agent-dir>/skills` and each `--skills` path (SKILL.md frontmatter), listed
   only when `read` or `bash` is on offer;
-- the working folder.
+- the working folder;
+- last, one line naming the session's `context.jsonl` and saying it can be edited.
 
-There is no fixed wording: no opening line, no standing rules. Those belong in an AGENTS file.
+Apart from that line there is no fixed wording: no opening line, no standing rules. Those belong in an AGENTS file.
 `prepared.instructions` comes first, and `prepared.sections`
 (`{name: text}`) follow the core's, a same-named one replacing it. `"basePrompt": false`
 sends `instructions` alone. Outside Codex the prompt is the first input message, with

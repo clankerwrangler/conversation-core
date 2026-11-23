@@ -1604,10 +1604,11 @@ fn the_core_builds_the_changing_part_of_the_system_prompt() {
     );
     let bodies = server.join().unwrap();
     let expected = format!(
-        "You are an assistant.\n\n<tools>\n- ipython: Run calculations\n</tools>\n\n<rules>\n- Use the tool as needed.\n</rules>\n\n<project_context>\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"{}\">\nGlobal rules.\n</project_instructions>\n\n<project_instructions path=\"{}\">\nProject rules.\n</project_instructions>\n</project_context>\n\n<cwd>\n{}\n</cwd>\n\n<scratch>\nUse /tmp.\n</scratch>",
+        "You are an assistant.\n\n<tools>\n- ipython: Run calculations\n</tools>\n\n<rules>\n- Use the tool as needed.\n</rules>\n\n<project_context>\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"{}\">\nGlobal rules.\n</project_instructions>\n\n<project_instructions path=\"{}\">\nProject rules.\n</project_instructions>\n</project_context>\n\n<cwd>\n{}\n</cwd>\n\n<scratch>\nUse /tmp.\n</scratch>\n\nYour context is mirrored at {}. Edit the file to change it; edits take effect at your next request.",
         agent.join("AGENTS.md").display(),
         cwd.join("AGENTS.md").display(),
-        cwd.display()
+        cwd.display(),
+        d.join("context.jsonl").display()
     );
     assert_eq!(bodies[0]["instructions"], expected);
     assert_eq!(

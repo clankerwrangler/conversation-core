@@ -18,6 +18,14 @@ type Result<T> = std::result::Result<T, Error>;
 
 pub const FILE: &str = "context.jsonl";
 
+/// The line in the core-built instructions that tells the model about the file.
+pub fn note(session_dir: &std::path::Path) -> String {
+    format!(
+        "Your context is mirrored at {}. Edit the file to change it; edits take effect at your next request.",
+        session_dir.join(FILE).display()
+    )
+}
+
 /// What happened to the file at a request boundary.
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
