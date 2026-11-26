@@ -6,6 +6,8 @@
 \*
 \* Models synchronization between Core (accept + publish of context.jsonl)
 \* and a concurrent async tool call or external editor.
+\* Not modeled: an external edit while Core publishes (after its last check,
+\* before its rename). Core overwrites such an edit; ExternalEdit excludes it.
 \*
 \* Fault values:
 \*   "None"         - Fixed protocol: skip accept & publish while any tool call

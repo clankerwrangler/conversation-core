@@ -124,7 +124,9 @@ fn plan_accept(session: &Session, observed: Option<&str>, state: &Value) -> Resu
 /// Synchronize `context.jsonl` at a quiescent request boundary: accept an edited
 /// file (if any), run `before_publish` once (for example, starting the turn and
 /// appending the new user message), load the resulting context snapshot, and
-/// publish the mirror without clobbering a concurrent write. Caller holds
+/// publish the mirror. Edits by the session's own tool calls are kept, because
+/// callers sync only while no tool call is running. An edit by another process
+/// that lands between the last check and the rename is overwritten. Caller holds
 /// `references.lock`.
 pub fn sync_before_publish(
     session: &Session,
