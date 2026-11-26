@@ -2278,20 +2278,22 @@ fn shortened_request_usage_is_not_reused_for_restored_history() {
         "request 2 should shorten: {}",
         output_of(&bodies[1])
     );
-    // Request 3 must NOT trust the 415-token shortened count; it must estimate ~4k and shorten again.
+    // Request 3 must NOT trust the 415-token shortened count; it retains request 1's proved
+    // 0k anchor, counts the restored ~4k result, and shortens again.
     assert_eq!(
         last_input_text(&bodies[2]),
-        "Context: about 4k of 2k tokens (estimated)"
+        "Context: about 4k of 2k tokens (0k measured + ~4k new)"
     );
     assert!(
         output_of(&bodies[2]).starts_with("[Tool result set aside to fit the context window:"),
         "request 3 must shorten the restored result again: {}",
         output_of(&bodies[2])
     );
-    // Request 4 with a roomier window estimates ~4k and sends the full 16k-byte result.
+    // Request 4 with a roomier window retains request 1's proved 0k anchor, counts the
+    // restored ~4k result, and sends the full 16k-byte result.
     assert_eq!(
         last_input_text(&bodies[3]),
-        "Context: about 4k of 10k tokens (estimated)"
+        "Context: about 4k of 10k tokens (0k measured + ~4k new)"
     );
     assert_eq!(
         output_of(&bodies[3]),
@@ -2493,5 +2495,242 @@ fn late_async_tool_result_before_reply_prevents_anchoring_over_it() {
     assert!(
         out.starts_with("[Tool result set aside to fit the context window:"),
         "request 3 must shorten the unseen async result: {out}"
+    );
+}
+
+#[test]
+fn over_budget_proved_anchor_survives_consecutive_shortened_requests() {
+    // Small enough that chars/4 (~700 tokens) fits the 2,000-token window on its own,
+    // so losing the proved 1,700-token anchor would sawtooth back to an unguarded request.
+    let tool_blob = "r".repeat(2_800);
+    let (base, server) = server(vec![
+        // 1: unguarded reply proves 1,700 measured tokens on a 2,000-token window
+        vec![call("c1", json!({})), done_tokens(1_600, 100)],
+        // 2: 1,700 + ~700 > 2,000 -> shortened; provider returns small 320-token count
+        vec![text("shortened once"), done_tokens(300, 20)],
+        // 3: must retain request 1's proved anchor and keep shortening (no sawtooth)
+        vec![text("shortened twice"), done_tokens(310, 20)],
+        // 4: must still retain request 1's proved anchor and keep shortening
+        vec![text("shortened thrice"), done_tokens(320, 20)],
+        // 5: after editing context.jsonl, retained anchor is cleared and request fits unguarded
+        vec![text("after compact"), done_tokens(100, 10)],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+    core.extra = json!({"model": {"contextWindow": 2_000}});
+
+    core.op(json!({"op": "send", "input": {"text": "run tool"}}));
+    core.until("tool_call");
+    core.result("c1|fc_c1", &tool_blob);
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    core.op(json!({"op": "send", "input": {"text": "follow up 1"}}));
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    core.op(json!({"op": "send", "input": {"text": "follow up 2"}}));
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    // Compacting via context.jsonl must clear the retained anchor.
+    let edited = json!({"role": "user", "content": [{"type": "text", "text": "compact summary"}]});
+    std::fs::write(d.join("context.jsonl"), format!("{edited}\n")).unwrap();
+    core.op(json!({"op": "send", "input": {"text": "after compact"}}));
+    assert_eq!(core.until("context_file")["accepted"], true);
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+    core.stop();
+
+    let bodies = server.join().unwrap();
+    assert_eq!(bodies.len(), 5);
+    let output_of = |body: &Value| -> String {
+        body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .and_then(|i| i["output"].as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    for (idx, body) in bodies[1..=3].iter().enumerate() {
+        let req_num = idx + 2;
+        assert!(
+            output_of(body).starts_with("[Tool result set aside to fit the context window:"),
+            "request {req_num} must stay shortened without sawtoothing: {}",
+            output_of(body)
+        );
+        let note = last_input_text(body);
+        assert!(
+            note.contains("(2k measured + ~"),
+            "request {req_num} must keep request 1's proved anchor, got: {note}"
+        );
+    }
+    assert_eq!(
+        last_input_text(&bodies[4]),
+        "Context: about 0k of 2k tokens (estimated)",
+        "accepted context.jsonl edit must clear the retained anchor"
+    );
+}
+
+#[test]
+fn async_tool_context_file_edit_is_not_overwritten_by_next_request() {
+    let (base, server) = server(vec![
+        // 1: dispatch async tool call (turn immediately continues to request 2 while c1 runs)
+        vec![async_call("c1"), done_tokens(40, 5)],
+        // 2: runs while c1 is still active; calls a normal wait tool w1
+        vec![call("w1", json!({"wait": "c1"})), done_tokens(50, 5)],
+        // 3: runs once both c1 and w1 have finished; must accept c1's edit
+        vec![text("after compact"), done_tokens(60, 5)],
+        // 4: steady follow-up must not accept the same edit twice
+        vec![text("steady"), done_tokens(70, 5)],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+
+    core.op(json!({"op": "send", "input": {"text": "run compact"}}));
+    let tc1 = core.until("tool_call");
+    assert_eq!(tc1["async"], true);
+
+    // Pause request 2 at review_request while c1 is still running.
+    core.extra = json!({"reviewRequest": true});
+    let review = core.until("review_request");
+
+    // Request 2 must freeze context.jsonl while c1 is running: only request 1's single
+    // user message should be in context.jsonl (not the assistant's c1 tool call).
+    let frozen_lines: Vec<Value> = std::fs::read_to_string(d.join("context.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        frozen_lines.len(),
+        1,
+        "request 2 must not republish context.jsonl while async tool c1 is running"
+    );
+    assert_eq!(frozen_lines[0]["content"][0]["text"], "run compact");
+
+    // Simulate async tool c1 atomically replacing context.jsonl while request 2 is in flight.
+    let edited =
+        json!({"role": "user", "content": [{"type": "text", "text": "compacted summary"}]});
+    let edited_text = format!("{edited}\n");
+    let tmp = d.join("context.jsonl.tmp");
+    std::fs::write(&tmp, &edited_text).unwrap();
+    std::fs::rename(&tmp, d.join("context.jsonl")).unwrap();
+
+    // Release request 2; it calls normal tool w1 and blocks in wait_for_normal_calls.
+    core.extra = json!({});
+    core.op(json!({"op": "review_request", "id": review["id"]}));
+    let tc2 = core.until("tool_call");
+    assert_eq!(tc2["call"], "w1|fc_w1");
+    assert_eq!(
+        std::fs::read_to_string(d.join("context.jsonl")).unwrap(),
+        edited_text,
+        "in-flight request 2 must leave the async tool's edit untouched on disk"
+    );
+
+    // Finish both c1 and w1 so core becomes quiescent before request 3.
+    core.result("c1|fc_c1", "compacted ok");
+    core.result("w1|fc_w1", "c1 done");
+
+    let cf_ev = core.until("context_file");
+    assert_eq!(cf_ev["accepted"], true);
+    assert_eq!(core.until("turn_end")["stopReason"], "stop");
+
+    // Request 4 must NOT double-accept the already published edit.
+    core.op(json!({"op": "send", "input": {"text": "steady check"}}));
+    let mut cf_events = 0usize;
+    loop {
+        let ev = core.next();
+        if ev["ev"] == "context_file" {
+            cf_events += 1;
+        }
+        if ev["ev"] == "turn_end" {
+            assert_eq!(ev["stopReason"], "stop");
+            break;
+        }
+    }
+    assert_eq!(
+        cf_events, 0,
+        "republished context must not be accepted twice"
+    );
+
+    // Disk mirror now contains the merged context (edited summary + post-through tool results).
+    let disk = std::fs::read_to_string(d.join("context.jsonl")).unwrap();
+    assert!(disk.contains("compacted summary"));
+    assert!(disk.contains("steady check"));
+    core.stop();
+
+    let bodies = server.join().unwrap();
+    assert_eq!(bodies.len(), 4);
+    let req3 = bodies[2]["input"].to_string();
+    assert!(
+        req3.contains("compacted summary"),
+        "req3 missing edit: {req3}"
+    );
+    assert!(
+        req3.contains("compacted ok"),
+        "req3 missing c1 result: {req3}"
+    );
+    assert!(req3.contains("c1 done"), "req3 missing w1 result: {req3}");
+    assert!(
+        !req3.contains("run compact"),
+        "req3 should have compacted away the original prompt: {req3}"
+    );
+}
+
+#[test]
+fn async_tool_context_file_edit_accepted_after_late_completion() {
+    let (base, server) = server(vec![
+        // 1: dispatch async tool call c1
+        vec![async_call("c1"), done_tokens(40, 5)],
+        // 2: ends turn while c1 is still running
+        vec![text("continuing while bg runs"), done_tokens(50, 5)],
+        // 3: woken when c1 finishes; now quiescent and accepts c1's edit
+        vec![text("saw late compact"), done_tokens(60, 5)],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+
+    core.op(json!({"op": "send", "input": {"text": "start bg"}}));
+    core.until("settled");
+
+    // Request 2 must have frozen context.jsonl while c1 was running.
+    let frozen_lines: Vec<Value> = std::fs::read_to_string(d.join("context.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(frozen_lines.len(), 1);
+    assert_eq!(frozen_lines[0]["content"][0]["text"], "start bg");
+
+    // Async tool c1 edits context.jsonl and reports completion after turn 1 settled.
+    let edited =
+        json!({"role": "user", "content": [{"type": "text", "text": "late compacted summary"}]});
+    std::fs::write(d.join("context.jsonl"), format!("{edited}\n")).unwrap();
+    core.result("c1|fc_c1", "bg done");
+
+    assert_eq!(core.until("context_file")["accepted"], true);
+    core.until("settled");
+    core.stop();
+
+    let bodies = server.join().unwrap();
+    assert_eq!(bodies.len(), 3);
+    let req3 = bodies[2]["input"].to_string();
+    assert!(
+        req3.contains("late compacted summary"),
+        "req3 missing edit: {req3}"
+    );
+    assert!(
+        req3.contains("continuing while bg runs"),
+        "req3 missing intervening reply: {req3}"
+    );
+    assert!(
+        req3.contains("bg done"),
+        "req3 missing async result: {req3}"
+    );
+    assert!(
+        !req3.contains("start bg"),
+        "req3 should have compacted away the original prompt: {req3}"
     );
 }

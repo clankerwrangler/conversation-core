@@ -77,6 +77,7 @@ enum End {
 
 /// Runtime proof that one reply's provider usage measured the exact canonical prefix
 /// up to `reply_index` for this target. Reopening a session starts unanchored.
+#[derive(Clone)]
 struct BudgetAnchor {
     reply_index: usize,
     provider: String,
@@ -88,6 +89,16 @@ struct BudgetAnchor {
 struct BudgetPrefix {
     len: usize,
     model_writes: u64,
+}
+
+/// How a completed reply updates `Core.budget_anchor` (specification/BudgetAnchor.tla).
+enum BudgetUpdate {
+    /// Unmodified canonical request: prove a new anchor if the reply stays contiguous.
+    Prove(BudgetPrefix),
+    /// Shortened canonical request: keep the prior proved anchor on clean completion.
+    Retain(BudgetAnchor),
+    /// Non-canonical or runner-modified request: leave the next request unanchored.
+    Clear,
 }
 
 struct Core {
@@ -743,15 +754,12 @@ impl Core {
     }
 
     /// One turn, starting with `user` if given (else with what was just added). False if aborted.
-    fn turn(&mut self, user: Option<Value>) -> Result<bool> {
-        self.boundary()?;
-        // A turn begins (each turn of a chain, before its first request).
-        emit(json!({"ev": "turn_start"}));
-        if let Some(user) = user {
-            self.session.append("user", &user)?;
-        }
+    fn turn(&mut self, mut user: Option<Value>) -> Result<bool> {
+        let mut started = false;
         loop {
-            match self.request()? {
+            let result = self.request(!started, user.take())?;
+            started = true;
+            match result {
                 End::Aborted => return Ok(false),
                 End::Failed => {
                     emit(json!({"ev": "turn_end", "stopReason": "error"}));
@@ -768,7 +776,6 @@ impl Core {
             if !self.wait_for_normal_calls()? {
                 return Ok(false);
             }
-            self.boundary()?;
             self.flush_injected(false)?;
             while let Some(steer) = self.steer.pop_front() {
                 self.session.append("user", &steer)?;
@@ -776,20 +783,43 @@ impl Core {
         }
     }
 
-    /// Request boundary: an edited context file becomes the context.
-    fn boundary(&mut self) -> Result<()> {
+    /// Whether any tool call (normal or async) is still running.
+    fn has_running_calls(&self) -> bool {
+        self.calls.values().any(|c| !c.done)
+    }
+
+    /// Quiescent request boundary: accept an edited context file and publish the mirror together.
+    fn sync_context_file(
+        &mut self,
+        start_turn: bool,
+        user: Option<Value>,
+    ) -> Result<(Vec<Value>, usize)> {
         let session = &self.session;
-        match session.with_references_lock(|| context_file::accept(session))? {
+        let synced = session.with_references_lock(|| {
+            context_file::sync_before_publish(session, || {
+                if start_turn {
+                    // A turn begins (each turn of a chain, before its first request).
+                    emit(json!({"ev": "turn_start"}));
+                    if let Some(user) = user {
+                        session.append("user", &user)?;
+                    }
+                }
+                Ok(())
+            })
+        })?;
+        if synced.checkpointed {
+            self.budget_anchor = None;
+        }
+        match synced.outcome {
             context_file::Outcome::Unchanged => {}
             context_file::Outcome::Accepted { messages } => {
-                self.budget_anchor = None;
                 emit(json!({"ev": "context_file", "accepted": true, "messages": messages}))
             }
             context_file::Outcome::Rejected(reason) => {
                 emit(json!({"ev": "context_file", "accepted": false, "error": reason}))
             }
         }
-        Ok(())
+        Ok((synced.refs, synced.from_checkpoint))
     }
 
     /// Every normal call has a result. False if aborted.
@@ -883,13 +913,25 @@ impl Core {
     }
 
     /// One request: prepare, stream, save. Retries from scratch only while nothing was saved.
-    fn request(&mut self) -> Result<End> {
-        // Any attempt without a newly proved reply leaves the next request
-        // estimating from scratch, including on an error or abort.
+    fn request(&mut self, start_turn: bool, user: Option<Value>) -> Result<End> {
+        // Freeze context.jsonl while any tool call is running so an async tool editing
+        // the file cannot race with publication (specification/ContextFileSync.tla).
+        let (refs, from_checkpoint) = if self.has_running_calls() {
+            if start_turn {
+                emit(json!({"ev": "turn_start"}));
+                if let Some(user) = user {
+                    self.session.append("user", &user)?;
+                }
+            }
+            self.session.context_parts()?
+        } else {
+            self.sync_context_file(start_turn, user)?
+        };
+        // Any attempt without a newly proved reply leaves the next request estimating from
+        // scratch (including on error or abort), except a completed shortened canonical
+        // request, which retains its prior proved anchor.
         let anchor = self.budget_anchor.take();
-        let (refs, from_checkpoint, through) = self.session.context_parts_with_seq()?;
         let snapshot_writes = self.session.model_writes();
-        context_file::publish_refs(&self.session, &refs, through)?;
         let context = self.session.resolve(&refs)?;
         // This snapshot contains all results saved so far. Later results must wake
         // a further request, even if they arrive while this one is preparing.
@@ -1068,15 +1110,14 @@ impl Core {
             .and_then(Value::as_u64)
             .filter(|w| *w > 0)
             .or_else(|| self.models.window(&model_id));
-        let trusted_reply = anchor
-            .filter(|a| {
-                refs.is_some()
-                    && a.reply_index >= trusted_from
-                    && a.provider == target.provider
-                    && a.api == target.api
-                    && a.model == target.model
-            })
-            .map(|a| a.reply_index);
+        let valid_anchor = anchor.filter(|a| {
+            refs.is_some()
+                && a.reply_index >= trusted_from
+                && a.provider == target.provider
+                && a.api == target.api
+                && a.model == target.model
+        });
+        let trusted_reply = valid_anchor.as_ref().map(|a| a.reply_index);
         let prefix = BudgetPrefix {
             len: context.len(),
             model_writes: snapshot_writes,
@@ -1086,7 +1127,13 @@ impl Core {
         else {
             return Ok(End::Failed);
         };
-        let mut prefix = (refs.is_some() && full).then_some(prefix);
+        let mut budget_update = if refs.is_some() && full {
+            BudgetUpdate::Prove(prefix)
+        } else if !full {
+            valid_anchor.map_or(BudgetUpdate::Clear, BudgetUpdate::Retain)
+        } else {
+            BudgetUpdate::Clear
+        };
         let mut ready = provider::prepare(&req, &context)?;
         // `"transport": "sse"` keeps a Codex request on plain HTTP.
         if prepared.get("transport").and_then(Value::as_str) == Some("sse") {
@@ -1108,7 +1155,7 @@ impl Core {
             };
             let body = reviewed.get("body");
             if body.is_some() {
-                prefix = None;
+                budget_update = BudgetUpdate::Clear;
             }
             ready.replace(body, reviewed.get("headers"))?;
         }
@@ -1124,7 +1171,7 @@ impl Core {
             provider::spawn(ready.clone(), move |piece| {
                 let _ = tx.send(Msg::Piece(tag, piece));
             });
-            match self.stream(tag, &target, &pricing, window, prefix)? {
+            match self.stream(tag, &target, &pricing, window, &budget_update)? {
                 Streamed::Ended(end) => return Ok(end),
                 // The model's reasoning cannot be switched off: send again without the
                 // setting (the model's own default), and remember it for this model.
@@ -1137,7 +1184,7 @@ impl Core {
                         &model_id,
                     );
                     ready.without("reasoning");
-                    prefix = None;
+                    budget_update = BudgetUpdate::Clear;
                     emit(json!({"ev": "retry", "attempt": attempt + 1, "error": reason}));
                 }
                 Streamed::Retry(reason) if attempt < MAX_ATTEMPTS => {
@@ -1205,7 +1252,7 @@ impl Core {
         target: &Target,
         pricing: &Pricing,
         window: Option<u64>,
-        prefix: Option<BudgetPrefix>,
+        budget: &BudgetUpdate,
     ) -> Result<Streamed> {
         let mut message = provider::empty_reply(target);
         let mut unsaved: Vec<Value> = Vec::new();
@@ -1290,8 +1337,10 @@ impl Core {
                         // Save the reply so far with this call, then hand the call off.
                         match open {
                             None => {
-                                open_contiguous = prefix
-                                    .is_some_and(|p| self.session.model_writes() == p.model_writes);
+                                open_contiguous = matches!(
+                                    budget,
+                                    BudgetUpdate::Prove(p) if self.session.model_writes() == p.model_writes
+                                );
                                 message["content"] = Value::Array(std::mem::take(&mut unsaved));
                                 message["stopReason"] = json!("toolUse");
                                 open = Some(self.session.append_open_reply(&message)?);
@@ -1352,8 +1401,10 @@ impl Core {
                             )
                         }
                         None => {
-                            let contiguous = prefix
-                                .is_some_and(|p| self.session.model_writes() == p.model_writes);
+                            let contiguous = matches!(
+                                budget,
+                                BudgetUpdate::Prove(p) if self.session.model_writes() == p.model_writes
+                            );
                             message["content"] = Value::Array(unsaved);
                             message["usage"] = usage.clone();
                             message["stopReason"] = json!(stop);
@@ -1361,18 +1412,22 @@ impl Core {
                         }
                     };
                     let tokens = budget::context_tokens(&usage);
-                    // Only anchor when the provider saw the exact canonical prefix and no
-                    // model-visible record was inserted before this reply's first position.
-                    if contiguous
-                        && tokens.is_some()
-                        && let Some(prefix) = prefix
-                    {
-                        self.budget_anchor = Some(BudgetAnchor {
-                            reply_index: prefix.len,
-                            provider: target.provider.to_owned(),
-                            api: target.api.to_owned(),
-                            model: target.model.to_owned(),
-                        });
+                    // Only prove a new anchor when the provider saw the exact canonical prefix
+                    // and no model-visible record was inserted before this reply's first position.
+                    // A completed shortened canonical request retains its prior proved anchor.
+                    match budget {
+                        BudgetUpdate::Prove(p) if contiguous && tokens.is_some() => {
+                            self.budget_anchor = Some(BudgetAnchor {
+                                reply_index: p.len,
+                                provider: target.provider.to_owned(),
+                                api: target.api.to_owned(),
+                                model: target.model.to_owned(),
+                            });
+                        }
+                        BudgetUpdate::Retain(anchor) => {
+                            self.budget_anchor = Some(anchor.clone());
+                        }
+                        BudgetUpdate::Prove(_) | BudgetUpdate::Clear => {}
                     }
                     // Report the provider's count even if it cannot measure our next prefix.
                     let context = json!({"tokens": tokens, "contextWindow": window,

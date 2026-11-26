@@ -1,10 +1,18 @@
 //! Context = file, file = context.
 //!
-//! Before each request the core writes the context, one message per line, exactly
-//! as the model receives it, to `<session>/context.jsonl`. At the next request
-//! boundary, if the file was edited, the edited messages plus every record added
-//! since the file was written become the new context (a checkpoint). A file that
-//! does not parse changes nothing and is reported.
+//! Before each quiescent request (when no tool calls are running), the core
+//! synchronizes `<session>/context.jsonl` under `references.lock`: if the file
+//! was edited since the last publication, the edited messages plus every record
+//! added since that publication become the new context (a checkpoint), and the
+//! mirror is then published one message per line exactly as the model receives
+//! it. A file that does not parse changes nothing and is reported.
+//!
+//! While any tool call is running, `context.jsonl` is frozen (neither accepted
+//! nor republished) so an async tool editing the file cannot race with
+//! publication; the edit is accepted once running calls settle. Before writing
+//! `context.jsonl`, sync verifies the file on disk still matches what it read,
+//! retrying on a mid-sync write and leaving the file untouched if contention
+//! persists (specification/ContextFileSync.tla).
 //!
 //! `state.json` remembers the last two publications (`sha256`, `through`). It is
 //! written before the file, so a crash between the two leaves the previous file in
@@ -17,6 +25,7 @@ use sha2::{Digest, Sha256};
 type Result<T> = std::result::Result<T, Error>;
 
 pub const FILE: &str = "context.jsonl";
+const MAX_SYNC_ATTEMPTS: usize = 3;
 
 /// The line in the core-built instructions that tells the model about the file.
 pub fn note(session_dir: &std::path::Path) -> String {
@@ -33,8 +42,16 @@ pub enum Outcome {
     Unchanged,
     /// The edit became the new context.
     Accepted { messages: usize },
-    /// The file did not parse; the context is unchanged.
+    /// The file did not parse or could not be published safely; the context is unchanged.
     Rejected(String),
+}
+
+/// Snapshot and edit outcome produced by synchronizing `context.jsonl`.
+pub struct Synced {
+    pub outcome: Outcome,
+    pub checkpointed: bool,
+    pub refs: Vec<Value>,
+    pub from_checkpoint: usize,
 }
 
 fn sha(text: &str) -> String {
@@ -66,10 +83,144 @@ fn parse(text: &str) -> std::result::Result<Vec<Value>, String> {
         .collect()
 }
 
-/// Publish an already-loaded context snapshot (`refs`, `through`) to `context.jsonl`.
-/// Skips rewriting `state.json` and/or `context.jsonl` when they already match on disk.
-pub fn publish_refs(session: &Session, refs: &[Value], through: u64) -> Result<()> {
-    let text = render(refs)?;
+enum Plan {
+    Unchanged,
+    Accept(Vec<Value>),
+    Reject(String),
+}
+
+fn plan_accept(session: &Session, observed: Option<&str>, state: &Value) -> Result<Plan> {
+    let Some(text) = observed else {
+        return Ok(Plan::Unchanged);
+    };
+    let published = |which: &str| {
+        state
+            .pointer(&format!("/contextFile/{which}"))
+            .filter(|v| !v.is_null())
+            .cloned()
+    };
+    let Some(current) = published("current") else {
+        return Ok(Plan::Unchanged);
+    };
+    let digest = sha(text);
+    let matches = |p: &Value| p.get("sha256").and_then(Value::as_str) == Some(digest.as_str());
+    if matches(&current) || published("previous").is_some_and(|p| matches(&p)) {
+        return Ok(Plan::Unchanged);
+    }
+    let edited = match parse(text) {
+        Ok(messages) => messages,
+        Err(reason) => return Ok(Plan::Reject(reason)),
+    };
+    // Every reference must name stored data of this session.
+    if let Err(err) = session.resolve(&edited) {
+        return Ok(Plan::Reject(err.to_string()));
+    }
+    let through = current.get("through").and_then(Value::as_u64).unwrap_or(0);
+    let mut context = edited;
+    context.extend(session.model_messages_after(through)?);
+    Ok(Plan::Accept(context))
+}
+
+/// Synchronize `context.jsonl` at a quiescent request boundary: accept an edited
+/// file (if any), run `before_publish` once (for example, starting the turn and
+/// appending the new user message), load the resulting context snapshot, and
+/// publish the mirror without clobbering a concurrent write. Caller holds
+/// `references.lock`.
+pub fn sync_before_publish(
+    session: &Session,
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<Synced> {
+    sync_with(session, before_publish, |_| {})
+}
+
+#[cfg(test)]
+pub fn sync(session: &Session) -> Result<Synced> {
+    sync_before_publish(session, || Ok(()))
+}
+
+fn sync_with(
+    session: &Session,
+    before_publish: impl FnOnce() -> Result<()>,
+    mut on_before_commit: impl FnMut(usize),
+) -> Result<Synced> {
+    let mut before_publish = Some(before_publish);
+    let mut checkpointed = false;
+    for attempt in 0..MAX_SYNC_ATTEMPTS {
+        let observed = session.read_file(FILE)?;
+        let mut state = session.read_state()?;
+        let plan = plan_accept(session, observed.as_deref(), &state)?;
+
+        // Check for a concurrent external write before mutating the session log or disk.
+        on_before_commit(attempt);
+        if session.read_file(FILE)? != observed {
+            continue;
+        }
+
+        let outcome = match plan {
+            Plan::Unchanged => Outcome::Unchanged,
+            Plan::Reject(reason) => Outcome::Rejected(reason),
+            Plan::Accept(context) => {
+                let messages = context.len();
+                session.checkpoint(&context)?;
+                checkpointed = true;
+                Outcome::Accepted { messages }
+            }
+        };
+        if let Some(hook) = before_publish.take() {
+            hook()?;
+        }
+        let (refs, from_checkpoint, through) = session.context_parts_with_seq()?;
+        let text = render(&refs)?;
+        let digest = sha(&text);
+        let previous = state
+            .get("contextFile")
+            .and_then(|f| f.get("current"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let same_meta = previous.get("sha256").and_then(Value::as_str) == Some(digest.as_str())
+            && previous.get("through").and_then(Value::as_u64) == Some(through);
+        let existing_matches = observed.as_deref() == Some(text.as_str());
+
+        // Re-check immediately before writing state.json and context.jsonl.
+        if session.read_file(FILE)? != observed {
+            continue;
+        }
+
+        if !same_meta {
+            state["contextFile"] =
+                json!({"current": {"sha256": digest, "through": through}, "previous": previous});
+            session.write_state(&state)?;
+        }
+        if !existing_matches {
+            session.write_file(FILE, &text)?;
+        }
+        return Ok(Synced {
+            outcome,
+            checkpointed,
+            refs,
+            from_checkpoint,
+        });
+    }
+    if let Some(hook) = before_publish.take() {
+        hook()?;
+    }
+    let (refs, from_checkpoint, _) = session.context_parts_with_seq()?;
+    Ok(Synced {
+        outcome: Outcome::Rejected(
+            "context.jsonl changed concurrently during publish; left unmodified".into(),
+        ),
+        checkpointed,
+        refs,
+        from_checkpoint,
+    })
+}
+
+/// Write the current context to the file: readable text inline, tool data, reasoning
+/// and images as references to their stored data.
+#[cfg(test)]
+pub fn publish(session: &Session) -> Result<()> {
+    let (refs, _, through) = session.context_parts_with_seq()?;
+    let text = render(&refs)?;
     let digest = sha(&text);
     let mut state = session.read_state()?;
     let previous = state
@@ -94,48 +245,20 @@ pub fn publish_refs(session: &Session, refs: &[Value], through: u64) -> Result<(
     Ok(())
 }
 
-/// Write the current context to the file: readable text inline, tool data, reasoning
-/// and images as references to their stored data.
-#[cfg(test)]
-pub fn publish(session: &Session) -> Result<()> {
-    let (refs, _, through) = session.context_parts_with_seq()?;
-    publish_refs(session, &refs, through)
-}
-
 /// At a request boundary: take an edited file as the new context.
+#[cfg(test)]
 pub fn accept(session: &Session) -> Result<Outcome> {
-    let Some(text) = session.read_file(FILE)? else {
-        return Ok(Outcome::Unchanged);
-    };
+    let observed = session.read_file(FILE)?;
     let state = session.read_state()?;
-    let published = |which: &str| {
-        state
-            .pointer(&format!("/contextFile/{which}"))
-            .filter(|v| !v.is_null())
-            .cloned()
-    };
-    let Some(current) = published("current") else {
-        return Ok(Outcome::Unchanged);
-    };
-    let digest = sha(&text);
-    let matches = |p: &Value| p.get("sha256").and_then(Value::as_str) == Some(digest.as_str());
-    if matches(&current) || published("previous").is_some_and(|p| matches(&p)) {
-        return Ok(Outcome::Unchanged);
+    match plan_accept(session, observed.as_deref(), &state)? {
+        Plan::Unchanged => Ok(Outcome::Unchanged),
+        Plan::Reject(reason) => Ok(Outcome::Rejected(reason)),
+        Plan::Accept(context) => {
+            let messages = context.len();
+            session.checkpoint(&context)?;
+            Ok(Outcome::Accepted { messages })
+        }
     }
-    let edited = match parse(&text) {
-        Ok(messages) => messages,
-        Err(reason) => return Ok(Outcome::Rejected(reason)),
-    };
-    // Every reference must name stored data of this session.
-    if let Err(err) = session.resolve(&edited) {
-        return Ok(Outcome::Rejected(err.to_string()));
-    }
-    let through = current.get("through").and_then(Value::as_u64).unwrap_or(0);
-    let mut context = edited;
-    context.extend(session.model_messages_after(through)?);
-    let messages = context.len();
-    session.checkpoint(&context)?;
-    Ok(Outcome::Accepted { messages })
 }
 
 #[cfg(test)]
@@ -318,5 +441,114 @@ mod tests {
             Some(s.last_seq().unwrap())
         );
         assert_eq!(accept(&s).unwrap(), Outcome::Unchanged);
+    }
+
+    #[test]
+    fn sync_accepts_edit_and_publishes_without_double_accept() {
+        use std::os::unix::fs::MetadataExt;
+        let s = fresh();
+        s.append("user", &text("a")).unwrap();
+        s.append("user", &text("b")).unwrap();
+        let first = sync(&s).unwrap();
+        assert_eq!(first.outcome, Outcome::Unchanged);
+        assert!(!first.checkpointed);
+
+        s.write_file(FILE, &render(&[text("summary")]).unwrap())
+            .unwrap();
+        s.append("user", &text("c")).unwrap();
+
+        let second = sync(&s).unwrap();
+        assert_eq!(second.outcome, Outcome::Accepted { messages: 2 });
+        assert!(second.checkpointed);
+        assert_eq!(s.context().unwrap(), vec![text("summary"), text("c")]);
+        assert_eq!(
+            parse(&s.read_file(FILE).unwrap().unwrap()).unwrap(),
+            vec![text("summary"), text("c")]
+        );
+
+        let state_ino = std::fs::metadata(s.dir().join("state.json")).unwrap().ino();
+        let ctx_ino = std::fs::metadata(s.dir().join(FILE)).unwrap().ino();
+        let third = sync(&s).unwrap();
+        assert_eq!(third.outcome, Outcome::Unchanged);
+        assert!(!third.checkpointed);
+        assert_eq!(
+            std::fs::metadata(s.dir().join("state.json")).unwrap().ino(),
+            state_ino
+        );
+        assert_eq!(
+            std::fs::metadata(s.dir().join(FILE)).unwrap().ino(),
+            ctx_ino
+        );
+    }
+
+    #[test]
+    fn sync_retries_when_concurrent_write_lands_before_publish() {
+        let s = fresh();
+        s.append("user", &text("a")).unwrap();
+        assert_eq!(sync(&s).unwrap().outcome, Outcome::Unchanged);
+
+        s.append("user", &text("b")).unwrap();
+        let synced = sync_with(
+            &s,
+            || Ok(()),
+            |attempt| {
+                if attempt == 0 {
+                    s.write_file(FILE, &render(&[text("concurrent")]).unwrap())
+                        .unwrap();
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(synced.outcome, Outcome::Accepted { messages: 2 });
+        assert!(synced.checkpointed);
+        assert_eq!(s.context().unwrap(), vec![text("concurrent"), text("b")]);
+        assert_eq!(
+            parse(&s.read_file(FILE).unwrap().unwrap()).unwrap(),
+            vec![text("concurrent"), text("b")]
+        );
+        assert_eq!(sync(&s).unwrap().outcome, Outcome::Unchanged);
+    }
+
+    #[test]
+    fn sync_leaves_disk_untouched_and_reports_rejection_on_persistent_contention() {
+        let s = fresh();
+        s.append("user", &text("a")).unwrap();
+        assert_eq!(sync(&s).unwrap().outcome, Outcome::Unchanged);
+        let state_before = s.read_state().unwrap();
+
+        s.append("user", &text("b")).unwrap();
+        let synced = sync_with(
+            &s,
+            || Ok(()),
+            |attempt| {
+                s.write_file(
+                    FILE,
+                    &render(&[text(&format!("writer-{attempt}"))]).unwrap(),
+                )
+                .unwrap();
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(synced.outcome, Outcome::Rejected(ref msg) if msg.contains("changed concurrently")),
+            "expected contention rejection, got {:?}",
+            synced.outcome
+        );
+        assert!(!synced.checkpointed);
+        assert_eq!(
+            parse(&s.read_file(FILE).unwrap().unwrap()).unwrap(),
+            vec![text("writer-2")],
+            "external writer's latest file must stay intact on disk"
+        );
+        assert_eq!(
+            s.read_state().unwrap(),
+            state_before,
+            "state.json must stay at the prior publication so the edit is accepted next"
+        );
+
+        let recovered = sync(&s).unwrap();
+        assert_eq!(recovered.outcome, Outcome::Accepted { messages: 2 });
+        assert!(recovered.checkpointed);
+        assert_eq!(s.context().unwrap(), vec![text("writer-2"), text("b")]);
     }
 }
