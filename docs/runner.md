@@ -59,6 +59,16 @@ files until it has finished deleting. The core takes the same lock only while
 accepting a new context, so a new reference never names a file being deleted.
 Modeled in `specification/ReaperReferences.tla`.
 
+## context.jsonl
+
+Before each request the core takes in an edited `context.jsonl`, even while tool calls
+run. It rewrites the file only while no tool call is running: after a reply, and also
+before a request. Modeled in `specification/ContextFileSync.tla`.
+
+The rewrite before a request is an extra: the agreed design rewrites the file only after
+a reply. If anything goes wrong around `context.jsonl`, remove that rewrite first (the
+`publish` flag in `request()` in `src/process.rs`).
+
 ## Request options in `prepared`
 
 - `reasoning`: the session's level (`off` .. `max`). It is fitted to the model using `reasoning` and `thinkingLevelMap` from
