@@ -2679,6 +2679,74 @@ fn async_tool_context_file_edit_is_not_overwritten_by_next_request() {
 }
 
 #[test]
+fn context_file_edit_is_taken_in_while_an_unrelated_tool_runs() {
+    let (base, server) = server(vec![
+        // 1: dispatch async tool call c1, which keeps running
+        vec![async_call("c1"), done_tokens(40, 5)],
+        // 2: ends the turn while c1 is still running
+        vec![text("bg running"), done_tokens(50, 5)],
+        // 3: new user input while c1 still runs; must already use the edit
+        vec![text("answered from summary"), done_tokens(60, 5)],
+        // 4: woken by c1's result; must not take the edit in again
+        vec![text("saw bg result"), done_tokens(70, 5)],
+    ]);
+    let d = dir();
+    let mut core = Core::start(&d, &base);
+
+    core.op(json!({"op": "send", "input": {"text": "start bg"}}));
+    core.until("settled");
+
+    // The runner edits context.jsonl (replacing it in one step) while c1 still runs.
+    let edited = json!({"role": "user", "content": [{"type": "text", "text": "short summary"}]});
+    let edited_text = format!("{edited}\n");
+    let tmp = d.join("context.jsonl.tmp");
+    std::fs::write(&tmp, &edited_text).unwrap();
+    std::fs::rename(&tmp, d.join("context.jsonl")).unwrap();
+
+    core.op(json!({"op": "send", "input": {"text": "next question"}}));
+    let cf = core.until("context_file");
+    assert_eq!(cf["accepted"], true, "the edit is taken in although c1 runs");
+    core.until("settled");
+    assert_eq!(
+        std::fs::read_to_string(d.join("context.jsonl")).unwrap(),
+        edited_text,
+        "the file is not rewritten while c1 runs"
+    );
+
+    core.result("c1|fc_c1", "bg done");
+    let mut accepted_again = 0usize;
+    loop {
+        let ev = core.next();
+        if ev["ev"] == "context_file" {
+            accepted_again += 1;
+        }
+        if ev["ev"] == "settled" {
+            break;
+        }
+    }
+    assert_eq!(accepted_again, 0, "the edit must not be taken in twice");
+    let disk = std::fs::read_to_string(d.join("context.jsonl")).unwrap();
+    assert!(
+        disk.contains("short summary") && disk.contains("saw bg result"),
+        "once nothing runs the file is rewritten with the merged context: {disk}"
+    );
+    core.stop();
+
+    let bodies = server.join().unwrap();
+    assert_eq!(bodies.len(), 4);
+    let req3 = bodies[2]["input"].to_string();
+    assert!(req3.contains("short summary"), "req3 missing edit: {req3}");
+    assert!(req3.contains("next question"), "req3 missing new input: {req3}");
+    assert!(
+        !req3.contains("start bg"),
+        "req3 should have compacted away the original prompt: {req3}"
+    );
+    let req4 = bodies[3]["input"].to_string();
+    assert!(req4.contains("short summary") && req4.contains("bg done"));
+    assert!(!req4.contains("start bg"), "req4: {req4}");
+}
+
+#[test]
 fn async_tool_context_file_edit_accepted_after_late_completion() {
     let (base, server) = server(vec![
         // 1: dispatch async tool call c1

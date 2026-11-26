@@ -1,18 +1,19 @@
 //! Context = file, file = context.
 //!
-//! Before each quiescent request (when no tool calls are running), the core
-//! synchronizes `<session>/context.jsonl` under `references.lock`: if the file
-//! was edited since the last publication, the edited messages plus every record
-//! added since that publication become the new context (a checkpoint), and the
-//! mirror is then published one message per line exactly as the model receives
-//! it. A file that does not parse changes nothing and is reported.
+//! Before each request the core synchronizes `<session>/context.jsonl` under
+//! `references.lock`: if the file was edited since the last publication, the
+//! edited messages plus every record added since that publication become the new
+//! context (a checkpoint). A file that does not parse changes nothing and is
+//! reported.
 //!
-//! While any tool call is running, `context.jsonl` is frozen (neither accepted
-//! nor republished) so an async tool editing the file cannot race with
-//! publication; the edit is accepted once running calls settle. Before writing
-//! `context.jsonl`, sync verifies the file on disk still matches what it read,
-//! retrying on a mid-sync write and leaving the file untouched if contention
-//! persists (specification/ContextFileSync.tla).
+//! The core rewrites the file (publishes the mirror, one message per line exactly
+//! as the model receives it) only while no tool call is running: before a request
+//! and again right after a reply. While a tool call runs, an edit is still taken
+//! in, but the file is left as it is, so a tool editing the file is never
+//! overwritten; the accepted file is recorded as the current publication so it is
+//! not taken in twice. Before writing `context.jsonl`, sync verifies the file on
+//! disk still matches what it read, retrying on a mid-sync write and leaving the
+//! file untouched if contention persists (specification/ContextFileSync.tla).
 //!
 //! `state.json` remembers the last two publications (`sha256`, `through`). It is
 //! written before the file, so a crash between the two leaves the previous file in
@@ -121,27 +122,29 @@ fn plan_accept(session: &Session, observed: Option<&str>, state: &Value) -> Resu
     Ok(Plan::Accept(context))
 }
 
-/// Synchronize `context.jsonl` at a quiescent request boundary: accept an edited
-/// file (if any), run `before_publish` once (for example, starting the turn and
-/// appending the new user message), load the resulting context snapshot, and
-/// publish the mirror. Edits by the session's own tool calls are kept, because
-/// callers sync only while no tool call is running. An edit by another process
+/// Synchronize `context.jsonl` at a request boundary: accept an edited file (if
+/// any), run `before_publish` once (for example, starting the turn and appending
+/// the new user message), load the resulting context snapshot, and, if `publish`,
+/// publish the mirror. Callers publish only while no tool call is running, so
+/// edits by the session's own tool calls are kept. An edit by another process
 /// that lands between the last check and the rename is overwritten. Caller holds
 /// `references.lock`.
 pub fn sync_before_publish(
     session: &Session,
+    publish: bool,
     before_publish: impl FnOnce() -> Result<()>,
 ) -> Result<Synced> {
-    sync_with(session, before_publish, |_| {})
+    sync_with(session, publish, before_publish, |_| {})
 }
 
 #[cfg(test)]
 pub fn sync(session: &Session) -> Result<Synced> {
-    sync_before_publish(session, || Ok(()))
+    sync_before_publish(session, true, || Ok(()))
 }
 
 fn sync_with(
     session: &Session,
+    publish: bool,
     before_publish: impl FnOnce() -> Result<()>,
     mut on_before_commit: impl FnMut(usize),
 ) -> Result<Synced> {
@@ -168,6 +171,29 @@ fn sync_with(
                 Outcome::Accepted { messages }
             }
         };
+        if !publish {
+            // Leave the file as it is. Record an accepted file as the current
+            // publication, covering the context through its checkpoint, so it is not
+            // taken in again and a later edit keeps what came after.
+            if let (Outcome::Accepted { .. }, Some(text)) = (&outcome, observed.as_deref()) {
+                let previous = state
+                    .pointer("/contextFile/current")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                state["contextFile"] = json!({"current": {"sha256": sha(text), "through": session.last_seq()?}, "previous": previous});
+                session.write_state(&state)?;
+            }
+            if let Some(hook) = before_publish.take() {
+                hook()?;
+            }
+            let (refs, from_checkpoint, _) = session.context_parts_with_seq()?;
+            return Ok(Synced {
+                outcome,
+                checkpointed,
+                refs,
+                from_checkpoint,
+            });
+        }
         if let Some(hook) = before_publish.take() {
             hook()?;
         }
@@ -484,6 +510,51 @@ mod tests {
     }
 
     #[test]
+    fn sync_without_publish_accepts_once_and_leaves_the_file() {
+        use std::os::unix::fs::MetadataExt;
+        let s = fresh();
+        s.append("user", &text("a")).unwrap();
+        s.append("user", &text("b")).unwrap();
+        assert_eq!(sync(&s).unwrap().outcome, Outcome::Unchanged);
+
+        // A tool call is running: the edit is taken in, the file is not rewritten.
+        let edited = render(&[text("summary")]).unwrap();
+        s.write_file(FILE, &edited).unwrap();
+        let ino = std::fs::metadata(s.dir().join(FILE)).unwrap().ino();
+        let held = sync_before_publish(&s, false, || s.append("user", &text("c")).map(|_| ()))
+            .unwrap();
+        assert_eq!(held.outcome, Outcome::Accepted { messages: 1 });
+        assert!(held.checkpointed);
+        assert_eq!(s.context().unwrap(), vec![text("summary"), text("c")]);
+        assert_eq!(s.read_file(FILE).unwrap().unwrap(), edited);
+        assert_eq!(std::fs::metadata(s.dir().join(FILE)).unwrap().ino(), ino);
+
+        // Still running: the same file is not taken in again.
+        s.append("user", &text("d")).unwrap();
+        let again = sync_before_publish(&s, false, || Ok(())).unwrap();
+        assert_eq!(again.outcome, Outcome::Unchanged);
+        assert!(!again.checkpointed);
+
+        // A second edit keeps what came after the first one.
+        s.write_file(FILE, &render(&[text("shorter")]).unwrap())
+            .unwrap();
+        let second = sync_before_publish(&s, false, || Ok(())).unwrap();
+        assert_eq!(second.outcome, Outcome::Accepted { messages: 3 });
+        assert_eq!(
+            s.context().unwrap(),
+            vec![text("shorter"), text("c"), text("d")]
+        );
+
+        // Once nothing runs, the file is rewritten from the context and is not an edit.
+        assert_eq!(sync(&s).unwrap().outcome, Outcome::Unchanged);
+        assert_eq!(
+            parse(&s.read_file(FILE).unwrap().unwrap()).unwrap(),
+            vec![text("shorter"), text("c"), text("d")]
+        );
+        assert_eq!(sync(&s).unwrap().outcome, Outcome::Unchanged);
+    }
+
+    #[test]
     fn sync_retries_when_concurrent_write_lands_before_publish() {
         let s = fresh();
         s.append("user", &text("a")).unwrap();
@@ -492,6 +563,7 @@ mod tests {
         s.append("user", &text("b")).unwrap();
         let synced = sync_with(
             &s,
+            true,
             || Ok(()),
             |attempt| {
                 if attempt == 0 {
@@ -521,6 +593,7 @@ mod tests {
         s.append("user", &text("b")).unwrap();
         let synced = sync_with(
             &s,
+            true,
             || Ok(()),
             |attempt| {
                 s.write_file(

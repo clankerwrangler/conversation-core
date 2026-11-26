@@ -766,6 +766,10 @@ impl Core {
                     return Ok(true);
                 }
                 End::Reply { calls } => {
+                    // Refresh context.jsonl with the reply while no tool call is running.
+                    if !self.has_running_calls() {
+                        self.sync_context_file(false, None, true)?;
+                    }
                     let waiting = self.injected.iter().any(|op| wakes(op) && !follow_up(op));
                     if !calls && self.steer.is_empty() && !waiting {
                         emit(json!({"ev": "turn_end", "stopReason": "stop"}));
@@ -788,15 +792,16 @@ impl Core {
         self.calls.values().any(|c| !c.done)
     }
 
-    /// Quiescent request boundary: accept an edited context file and publish the mirror together.
+    /// Accept an edited context file and, when `publish`, rewrite the mirror.
     fn sync_context_file(
         &mut self,
         start_turn: bool,
         user: Option<Value>,
+        publish: bool,
     ) -> Result<(Vec<Value>, usize)> {
         let session = &self.session;
         let synced = session.with_references_lock(|| {
-            context_file::sync_before_publish(session, || {
+            context_file::sync_before_publish(session, publish, || {
                 if start_turn {
                     // A turn begins (each turn of a chain, before its first request).
                     emit(json!({"ev": "turn_start"}));
@@ -914,19 +919,11 @@ impl Core {
 
     /// One request: prepare, stream, save. Retries from scratch only while nothing was saved.
     fn request(&mut self, start_turn: bool, user: Option<Value>) -> Result<End> {
-        // Freeze context.jsonl while any tool call is running so an async tool editing
-        // the file cannot race with publication (specification/ContextFileSync.tla).
-        let (refs, from_checkpoint) = if self.has_running_calls() {
-            if start_turn {
-                emit(json!({"ev": "turn_start"}));
-                if let Some(user) = user {
-                    self.session.append("user", &user)?;
-                }
-            }
-            self.session.context_parts()?
-        } else {
-            self.sync_context_file(start_turn, user)?
-        };
+        // Take in an edited context.jsonl at every request, but rewrite it only while no
+        // tool call is running, so a tool editing the file is never overwritten
+        // (specification/ContextFileSync.tla).
+        let publish = !self.has_running_calls();
+        let (refs, from_checkpoint) = self.sync_context_file(start_turn, user, publish)?;
         // Any attempt without a newly proved reply leaves the next request estimating from
         // scratch (including on error or abort), except a completed shortened canonical
         // request, which retains its prior proved anchor.
