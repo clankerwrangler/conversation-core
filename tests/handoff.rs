@@ -2687,7 +2687,9 @@ fn context_file_edit_is_taken_in_while_an_unrelated_tool_runs() {
         vec![text("bg running"), done_tokens(50, 5)],
         // 3: new user input while c1 still runs; must already use the edit
         vec![text("answered from summary"), done_tokens(60, 5)],
-        // 4: woken by c1's result; must not take the edit in again
+        // 4: a second edit while c1 still runs; keeps everything after the last rewrite
+        vec![text("answered again"), done_tokens(65, 5)],
+        // 5: woken by c1's result; must not take the edit in again
         vec![text("saw bg result"), done_tokens(70, 5)],
     ]);
     let d = dir();
@@ -2705,12 +2707,28 @@ fn context_file_edit_is_taken_in_while_an_unrelated_tool_runs() {
 
     core.op(json!({"op": "send", "input": {"text": "next question"}}));
     let cf = core.until("context_file");
-    assert_eq!(cf["accepted"], true, "the edit is taken in although c1 runs");
+    assert_eq!(
+        cf["accepted"], true,
+        "the edit is taken in although c1 runs"
+    );
     core.until("settled");
     assert_eq!(
         std::fs::read_to_string(d.join("context.jsonl")).unwrap(),
         edited_text,
         "the file is not rewritten while c1 runs"
+    );
+
+    // A second edit of the same file, still while c1 runs.
+    let more = json!({"role": "user", "content": [{"type": "text", "text": "more detail"}]});
+    let second_text = format!("{edited}\n{more}\n");
+    std::fs::write(&tmp, &second_text).unwrap();
+    std::fs::rename(&tmp, d.join("context.jsonl")).unwrap();
+    core.op(json!({"op": "send", "input": {"text": "second question"}}));
+    assert_eq!(core.until("context_file")["accepted"], true);
+    core.until("settled");
+    assert_eq!(
+        std::fs::read_to_string(d.join("context.jsonl")).unwrap(),
+        second_text
     );
 
     core.result("c1|fc_c1", "bg done");
@@ -2733,17 +2751,44 @@ fn context_file_edit_is_taken_in_while_an_unrelated_tool_runs() {
     core.stop();
 
     let bodies = server.join().unwrap();
-    assert_eq!(bodies.len(), 4);
+    assert_eq!(bodies.len(), 5);
     let req3 = bodies[2]["input"].to_string();
     assert!(req3.contains("short summary"), "req3 missing edit: {req3}");
-    assert!(req3.contains("next question"), "req3 missing new input: {req3}");
+    assert!(
+        req3.contains("next question"),
+        "req3 missing new input: {req3}"
+    );
     assert!(
         !req3.contains("start bg"),
         "req3 should have compacted away the original prompt: {req3}"
     );
+    let has_c1_call = |body: &Value| {
+        body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["type"] == "function_call" && x.to_string().contains("c1"))
+    };
     let req4 = bodies[3]["input"].to_string();
-    assert!(req4.contains("short summary") && req4.contains("bg done"));
+    for want in [
+        "short summary",
+        "more detail",
+        "bg running",
+        "next question",
+        "answered from summary",
+        "second question",
+    ] {
+        assert!(req4.contains(want), "req4 missing {want}: {req4}");
+    }
+    assert!(has_c1_call(&bodies[3]), "req4 lost c1's call: {req4}");
     assert!(!req4.contains("start bg"), "req4: {req4}");
+    let req5 = bodies[4]["input"].to_string();
+    assert!(
+        req5.contains("more detail") && req5.contains("bg done"),
+        "req5: {req5}"
+    );
+    assert!(has_c1_call(&bodies[4]), "req5 lost c1's call: {req5}");
+    assert!(!req5.contains("start bg"), "req5: {req5}");
 }
 
 #[test]

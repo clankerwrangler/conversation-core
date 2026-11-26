@@ -1427,6 +1427,7 @@ impl Session {
     }
 
     /// The highest record number so far.
+    #[cfg(test)]
     pub fn last_seq(&self) -> Result<u64> {
         Ok(self.tail()?.1)
     }

@@ -172,15 +172,17 @@ fn sync_with(
             }
         };
         if !publish {
-            // Leave the file as it is. Record an accepted file as the current
-            // publication, covering the context through its checkpoint, so it is not
-            // taken in again and a later edit keeps what came after.
+            // Leave the file as it is. Record the accepted file as the current
+            // publication so it is not taken in again. It still covers only what the
+            // last rewrite covered, so `through` stays: a later edit of it keeps every
+            // record after that point.
             if let (Outcome::Accepted { .. }, Some(text)) = (&outcome, observed.as_deref()) {
                 let previous = state
                     .pointer("/contextFile/current")
                     .cloned()
                     .unwrap_or(Value::Null);
-                state["contextFile"] = json!({"current": {"sha256": sha(text), "through": session.last_seq()?}, "previous": previous});
+                let through = previous.get("through").cloned().unwrap_or(json!(0));
+                state["contextFile"] = json!({"current": {"sha256": sha(text), "through": through}, "previous": previous});
                 session.write_state(&state)?;
             }
             if let Some(hook) = before_publish.take() {
@@ -517,41 +519,44 @@ mod tests {
         s.append("user", &text("b")).unwrap();
         assert_eq!(sync(&s).unwrap().outcome, Outcome::Unchanged);
 
+        // Recorded after the last rewrite, so not in the file.
+        s.append("user", &text("m1")).unwrap();
+
         // A tool call is running: the edit is taken in, the file is not rewritten.
-        let edited = render(&[text("summary")]).unwrap();
-        s.write_file(FILE, &edited).unwrap();
+        let first = render(&[text("s1")]).unwrap();
+        s.write_file(FILE, &first).unwrap();
         let ino = std::fs::metadata(s.dir().join(FILE)).unwrap().ino();
-        let held = sync_before_publish(&s, false, || s.append("user", &text("c")).map(|_| ()))
-            .unwrap();
-        assert_eq!(held.outcome, Outcome::Accepted { messages: 1 });
+        let held =
+            sync_before_publish(&s, false, || s.append("user", &text("c")).map(|_| ())).unwrap();
+        assert_eq!(held.outcome, Outcome::Accepted { messages: 2 });
         assert!(held.checkpointed);
-        assert_eq!(s.context().unwrap(), vec![text("summary"), text("c")]);
-        assert_eq!(s.read_file(FILE).unwrap().unwrap(), edited);
+        assert_eq!(
+            s.context().unwrap(),
+            vec![text("s1"), text("m1"), text("c")]
+        );
+        assert_eq!(s.read_file(FILE).unwrap().unwrap(), first);
         assert_eq!(std::fs::metadata(s.dir().join(FILE)).unwrap().ino(), ino);
 
         // Still running: the same file is not taken in again.
-        s.append("user", &text("d")).unwrap();
+        s.append("user", &text("m2")).unwrap();
         let again = sync_before_publish(&s, false, || Ok(())).unwrap();
         assert_eq!(again.outcome, Outcome::Unchanged);
         assert!(!again.checkpointed);
 
-        // A second edit keeps what came after the first one.
-        s.write_file(FILE, &render(&[text("shorter")]).unwrap())
+        // A second edit of the same file (the first was a shorter version of it) replaces
+        // it and keeps every record after the last rewrite.
+        s.write_file(FILE, &render(&[text("s1"), text("s2")]).unwrap())
             .unwrap();
         let second = sync_before_publish(&s, false, || Ok(())).unwrap();
-        assert_eq!(second.outcome, Outcome::Accepted { messages: 3 });
-        assert_eq!(
-            s.context().unwrap(),
-            vec![text("shorter"), text("c"), text("d")]
-        );
+        assert_eq!(second.outcome, Outcome::Accepted { messages: 5 });
+        let merged = vec![text("s1"), text("s2"), text("m1"), text("c"), text("m2")];
+        assert_eq!(s.context().unwrap(), merged);
 
         // Once nothing runs, the file is rewritten from the context and is not an edit.
         assert_eq!(sync(&s).unwrap().outcome, Outcome::Unchanged);
-        assert_eq!(
-            parse(&s.read_file(FILE).unwrap().unwrap()).unwrap(),
-            vec![text("shorter"), text("c"), text("d")]
-        );
+        assert_eq!(parse(&s.read_file(FILE).unwrap().unwrap()).unwrap(), merged);
         assert_eq!(sync(&s).unwrap().outcome, Outcome::Unchanged);
+        assert_eq!(s.context().unwrap(), merged);
     }
 
     #[test]
