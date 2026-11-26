@@ -175,14 +175,15 @@ fn sync_with(
             // Leave the file as it is. Record the accepted file as the current
             // publication so it is not taken in again. It still covers only what the
             // last rewrite covered, so `through` stays: a later edit of it keeps every
-            // record after that point.
+            // record after that point. No file is written here, so there is no older
+            // file to recognize after a crash; forgetting it lets an edit that restores
+            // the last rewrite exactly be taken in as an edit.
             if let (Outcome::Accepted { .. }, Some(text)) = (&outcome, observed.as_deref()) {
-                let previous = state
-                    .pointer("/contextFile/current")
+                let through = state
+                    .pointer("/contextFile/current/through")
                     .cloned()
-                    .unwrap_or(Value::Null);
-                let through = previous.get("through").cloned().unwrap_or(json!(0));
-                state["contextFile"] = json!({"current": {"sha256": sha(text), "through": through}, "previous": previous});
+                    .unwrap_or(json!(0));
+                state["contextFile"] = json!({"current": {"sha256": sha(text), "through": through}, "previous": Value::Null});
                 session.write_state(&state)?;
             }
             if let Some(hook) = before_publish.take() {
@@ -557,6 +558,27 @@ mod tests {
         assert_eq!(parse(&s.read_file(FILE).unwrap().unwrap()).unwrap(), merged);
         assert_eq!(sync(&s).unwrap().outcome, Outcome::Unchanged);
         assert_eq!(s.context().unwrap(), merged);
+    }
+
+    #[test]
+    fn an_edit_restoring_the_last_rewrite_is_taken_in_while_a_tool_runs() {
+        let s = fresh();
+        s.append("user", &text("a")).unwrap();
+        s.append("user", &text("b")).unwrap();
+        assert_eq!(sync(&s).unwrap().outcome, Outcome::Unchanged);
+        let rewritten = s.read_file(FILE).unwrap().unwrap();
+
+        s.write_file(FILE, &render(&[text("summary")]).unwrap())
+            .unwrap();
+        let first = sync_before_publish(&s, false, || Ok(())).unwrap();
+        assert_eq!(first.outcome, Outcome::Accepted { messages: 1 });
+
+        // Undo: write back exactly what the last rewrite wrote.
+        s.write_file(FILE, &rewritten).unwrap();
+        let undo = sync_before_publish(&s, false, || Ok(())).unwrap();
+        assert_eq!(undo.outcome, Outcome::Accepted { messages: 2 });
+        assert_eq!(s.context().unwrap(), vec![text("a"), text("b")]);
+        assert_eq!(sync(&s).unwrap().outcome, Outcome::Unchanged);
     }
 
     #[test]
