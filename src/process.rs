@@ -450,17 +450,19 @@ impl Core {
                 self.complete_with(request, op.clone());
             }
             // Sign-in, kept by the core (see auth.rs): device code, or a page to open whose
-            // final address is pasted back with `login_input`, or an OpenRouter API key.
+            // final address is pasted back with `login_input`, or an OpenRouter or DeepSeek API key.
             Some("login") => {
                 let provider = text("provider")
                     .ok_or_else(|| Error::Format("login needs provider".into()))?
                     .to_string();
                 let method = text("method")
-                    .unwrap_or(if provider == auth::OPENROUTER {
-                        "key"
-                    } else {
-                        "device"
-                    })
+                    .unwrap_or(
+                        if provider == auth::OPENROUTER || provider == auth::DEEPSEEK {
+                            "key"
+                        } else {
+                            "device"
+                        },
+                    )
                     .to_string();
                 start_login(
                     self.auth_path.clone(),

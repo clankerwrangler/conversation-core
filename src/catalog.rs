@@ -4,7 +4,7 @@
 //! - OpenRouter: OpenRouter's own model list, fetched from OpenRouter (`/models/user` with
 //!   the account's key to get its permitted models and prices, or `/models` without one), cached in
 //!   `<catalog-dir>/openrouter.json` and refreshed every 4 hours.
-//! - Codex and Grok: their provider model lists, with the models file as fallback.
+//! - Codex, Grok, and DeepSeek: their provider model lists, with the models file as fallback.
 //!
 //! The models file uses the Pi-compatible model format.
 
@@ -442,11 +442,117 @@ pub fn resolve(models: &Models, dir: &Path, requested: &Value, key: Option<&str>
     model
 }
 
+pub const DEEPSEEK: &str = crate::auth::DEEPSEEK;
+const DEEPSEEK_BASE: &str = "https://api.deepseek.com";
+
+/// One entry of DeepSeek's `/models` list as a model description. Prices are omitted so
+/// `models.json` rates apply beneath discovered fields.
+pub fn deepseek_model(entry: &Value, base_url: &str) -> Option<Value> {
+    let id = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    if let Some(outputs) = entry.get("output_modalities").and_then(Value::as_array)
+        && !outputs.iter().any(|m| m == "text")
+    {
+        return None;
+    }
+    let window = entry
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .filter(|w| *w > 0)?;
+    let name = entry
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(id);
+    let inputs: Vec<&str> = entry
+        .get("input_modalities")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|m| matches!(*m, "text" | "image"))
+        .collect();
+    let efforts: Vec<&str> = entry
+        .pointer("/effort/supported_levels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let reasoning = ["minimal", "low", "medium", "high", "xhigh", "max"]
+        .iter()
+        .any(|level| efforts.contains(level));
+    let mut model = json!({
+        "id": id,
+        "name": name,
+        "api": crate::completions::API,
+        "provider": DEEPSEEK,
+        "baseUrl": base_url,
+        "reasoning": reasoning,
+        "input": if inputs.is_empty() { json!(["text"]) } else { json!(inputs) },
+        "contextWindow": window,
+    });
+    if let Some(max) = entry
+        .get("max_output_tokens")
+        .and_then(Value::as_u64)
+        .filter(|m| *m > 0)
+    {
+        model["maxTokens"] = json!(max);
+    }
+    if reasoning {
+        let mut map = Map::new();
+        map.insert("off".into(), json!("none"));
+        for level in ["minimal", "low", "medium", "high", "xhigh", "max"] {
+            map.insert(
+                level.into(),
+                if efforts.contains(&level) {
+                    json!(level)
+                } else {
+                    Value::Null
+                },
+            );
+        }
+        model["thinkingLevelMap"] = Value::Object(map);
+    }
+    Some(model)
+}
+
+/// Fetch DeepSeek's model list (`<base>/models` with the account's API key) and cache it.
+pub fn refresh_deepseek(
+    dir: &Path,
+    base_url: &str,
+    key: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    let key = key
+        .filter(|k| !k.is_empty())
+        .ok_or("deepseek_models_need_sign_in")?;
+    let (status, body, _) = get(
+        &format!("{}/models", base_url.trim_end_matches('/')),
+        &[("authorization", format!("Bearer {key}"))],
+    )?;
+    if status != 200 {
+        return Err(format!("deepseek_models_http_{status}"));
+    }
+    let entries = body
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or("deepseek_models_invalid")?;
+    let models: Vec<Value> = entries
+        .iter()
+        .filter_map(|e| deepseek_model(e, base_url))
+        .collect();
+    write_cache(dir, DEEPSEEK, &models, None).map_err(|_| "deepseek_models_not_saved")?;
+    Ok(models)
+}
+
 /// The providers whose lists the core discovers, with their default endpoints.
-const DISCOVERED: [(&str, &str); 3] = [
+const DISCOVERED: [(&str, &str); 4] = [
     (OPENROUTER, OPENROUTER_BASE),
     (CODEX, CODEX_BASE),
     (grok::PROVIDER, grok::BASE),
+    (DEEPSEEK, DEEPSEEK_BASE),
 ];
 
 /// A provider's discovered list (empty for providers the core cannot ask).
@@ -460,6 +566,13 @@ fn discovered(dir: &Path, provider: &str, base_url: Option<&str>, key: Option<&s
             base_url.unwrap_or(grok::BASE),
             key,
             refresh_grok,
+        ),
+        DEEPSEEK => fetched(
+            dir,
+            DEEPSEEK,
+            base_url.unwrap_or(DEEPSEEK_BASE),
+            key,
+            refresh_deepseek,
         ),
         _ => Vec::new(),
     }
@@ -736,5 +849,112 @@ mod tests {
             json!({"provider": "grok-cli", "id": "gpt-x"}),
             "another provider's entry is not used"
         );
+    }
+
+    #[test]
+    fn a_deepseek_entry_becomes_a_model() {
+        let flash = json!({
+            "id": "deepseek-flash",
+            "name": "DeepSeek-V4.1-Flash",
+            "context_window": 1048576,
+            "max_output_tokens": 393216,
+            "input_modalities": ["text", "image"],
+            "output_modalities": ["text"],
+            "effort": {"supported_levels": ["low", "high", "max"], "default_level": "high"}
+        });
+        let m = deepseek_model(&flash, DEEPSEEK_BASE).unwrap();
+        assert_eq!(
+            m,
+            json!({
+                "id": "deepseek-flash",
+                "name": "DeepSeek-V4.1-Flash",
+                "api": "openai-completions",
+                "provider": DEEPSEEK,
+                "baseUrl": DEEPSEEK_BASE,
+                "reasoning": true,
+                "input": ["text", "image"],
+                "contextWindow": 1048576,
+                "maxTokens": 393216,
+                "thinkingLevelMap": {"off": "none", "minimal": null, "low": "low", "medium": null, "high": "high", "xhigh": null, "max": "max"}
+            })
+        );
+        let r = |l: Option<&str>| crate::models::reasoning(&m, None, l).effort;
+        assert_eq!(
+            (r(None), r(Some("medium")), r(Some("max"))),
+            (Some("none".into()), Some("high".into()), Some("max".into()))
+        );
+
+        let pro = json!({
+            "id": "deepseek-v4-pro",
+            "name": "DeepSeek-V4-Pro",
+            "context_window": 1048576,
+            "max_output_tokens": 393216,
+            "input_modalities": ["text"],
+            "output_modalities": ["text"],
+            "effort": {"supported_levels": ["low", "high", "max"], "default_level": "high"}
+        });
+        let p = deepseek_model(&pro, DEEPSEEK_BASE).unwrap();
+        assert_eq!(p["input"], json!(["text"]));
+
+        let non_reasoning = json!({"id": "plain", "context_window": 65536});
+        let n = deepseek_model(&non_reasoning, DEEPSEEK_BASE).unwrap();
+        assert_eq!(n["reasoning"], json!(false));
+        assert!(n.get("thinkingLevelMap").is_none());
+
+        assert!(
+            deepseek_model(
+                &json!({"id": "img", "context_window": 1000, "output_modalities": ["image"]}),
+                DEEPSEEK_BASE
+            )
+            .is_none()
+        );
+        assert!(deepseek_model(&json!({"id": "no-win"}), DEEPSEEK_BASE).is_none());
+    }
+
+    #[test]
+    fn deepseek_discovery_merges_over_shipped_prices_and_adds_new_models() {
+        let dir = std::env::temp_dir().join(format!("core-deepseek-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shipped = Models::parse(include_str!("../models.json")).unwrap();
+        let found = [
+            json!({
+                "id": "deepseek-flash",
+                "name": "DeepSeek-V4.2-Flash",
+                "api": "openai-completions",
+                "provider": DEEPSEEK,
+                "baseUrl": DEEPSEEK_BASE,
+                "reasoning": true,
+                "input": ["text", "image"],
+                "contextWindow": 2097152,
+                "maxTokens": 393216
+            }),
+            json!({
+                "id": "deepseek-v5",
+                "name": "DeepSeek-V5",
+                "api": "openai-completions",
+                "provider": DEEPSEEK,
+                "baseUrl": DEEPSEEK_BASE,
+                "reasoning": true,
+                "input": ["text"],
+                "contextWindow": 2097152
+            }),
+        ];
+        write_cache(&dir, DEEPSEEK, &found, None).unwrap();
+        let listed = list(&shipped, &dir, Some(DEEPSEEK), &|_| None);
+        let flash = listed.iter().find(|m| m["id"] == "deepseek-flash").unwrap();
+        assert_eq!(flash["contextWindow"], 2097152);
+        assert_eq!(flash["cost"]["input"], 0.15);
+        assert!(listed.iter().any(|m| m["id"] == "deepseek-v5"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_deepseek_requires_key() {
+        let dir = std::env::temp_dir().join(format!("core-deepseek-nokey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = refresh_deepseek(&dir, DEEPSEEK_BASE, None).unwrap_err();
+        assert_eq!(err, "deepseek_models_need_sign_in");
+        let err_empty = refresh_deepseek(&dir, DEEPSEEK_BASE, Some("")).unwrap_err();
+        assert_eq!(err_empty, "deepseek_models_need_sign_in");
     }
 }

@@ -3,10 +3,10 @@
 //!
 //! Covered: compatibility detection and `model.compat` overrides, message conversion
 //! (including replay of another model's history: its thinking is dropped and long tool
-//! call ids are shortened), tools, the OpenRouter and OpenAI reasoning settings, Anthropic
-//! cache markers for OpenRouter's anthropic/ models, OpenRouter session affinity and billed
-//! cost, and the streamed reply. Not covered (unused here): grammar tools and the
-//! zai/qwen/chat-template/baseten/together/deepseek reasoning formats, which send no
+//! call ids are shortened), tools, the OpenRouter, OpenAI, and DeepSeek reasoning settings,
+//! Anthropic cache markers for OpenRouter's anthropic/ models, OpenRouter session affinity and
+//! billed cost, and the streamed reply. Not covered (unused here): grammar tools and the
+//! zai/qwen/chat-template/baseten/together reasoning formats, which send no
 //! reasoning setting.
 
 use crate::provider::{Failure, Piece, provider_error};
@@ -796,7 +796,7 @@ pub fn body(
                 body.insert("reasoning".into(), json!({"effort": effort}));
             }
         }
-        "openai" if model_reasoning && c.supports_reasoning_effort => {
+        "openai" | "deepseek" if model_reasoning && c.supports_reasoning_effort => {
             if !off {
                 body.insert(
                     "reasoning_effort".into(),
@@ -1292,5 +1292,59 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("_openrouter"));
+    }
+
+    #[test]
+    fn deepseek_native_compat_and_reasoning_effort() {
+        let model = json!({
+            "provider": "deepseek",
+            "api": API,
+            "id": "deepseek-flash",
+            "baseUrl": "https://api.deepseek.com",
+            "reasoning": true,
+            "input": ["text", "image"],
+            "contextWindow": 1048576,
+            "maxTokens": 393216,
+            "thinkingLevelMap": {"off": "none", "minimal": null, "low": "low", "medium": null, "high": "high", "xhigh": null, "max": "max"}
+        });
+        let c = compat(&model);
+        assert_eq!(c.thinking_format, "deepseek");
+        assert!(c.requires_reasoning_content);
+        assert!(!c.supports_store);
+        assert!(!c.supports_developer_role);
+        assert_eq!(c.max_tokens_field, "max_tokens");
+        assert!(c.supports_reasoning_effort);
+
+        let high = crate::models::reasoning(&model, None, Some("high"));
+        let ctx = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "one"}]}),
+            json!({"role": "assistant", "provider": "deepseek", "api": API, "model": "deepseek-flash",
+                "stopReason": "stop", "content": [{"type": "thinking", "thinking": "plan", "thinkingSignature": "reasoning_content"}, {"type": "text", "text": "a"}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "two"}]}),
+            json!({"role": "assistant", "provider": "openai-codex", "api": "openai-codex-responses", "model": "gpt",
+                "stopReason": "stop", "content": [{"type": "text", "text": "b"}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "three"}]}),
+        ];
+        let sent = body(&model, "sys", &ctx, &[], "s1", &high);
+        assert_eq!(sent["reasoning_effort"], "high");
+        assert_eq!(sent["max_tokens"], 393216);
+        assert_eq!(sent["messages"][0]["role"], "system");
+        assert_eq!(sent["messages"][2]["reasoning_content"], "plan");
+        assert_eq!(sent["messages"][4]["reasoning_content"], "");
+
+        let off = crate::models::reasoning(&model, None, None);
+        assert_eq!(
+            body(&model, "sys", &ctx, &[], "s1", &off)["reasoning_effort"],
+            "none"
+        );
+
+        let mut no_off = model.clone();
+        no_off["thinkingLevelMap"]["off"] = Value::Null;
+        let off_null = crate::models::reasoning(&no_off, None, None);
+        assert!(
+            body(&no_off, "sys", &ctx, &[], "s1", &off_null)
+                .get("reasoning_effort")
+                .is_none()
+        );
     }
 }

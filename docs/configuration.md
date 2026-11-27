@@ -29,7 +29,11 @@ The runner only has to name a model (`provider` and `id`); the core fills in its
   reasoning levels become the `thinkingLevelMap`. It has no prices, so Codex replies have no cost.
   OpenAI's list never offers "none"; "off" is sent as "none" and a model that refuses it
   is learned the same way.
-- xAI, and Codex when OpenAI's list cannot be fetched: the models file,
+- DeepSeek: DeepSeek's own list, fetched from `<base>/models` with the account's API key, cached
+  and refreshed every 4 hours. Its `effort.supported_levels` map into `thinkingLevelMap`
+  with `"off"` sent as `"none"`. It has no prices, so `models.json` supplies rates beneath
+  the discovered fields.
+- xAI, and Codex or DeepSeek when their lists cannot be fetched: the models file,
   `~/.config/conversation-core/models.json` or `--models <file>`. `models.json` in this
   repository has the model definitions in the Pi-compatible format.
 
@@ -53,7 +57,7 @@ file first, so sessions sharing it never send a refresh token twice (providers r
 Modeled in `specification/CredentialRefresh.tla`.
 
 - `core login openai-codex|grok-cli [device|browser]`, `core login openrouter [key|browser]`,
-  `core logout <provider>`: from a terminal. Device sign-in prints a page and a code to
+  `core login deepseek [key]`, `core logout <provider>`: from a terminal. Device sign-in prints a page and a code to
   approve; browser sign-in prints a page and waits for the address it ends on to be pasted;
   an API key is read from standard input. With `--json`, `core login <provider> device`,
   for programs that run a sign-in for someone, prints one JSON object per line instead:
@@ -71,14 +75,16 @@ the proxy's `/models` with the sign-in, and a fallback list in `models.json` wit
 prices. Requests move the system prompt into `instructions`, reshape reasoning and images,
 move tool-result images to a message, and fit reasoning effort to the model.
 
-## Chat Completions (OpenRouter)
+## Chat Completions (OpenRouter and DeepSeek)
 
-A model with `"api": "openai-completions"` (OpenRouter and other OpenAI-compatible
+A model with `"api": "openai-completions"` (OpenRouter, DeepSeek, and other OpenAI-compatible
 endpoints) is sent to `<baseUrl>/chat/completions`. Compatibility rules come from the
 provider and endpoint and can be overridden by the model's `compat`. Another model's
 history is replayed without its thinking and with shortened tool call IDs. Requests support
 OpenRouter's `reasoning` setting, session header and billed cost, and cache markers for
-anthropic/ models.
+anthropic/ models. For DeepSeek (`provider: "deepseek"` or `deepseek.com` endpoints),
+requests send `reasoning_effort`, `max_tokens`, and the `system` instruction role, and
+replay assistant `reasoning_content`.
 `core chat-body <session-dir> <model-json> <level>` prints the body for a session.
 A model's `contextWindow` and `cost` on the model object are used when the models file has
 none.

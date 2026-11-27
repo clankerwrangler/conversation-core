@@ -7,7 +7,8 @@
 //! ```json
 //! {"openai-codex": {"type": "oauth", "access": "...", "refresh": "...", "expires": 0, "accountId": "..."},
 //!  "grok-cli": {"type": "oauth", "access": "...", "refresh": "...", "expires": 0, "tokenEndpoint": "...", "baseUrl": "..."},
-//!  "openrouter": {"type": "api_key", "key": "..."}}
+//!  "openrouter": {"type": "api_key", "key": "..."},
+//!  "deepseek": {"type": "api_key", "key": "..."}}
 //! ```
 //!
 //! Renewal. Providers rotate refresh tokens: renewing makes the old refresh token invalid.
@@ -25,6 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const CODEX: &str = "openai-codex";
 pub const GROK: &str = "grok-cli";
 pub const OPENROUTER: &str = "openrouter";
+pub const DEEPSEEK: &str = "deepseek";
 
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_AUTH: &str = "https://auth.openai.com";
@@ -441,9 +443,9 @@ pub enum Step {
     OpenAndPaste { url: String },
 }
 
-/// Sign in to a provider. `method`: "device", "browser" or "key" (OpenRouter API key, given
-/// as `secret`). `show` reports each step; `paste` waits for the pasted address. Saves the
-/// credentials and returns what was stored about them (no secrets).
+/// Sign in to a provider. `method`: "device", "browser" or "key" (OpenRouter or DeepSeek API
+/// key, given as `secret`). `show` reports each step; `paste` waits for the pasted address.
+/// Saves the credentials and returns what was stored about them (no secrets).
 pub fn login(
     path: &Path,
     provider: &str,
@@ -453,7 +455,7 @@ pub fn login(
     paste: &dyn Fn() -> Option<String>,
 ) -> Result<Value, String> {
     let credential = match (provider, method) {
-        (OPENROUTER, "key") => {
+        (OPENROUTER | DEEPSEEK, "key") => {
             let key = secret
                 .map(str::trim)
                 .filter(|k| !k.is_empty())
@@ -790,6 +792,33 @@ mod tests {
         );
         assert!(remove(&path, OPENROUTER).unwrap());
         assert!(credentials(&path, OPENROUTER).unwrap().is_none());
+    }
+
+    #[test]
+    fn deepseek_api_key_login_saves_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = file("deepseek");
+        let got = login(
+            &path,
+            DEEPSEEK,
+            "key",
+            Some("sk-ds-secret"),
+            &|_| {},
+            &|| None,
+        )
+        .unwrap();
+        assert_eq!(got["provider"], DEEPSEEK);
+        assert_eq!(got["type"], "api_key");
+        assert!(!got.to_string().contains("secret"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            credentials(&path, DEEPSEEK).unwrap().unwrap()["token"],
+            "sk-ds-secret"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// A Codex-shaped access token (a JWT carrying the account id).

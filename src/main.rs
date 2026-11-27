@@ -158,11 +158,13 @@ fn main() -> ExitCode {
                 }
             };
         }
-        let method = method.unwrap_or(if provider == auth::OPENROUTER {
-            "key"
-        } else {
-            "device"
-        });
+        let method = method.unwrap_or(
+            if provider == auth::OPENROUTER || provider == auth::DEEPSEEK {
+                "key"
+            } else {
+                "device"
+            },
+        );
         let line = || {
             let mut s = String::new();
             std::io::stdin()
